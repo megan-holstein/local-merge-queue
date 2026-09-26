@@ -717,6 +717,37 @@ check "…and lands the branch anyway"     '[[ -f "$ROOT/repo/based-on-two.txt" 
 check "…and still cleans the worktree"   '[[ ! -d "$ROOT/repo-based-on-two" ]]'
 rm -f "$ROOT/bin/gh"
 
+# ── a branch name two repos share (2026-09-26) ──────────────────────────────
+# `order fitness-functions --first` moved the website's entry when the app's was
+# meant, because order and drop took the first entry with that name anywhere in
+# the queue. They now scope by --repo or the worktree, and refuse to guess.
+cd "$ROOT"
+cp "$DRAINER_STATE/queue.json" "$ROOT/queue.saved"
+cat > "$DRAINER_STATE/queue.json" <<'QJSON'
+{"entries":[
+ {"repo":"r1","branch":"first","status":"held"},
+ {"repo":"r1","branch":"shared","status":"held"},
+ {"repo":"r2","branch":"other","status":"held"},
+ {"repo":"r2","branch":"shared","status":"held"}
+]}
+QJSON
+qorder () { node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.DRAINER_STATE+"/queue.json")).entries.map(e=>e.repo+"/"+e.branch).join(","))'; }
+out=$($DRAINER order shared --first 2>&1)
+check "order refuses a name two repos share"   '[[ "$out" == *"queued in r1 and r2"* && "$(qorder)" == "r1/first,r1/shared,r2/other,r2/shared" ]]'
+$DRAINER order shared --first --repo r2 >/dev/null 2>&1
+check "order --repo moves the entry in that repo"   '[[ "$(qorder)" == "r2/shared,r1/first,r1/shared,r2/other" ]]'
+out=$($DRAINER drop shared 2>&1)
+check "drop refuses a name two repos share"    '[[ "$out" == *"is queued in r2 and r1"* && "$(qorder)" == "r2/shared,r1/first,r1/shared,r2/other" ]]'
+out=$($DRAINER admit shared 2>&1)
+check "admit refuses a name two repos share"   '[[ "$out" == *"is queued in r2 and r1"* ]]'
+$DRAINER admit shared --repo r1 >/dev/null 2>&1
+st=$(node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.DRAINER_STATE+"/queue.json"));console.log(q.entries.filter(e=>e.branch=="shared").map(e=>e.repo+":"+e.status).join(","))')
+check "admit --repo admits the entry in that repo only" '[[ "$st" == "r2:held,r1:admitted" ]]'
+$DRAINER drop shared --repo r1 >/dev/null 2>&1
+check "drop --repo drops the entry in that repo only"   '[[ "$(qorder)" == "r2/shared,r1/first,r2/other" ]]'
+cp "$ROOT/queue.saved" "$DRAINER_STATE/queue.json"
+cd "$ROOT/repo"
+
 echo
 echo "════════════════════════════════════════════════════════════════"
 echo "  passed $PASS   failed $FAIL"

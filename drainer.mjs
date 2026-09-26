@@ -721,11 +721,36 @@ function reportResidue (key, repo) {
   console.log('')
 }
 
+// One named entry, scoped to its repo. Branch names are unique within a repo,
+// not across the queue: two repos can each hand off a branch called
+// "fitness-functions". The repo comes from --repo, or from the worktree the
+// command runs in; with neither, a name two repos share is refused rather
+// than guessed, because a guess can move or drop another session's entry.
+function entryNamed (cfg, q, name, args) {
+  const key = args['--repo'] || detectHere(cfg)?.repo.key
+  const hits = q.entries.filter(x => x.branch === name && (!key || x.repo === key))
+  if (!hits.length) die(`"${name}" is not in the queue${key ? ` for ${key}` : ''}`)
+  if (hits.length > 1) {
+    die(`"${name}" is queued in ${hits.map(x => x.repo).join(' and ')} — pass --repo <repo>`)
+  }
+  return hits[0]
+}
+
+// A name given to admit or unadmit without --repo must not reach two repos.
+function refuseAmbiguous (q, names, args) {
+  if (args['--repo']) return
+  for (const name of names) {
+    const repos = [...new Set(q.entries.filter(x => x.branch === name).map(x => x.repo))]
+    if (repos.length > 1) die(`"${name}" is queued in ${repos.join(' and ')} — pass --repo <repo>`)
+  }
+}
+
 function cmdAdmit (cfg, args) {
   const q = loadQueue()
   const all = args['--all']
   const names = args._
   if (!all && !names.length) die('name the branches to admit, or pass --all')
+  refuseAmbiguous(q, names, args)
   let n = 0
   for (const e of q.entries) {
     if (e.status !== 'held') continue
@@ -746,6 +771,7 @@ function cmdUnadmit (cfg, args) {
   const all = args['--all']
   const names = args._
   if (!all && !names.length) die('name the branches to unadmit, or pass --all')
+  refuseAmbiguous(q, names, args)
   const wanted = e => (all || names.includes(e.branch)) &&
     (!args['--repo'] || e.repo === args['--repo'])
   // A stalled entry is mid-drain: its worktree holds a rebase in progress, so
@@ -777,8 +803,7 @@ function cmdDrop (cfg, args) {
   const q = loadQueue()
   const name = args._[0]
   if (!name) die('name the branch to drop')
-  const e = q.entries.find(x => x.branch === name)
-  if (!e) die(`"${name}" is not in the queue`)
+  const e = entryNamed(cfg, q, name, args)
   // If it stalled mid-rebase, put the worktree back as it was.
   if (e.status === 'stalled' && e.worktree && fs.existsSync(path.join(e.worktree, '.git'))) {
     gitTry(['rebase', '--abort'], e.worktree)
@@ -792,8 +817,7 @@ function cmdOrder (cfg, args) {
   const q = loadQueue()
   const name = args._[0]
   if (!name) die('name the branch to move')
-  const idx = q.entries.findIndex(x => x.branch === name)
-  if (idx < 0) die(`"${name}" is not in the queue`)
+  const idx = q.entries.indexOf(entryNamed(cfg, q, name, args))
   const [e] = q.entries.splice(idx, 1)
   if (args['--first']) q.entries.unshift(e)
   else if (args['--last']) q.entries.push(e)

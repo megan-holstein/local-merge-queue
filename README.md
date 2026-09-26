@@ -196,6 +196,8 @@ drainer drain myapp --dry-run
 drainer drop <branch>                 # take it back out; the branch is untouched
 ```
 
+**A branch name belongs to its repo.** Two repos can each queue a branch with the same name. `order`, `drop`, `admit` and `unadmit` take `--repo <repo>`, or use the repo of the worktree they run in; given a name two repos share and neither, they refuse and ask for `--repo` rather than guess, because a guess can move, admit or drop another session's entry.
+
 ## A branch that already contains `main` is not rebased
 
 The rebase buys exactly one thing, which is that the branch is verified against the `main`
