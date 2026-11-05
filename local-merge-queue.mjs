@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // local-merge-queue — a local merge queue for git repositories.
 //
-// Branch agents hand a finished branch off; the owner admits it; the merge queue lands
-// the admitted entries one at a time, rebasing each onto a main that may have
+// Branch agents enqueue a finished branch; the owner approves it; the merge queue lands
+// the approved entries one at a time, rebasing each onto a main that may have
 // moved since the branch was cut. It stalls on conflict rather than evicting,
 // because these branches overlap and landing them out of order relocates a
 // conflict instead of avoiding it.
@@ -179,7 +179,7 @@ function worktreeFor (repo, branch) {
 // mobile-parity behind the website's cowriter-remote is the live case. A
 // dependency counts as met only when it has actually landed, which means: gone
 // from the queue AND either gone from its repo or already merged into its main.
-// An `after` naming something nobody handed off is treated as unmet, loudly,
+// An `after` naming something nobody enqueued is treated as unmet, loudly,
 // rather than silently passing.
 function dependencyMet (cfg, entry, queued, simulated, quiet = false) {
   const spec = entry.after.includes(':') ? entry.after : `${entry.repo}:${entry.after}`
@@ -198,7 +198,7 @@ function dependencyMet (cfg, entry, queued, simulated, quiet = false) {
   return true
 }
 
-// Would this entry be picked up by THIS drain run? One predicate, used twice:
+// Would this entry be picked up by THIS landing run? One predicate, used twice:
 // once to choose the next entry to land, and once to ask whether anything is
 // still behind the entry being landed — which is what decides whether its merge
 // commit carries the skip marker (see `moreEligibleAfter`). Two copies of this
@@ -206,14 +206,14 @@ function dependencyMet (cfg, entry, queued, simulated, quiet = false) {
 function eligible (cfg, entry, key, { queued, simulated, resuming, quiet = false }) {
   if (entry.repo !== key) return false
   if (simulated.has(entry.branch)) return false
-  if (entry.status !== 'admitted' && !(resuming && entry.status === 'stalled')) return false
+  if (entry.status !== 'approved' && !(resuming && entry.status === 'stalled')) return false
   if (entry.after && !dependencyMet(cfg, entry, queued, simulated, quiet)) return false
   return true
 }
 
 // Is there another entry this run will land after `entry`? Asked of the queue as
 // it stands RIGHT NOW rather than of the snapshot taken before the gate ran,
-// because a gate takes minutes and an entry can be dropped inside them — and a
+// because a gate takes minutes and an entry can be dequeued inside them — and a
 // wrong answer here is what would leave production sitting on a build nobody
 // asked the host to make. It is only ever a lookahead, though: the entry behind
 // this one may still stall, or turn out to be cleanup-only and push nothing. The
@@ -273,7 +273,7 @@ function prFor (repo, branch, extraArgs = []) {
 
 // Wait, briefly, for GitHub to register the PR as merged. Returns true once it
 // has. See the long note at the remote-branch deletion for why this exists and
-// what goes permanently wrong without it. Bounded on purpose: a drain must not
+// what goes permanently wrong without it. Bounded on purpose: a landing run must not
 // hang on GitHub being slow, and the caller's fallback (keep the branch, say so)
 // is a safe place to land.
 function waitForPrMerged (repo, branch, tries = 6, gapMs = 2500) {
@@ -363,16 +363,16 @@ function preflight (repo) {
  * What a worktree lacks is untracked or generated — `node_modules`, env files,
  * `core.hooksPath`, natively-rebuilt modules — so an agent whose own work needed
  * no build never runs the repo's setup, and the FIRST thing to notice is the
- * merge queue's gate, minutes into a drain, dying on something that is not the
+ * merge queue's gate, minutes into a landing run, dying on something that is not the
  * branch's fault. It happened three times on 2026-08-24, twice as `esbuild
  * ENOENT` out of an empty `node_modules` (`fragments-context`,
  * `tour-tray-vestige`), and each one cost a person a diagnose-install-resume
  * cycle for a queue whose whole purpose is not needing one.
  *
  * So the merge queue fills the environment in itself. `setupWhen` is a probe whose
- * NONZERO exit means setup is needed, which keeps a drain of an already-working
+ * NONZERO exit means setup is needed, which keeps a landing run of an already-working
  * worktree free: the probe runs, exits 0, and nothing else happens. Configure
- * `setup` without a probe and every drain pays for it, which is why both live
+ * `setup` without a probe and every landing run pays for it, which is why both live
  * repos carry one.
  *
  * The commands run in the worktree with `LOCAL_MERGE_QUEUE_CHECKOUT` pointing at the
@@ -396,17 +396,17 @@ function ensureWorktreeSetup (repo, wt) {
   return { ok: true, ran: true }
 }
 
-// ─── one deploy per drain, not one per branch ───────────────────────────────
+// ─── one deploy per landing run, not one per branch ───────────────────────────────
 
 /**
- * A REPO WHOSE HOST BUILDS EVERY PUSH TO `main` GETS ONE BUILD PER DRAIN RUN,
+ * A REPO WHOSE HOST BUILDS EVERY PUSH TO `main` GETS ONE BUILD PER LANDING RUN,
  * NOT ONE PER BRANCH.
  *
  * One site here deploys production from `main` through Vercel's git
- * integration, so the push at step 4 IS a production deploy. Draining N branches
+ * integration, so the push at step 4 IS a production deploy. Landing N branches
  * therefore shipped N builds, and every one but the last shipped a state that
  * existed for about ninety seconds while the queue was still moving. The owner's
- * ask, 2026-08-29: *"main should just redeploy at the end of the draining."*
+ * ask, 2026-08-29: *"main should just redeploy at the end of the landing."*
  *
  * The mechanism is Vercel's own `ignoreCommand` (vercel.json), whose contract is
  * that exit 0 ignores the build and exit 1 lets it proceed, reading the commit
@@ -422,16 +422,16 @@ function ensureWorktreeSetup (repo, wt) {
  *
  * `settleDeploy` is the safety net under the lookahead, and it is what makes the
  * messy paths correct rather than merely usual. The lookahead can be wrong in
- * two ways — the entry behind this one may stall and then be dropped, or it may
+ * two ways — the entry behind this one may stall and then be dequeued, or it may
  * turn out to be cleanup-only and push nothing — and both leave `main` sitting
  * on a merge the host was told to ignore, with production serving the build from
- * before the drain. So at the end of every run that did not stall, the merge queue
+ * before the landing run. So at the end of every run that did not stall, the merge queue
  * asks the state rather than its own memory: does the tip of `main` carry the
  * marker? If it does, an empty commit publishes it. On the ordinary path the tip
  * is unmarked and this does nothing at all.
  *
  * A stall deliberately does NOT settle. The line is expected to continue, and
- * shipping the half-drained state mid-stall is the thing this whole feature
+ * shipping the half-landed state mid-stall is the thing this whole feature
  * exists to stop; the resume that lands the last entry deploys it.
  */
 function settleDeploy (repo, dryRun) {
@@ -450,21 +450,21 @@ function settleDeploy (repo, dryRun) {
   // thing being fixed, which is the natural sentence to write — would make the
   // commit that exists to trigger a build the next one skipped, permanently and
   // silently. Asserted rather than trusted.
-  const msg = `Redeploy ${repo.mainBranch}: the drain ended on a merge the host was told not to build`
+  const msg = `Redeploy ${repo.mainBranch}: the landing run ended on a merge the host was told not to build`
   if (msg.includes(marker)) die('the redeploy commit message carries the skip marker — refusing to push a commit that cancels itself')
 
   console.log(yellow(`  ${repo.mainBranch} is sitting on a skipped build — publishing it`))
   const cm = gitTry(['commit', '--allow-empty', '-m', msg], repo.checkout)
   if (!cm.ok) {
     console.log(red(`  THE REDEPLOY COMMIT FAILED: ${cm.err || '(no stderr)'}`))
-    console.log(red('  Production is still serving the build from before this drain.'))
+    console.log(red('  Production is still serving the build from before this landing run.'))
     return
   }
   const push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
   if (!push.ok) {
     gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
     console.log(red(`  THE REDEPLOY PUSH FAILED: ${push.err || '(no stderr)'}`))
-    console.log(red(`  Rolled it back. Production is still serving the build from before this drain;`))
+    console.log(red(`  Rolled it back. Production is still serving the build from before this landing run;`))
     console.log(red(`  publish it with an empty commit on ${repo.mainBranch} once the push works.`))
     return
   }
@@ -508,7 +508,7 @@ ${fixSteps.length ? fixSteps.join('\n') : '# re-run what failed, and fix the cau
 
 Commit anything that belongs on the branch; a fix to the worktree's untracked
 environment is not a commit and needs none.`
-  const body = `# Drain stalled — ${repo.key} / \`${entry.branch}\`
+  const body = `# Landing stalled — ${repo.key} / \`${entry.branch}\`
 
 **When:** ${nowISO()}
 **Why:** ${kind}
@@ -524,14 +524,14 @@ ${conflicted.length ? `\n## Conflicted paths\n\n${conflicted.map(p => `- \`${p}\
 
 ${clearIt}
 
-Then hand the line back to the local-merge-queue:
+Then hand the line back to the merge queue:
 
 \`\`\`sh
 local-merge-queue resume ${repo.key}${ownerCall ? ' --owner-approved' : ''}
 \`\`\`
 
 Everything queued behind this entry is still waiting; nothing was landed out of
-order. If this branch should leave the queue instead, \`local-merge-queue drop ${entry.branch}\`
+order. If this branch should leave the queue instead, \`local-merge-queue dequeue ${entry.branch}\`
 (that returns the branch to its worktree untouched${midRebase ? ', aborting the rebase' : ''}).
 `
   fs.writeFileSync(file, body)
@@ -540,7 +540,7 @@ order. If this branch should leave the queue instead, \`local-merge-queue drop $
 
 // ─── commands ───────────────────────────────────────────────────────────────
 
-function cmdHandoff (cfg, args) {
+function cmdEnqueue (cfg, args) {
   const q = loadQueue()
   const here = detectHere(cfg)
   const repoKey = args['--repo'] || here?.repo.key
@@ -549,7 +549,7 @@ function cmdHandoff (cfg, args) {
     die('run this from inside the branch worktree, or pass --repo and --branch')
   }
   const repo = repoOf(cfg, repoKey)
-  if (branch === repo.mainBranch) die(`"${branch}" is the main branch; there is nothing to hand off`)
+  if (branch === repo.mainBranch) die(`"${branch}" is the main branch; there is nothing to enqueue`)
 
   const worktree = worktreeFor(repo, branch)
   if (!worktree) die(`no worktree holds "${branch}" in ${repo.key} — the merge queue lands branches from their worktrees`)
@@ -558,21 +558,21 @@ function cmdHandoff (cfg, args) {
   const upstream = gitTry(['rev-parse', '--abbrev-ref', `${branch}@{upstream}`], worktree)
   if (!upstream.ok) die(`"${branch}" has no upstream — push it first (git push -u origin ${branch})`)
   const ahead = git(['rev-list', '--count', `${upstream.out}..${branch}`], worktree)
-  if (ahead !== '0') die(`"${branch}" has ${ahead} unpushed commit(s) — push before handing off`)
+  if (ahead !== '0') die(`"${branch}" has ${ahead} unpushed commit(s) — push before enqueuing`)
   const dirty = git(['status', '--porcelain'], worktree)
-  if (dirty) die(`"${branch}"'s worktree is dirty — commit or discard before handing off`)
+  if (dirty) die(`"${branch}"'s worktree is dirty — commit or discard before enqueuing`)
 
   // A branch with no pull request is a branch with no record. Since 2026-08-19
   // the PR IS the roster — what the branch is, what is open on it, whose call is
-  // outstanding — so handing off without one queues work that `gh pr list` cannot
+  // outstanding — so enqueuing without one queues work that `gh pr list` cannot
   // see. Refuse, and say exactly how to fix it. This checks only that a PR
   // exists; whether it is draft is deliberately not policed, because "not ready
-  // to land" is a judgement the person admitting it makes, not this tool.
+  // to land" is a judgement the person approving it makes, not this tool.
   if (repo.githubRepo) {
     const pr = prFor(repo, branch)
     if (!pr) {
       die(`"${branch}" has no open pull request, and the pull request is the roster.\n` +
-          `  Open one from its worktree, then hand off again:\n\n` +
+          `  Open one from its worktree, then enqueue again:\n\n` +
           `    cd ${worktree}\n` +
           `    gh pr create --base ${repo.mainBranch} --head ${branch} --draft \\\n` +
           `      --title "<what it is, in one clause>" --body-file <(…)\n\n` +
@@ -598,12 +598,12 @@ function cmdHandoff (cfg, args) {
     worktree,
     note: args['--note'] || '',
     after: args['--after'] || null,
-    status: 'held',                 // held → admitted (the owner's word) → landed
-    handedOff: nowISO()
+    status: 'enqueued',                 // enqueued → approved (the owner's word) → landed
+    enqueued: nowISO()
   })
   saveQueue(q)
-  console.log(`${green('handed off')} ${repo.key}/${branch}`)
-  console.log(dim('  Waiting for the owner\'s word. Nothing merges until it is admitted.'))
+  console.log(`${green('enqueued')} ${repo.key}/${branch}`)
+  console.log(dim('  Waiting for the owner\'s word. Nothing merges until it is approved.'))
 }
 
 function cmdStatus (cfg, args) {
@@ -624,9 +624,9 @@ function cmdStatus (cfg, args) {
       console.log(yellow(`  LOCKED by pid ${owner?.pid ?? '?'} since ${owner?.since ?? '?'}`))
     }
     mine.forEach((e, i) => {
-      const mark = e.status === 'admitted' ? green('admitted')
+      const mark = e.status === 'approved' ? green('approved')
         : e.status === 'stalled' ? red('STALLED')
-          : dim('held')
+          : dim('enqueued')
       let delta = ''
       try {
         const lr = git(['rev-list', '--left-right', '--count', `${repo.mainBranch}...${e.branch}`], repo.checkout)
@@ -641,13 +641,13 @@ function cmdStatus (cfg, args) {
   }
   if (!any) console.log(dim('the queue is empty'))
   else {
-    // THE QUEUE IS SHARED, AND THAT IS THE POINT. Several agents hand off at once,
-    // so an agent reading `status` routinely finds branches it never handed off —
+    // THE QUEUE IS SHARED, AND THAT IS THE POINT. Several agents enqueue at once,
+    // so an agent reading `status` routinely finds branches it never enqueued —
     // and has read that as a fault worth investigating or warning about (learned
     // 2026-08-28). Said here rather than only in the README because this listing,
     // not a doc read at the start of a session, is what is in front of it.
-    console.log(dim('Several agents hand off to this queue; entries you did not create are expected.'))
-    console.log(dim('Before draining, confirm the admitted set is the one the owner meant: local-merge-queue drain <repo> --dry-run'))
+    console.log(dim('Several agents enqueue into this queue; entries you did not create are expected.'))
+    console.log(dim('Before landing, confirm the approved set is the one the owner meant: local-merge-queue land <repo> --dry-run'))
     console.log('')
   }
   for (const key of keys) {
@@ -662,9 +662,9 @@ function cmdStatus (cfg, args) {
  *
  * It is the one state this feature can leave behind that nobody would otherwise
  * look for: the branches all landed, the queue is empty, `git log` looks
- * healthy, and production is serving the build from before the drain. It arises
- * when the last entry of a run is dropped rather than landed, and it is cleared
- * by the next drain of that repo (`settleDeploy`), which is what this says.
+ * healthy, and production is serving the build from before the landing run. It arises
+ * when the last entry of a run is dequeued rather than landed, and it is cleared
+ * by the next landing run of that repo (`settleDeploy`), which is what this says.
  * Silent for every repo that configures no `deploy`.
  */
 function reportUndeployedTip (key, repo) {
@@ -674,7 +674,7 @@ function reportUndeployedTip (key, repo) {
   if (!tip.ok || !tip.out.includes(marker)) return
   console.log(yellow(`${key}: ${repo.mainBranch} is sitting on a build the host was told to skip`))
   console.log(dim(`  Production still serves what it served before that merge.`))
-  console.log(dim(`  The next drain of this repo publishes it:  local-merge-queue drain ${key}`))
+  console.log(dim(`  The next landing run of this repo publishes it:  local-merge-queue land ${key}`))
   console.log('')
 }
 
@@ -715,17 +715,17 @@ function reportResidue (key, repo) {
   if (!stale.length) return
   console.log(yellow(`${key}: ${stale.length} landed branch(es) still have a local ref`))
   for (const b of stale) console.log(dim(`  · ${b} — merged into ${repo.mainBranch}, no worktree`))
-  console.log(dim(`  If they are residue from a drain, clear them:`))
+  console.log(dim(`  If they are residue from a landing run, clear them:`))
   console.log(dim(`    git -C ${repo.checkout} branch -d ${stale.join(' ')}`))
   console.log(dim(`  Check first — a branch preserving removed code looks identical from here.`))
   console.log('')
 }
 
 // One named entry, scoped to its repo. Branch names are unique within a repo,
-// not across the queue: two repos can each hand off a branch called
+// not across the queue: two repos can each enqueue a branch called
 // "fitness-functions". The repo comes from --repo, or from the worktree the
 // command runs in; with neither, a name two repos share is refused rather
-// than guessed, because a guess can move or drop another session's entry.
+// than guessed, because a guess can move or dequeue another session's entry.
 function entryNamed (cfg, q, name, args) {
   const key = args['--repo'] || detectHere(cfg)?.repo.key
   const hits = q.entries.filter(x => x.branch === name && (!key || x.repo === key))
@@ -736,7 +736,7 @@ function entryNamed (cfg, q, name, args) {
   return hits[0]
 }
 
-// A name given to admit or unadmit without --repo must not reach two repos.
+// A name given to approve or unapprove without --repo must not reach two repos.
 function refuseAmbiguous (q, names, args) {
   if (args['--repo']) return
   for (const name of names) {
@@ -745,64 +745,64 @@ function refuseAmbiguous (q, names, args) {
   }
 }
 
-function cmdAdmit (cfg, args) {
+function cmdApprove (cfg, args) {
   const q = loadQueue()
   const all = args['--all']
   const names = args._
-  if (!all && !names.length) die('name the branches to admit, or pass --all')
+  if (!all && !names.length) die('name the branches to approve, or pass --all')
   refuseAmbiguous(q, names, args)
   let n = 0
   for (const e of q.entries) {
-    if (e.status !== 'held') continue
+    if (e.status !== 'enqueued') continue
     if (args['--repo'] && e.repo !== args['--repo']) continue
-    if (all || names.includes(e.branch)) { e.status = 'admitted'; e.admitted = nowISO(); n++ }
+    if (all || names.includes(e.branch)) { e.status = 'approved'; e.approved = nowISO(); n++ }
   }
   saveQueue(q)
-  console.log(`${green('admitted')} ${n} branch(es). Land them with: local-merge-queue drain <repo>`)
+  console.log(`${green('approved')} ${n} branch(es). Land them with: local-merge-queue land <repo>`)
 }
 
-// The inverse of admit, and it exists because an admitted entry is a state
+// The inverse of approve, and it exists because an approved entry is a state
 // the owner may want to take back — a change of mind, a branch that needs one more
-// look — without dropping it out of the queue and losing its place. It reaches
-// only as far as the drain: once a branch is landing, `drop` and `resume` are
+// look — without dequeuing it out of the queue and losing its place. It reaches
+// only as far as the landing run: once a branch is landing, `dequeue` and `resume` are
 // what govern it.
-function cmdUnadmit (cfg, args) {
+function cmdUnapprove (cfg, args) {
   const q = loadQueue()
   const all = args['--all']
   const names = args._
-  if (!all && !names.length) die('name the branches to unadmit, or pass --all')
+  if (!all && !names.length) die('name the branches to unapprove, or pass --all')
   refuseAmbiguous(q, names, args)
   const wanted = e => (all || names.includes(e.branch)) &&
     (!args['--repo'] || e.repo === args['--repo'])
-  // A stalled entry is mid-drain: its worktree holds a rebase in progress, so
-  // moving it back to held would leave the queue describing a state the disk
+  // A stalled entry is mid-landing: its worktree holds a rebase in progress, so
+  // moving it back to enqueued would leave the queue describing a state the disk
   // does not. Say so rather than half-doing it.
   const stalled = q.entries.filter(e => e.status === 'stalled' && wanted(e))
   for (const e of stalled) {
-    console.log(yellow(`${e.repo}/${e.branch} is STALLED mid-drain — unadmit will not touch it.`))
-    console.log(dim(`  Resolve it and ${bold('local-merge-queue resume')} ${e.repo}, or ${bold('local-merge-queue drop')} ${e.branch}.`))
+    console.log(yellow(`${e.repo}/${e.branch} is STALLED mid-landing — unapprove will not touch it.`))
+    console.log(dim(`  Resolve it and ${bold('local-merge-queue resume')} ${e.repo}, or ${bold('local-merge-queue dequeue')} ${e.branch}.`))
   }
   let n = 0
   for (const e of q.entries) {
-    if (e.status !== 'admitted') continue
+    if (e.status !== 'approved') continue
     if (!wanted(e)) continue
-    e.status = 'held'
-    delete e.admitted
+    e.status = 'enqueued'
+    delete e.approved
     n++
   }
   saveQueue(q)
   if (!n) {
-    console.log(dim('nothing to unadmit — no matching entry was admitted'))
+    console.log(dim('nothing to unapprove — no matching entry was approved'))
     return
   }
-  console.log(`${yellow('held')} ${n} branch(es) again. The branch, its worktree and its place in the queue are untouched.`)
-  console.log(dim('  Re-admit with: local-merge-queue admit <branch>'))
+  console.log(`${yellow('enqueued')} ${n} branch(es) again. The branch, its worktree and its place in the queue are untouched.`)
+  console.log(dim('  Re-approve with: local-merge-queue approve <branch>'))
 }
 
-function cmdDrop (cfg, args) {
+function cmdDequeue (cfg, args) {
   const q = loadQueue()
   const name = args._[0]
-  if (!name) die('name the branch to drop')
+  if (!name) die('name the branch to dequeue')
   const e = entryNamed(cfg, q, name, args)
   // If it stalled mid-rebase, put the worktree back as it was.
   if (e.status === 'stalled' && e.worktree && fs.existsSync(path.join(e.worktree, '.git'))) {
@@ -810,7 +810,7 @@ function cmdDrop (cfg, args) {
   }
   q.entries = q.entries.filter(x => x !== e)
   saveQueue(q)
-  console.log(`${yellow('dropped')} ${e.repo}/${e.branch} — the branch and its worktree are untouched`)
+  console.log(`${yellow('dequeued')} ${e.repo}/${e.branch} — the branch and its worktree are untouched`)
 }
 
 function cmdOrder (cfg, args) {
@@ -832,9 +832,9 @@ function cmdOrder (cfg, args) {
 }
 
 // The heart of it.
-function cmdDrain (cfg, args, { resuming = false } = {}) {
+function cmdLand (cfg, args, { resuming = false } = {}) {
   const key = args._[0] || detectHere(cfg)?.repo.key
-  if (!key) die('name the repo to drain (or run from inside one of its worktrees)')
+  if (!key) die('name the repo to land (or run from inside one of its worktrees)')
   const repo = repoOf(cfg, key)
   const dryRun = !!args['--dry-run']
 
@@ -847,13 +847,13 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
 
   const problems = preflight(repo)
   if (problems.length) {
-    die(`${key} is not ready to drain:\n  - ${problems.join('\n  - ')}`)
+    die(`${key} is not ready to land:\n  - ${problems.join('\n  - ')}`)
   }
 
   const lock = dryRun ? true : acquireLock(key)
   if (!lock) {
     const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
-    die(`${key} is being drained already (pid ${owner?.pid ?? '?'}, since ${owner?.since ?? '?'})`)
+    die(`${key} is being landed already (pid ${owner?.pid ?? '?'}, since ${owner?.since ?? '?'})`)
   }
 
   const landed = []
@@ -880,7 +880,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
 
       const wt = entry.worktree
       if (!fs.existsSync(wt)) {
-        die(`the worktree for "${entry.branch}" is gone (${wt}) — drop the entry or repair the worktree`)
+        die(`the worktree for "${entry.branch}" is gone (${wt}) — dequeue the entry or repair the worktree`)
       }
 
       // A branch already contained in main needs cleanup, not a merge. This is
@@ -954,7 +954,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
           }
           const anc = gitTry(['merge-base', '--is-ancestor', `origin/${repo.mainBranch}`, entry.branch], repo.checkout)
           if (!anc.ok) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
-          entry.status = 'admitted'
+          entry.status = 'approved'
           delete entry.stallReason
           saveQueue(q2)
         }
@@ -1002,7 +1002,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
             `This worktree lacked its generated environment — \`${repo.setupWhen || '(no probe configured)'}\` said so —\n` +
             `and the setup step that fills it in exited non-zero:\n\n` +
             `    ${setup.failed}\n\n` +
-            `Its output is above, in the drain log. The gate never ran; nothing here is a\n` +
+            `Its output is above, in the landing run log. The gate never ran; nothing here is a\n` +
             `verdict on the branch.`,
             [], false, [setup.failed])
           console.error(red(`\n  STALLED — worktree setup failed on ${entry.branch}`))
@@ -1025,7 +1025,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
           entry.stallReason = 'gate failed after rebase'
           saveQueue(q2)
           const file = writeStallReport(repo, entry, 'gate failed after rebase',
-            `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the drain log.`,
+            `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
             [], false, [gateFailed])
           console.error(red(`\n  STALLED — the gate failed on ${entry.branch} after rebasing.`))
           console.error(dim('  This is the queue working: it passed on the old main and fails on the new one.'))
@@ -1047,7 +1047,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
         //
         //     --force-with-lease and not --force: the fetch at step 1 made the
         //     remote-tracking ref current, so the lease refuses exactly when it
-        //     should — somebody pushed to the branch after the drain began.
+        //     should — somebody pushed to the branch after the landing run began.
         const pub = gitTry(['push', '--force-with-lease', 'origin', `${entry.branch}:${entry.branch}`], wt)
         if (pub.ok) {
           console.log(dim(current
@@ -1064,7 +1064,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
         //    AND, FOR A REPO WHOSE HOST BUILDS EVERY PUSH TO main, THE MESSAGE
         //    CARRIES THE SKIP MARKER UNLESS THIS IS THE LAST ENTRY OF THE RUN.
         //    The queue is re-read here rather than reusing q2: the gate above
-        //    takes minutes, and an entry can be dropped inside them, which would
+        //    takes minutes, and an entry can be dequeued inside them, which would
         //    make this the last merge after all. See `settleDeploy` for the rest
         //    of the design and for what happens when this lookahead is wrong.
         console.log(dim(`  merging into ${repo.mainBranch}…`))
@@ -1094,7 +1094,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
       //
       // A CLEANUP STEP THAT FAILS SAYS SO IN RED AND LEAVES A RESIDUE LINE.
       // It used to report every failure in dim, the same weight as a success,
-      // at the very end of a drain whose last two hundred lines are gate output.
+      // at the very end of a landing run whose last two hundred lines are gate output.
       // Three branches in a row (`story-graph`, `audit-repairs`, `graph-colors`,
       // 2026-08-19) landed leaving their LOCAL ref behind, and nobody noticed
       // until a roster sweep found three branches that no longer existed
@@ -1214,7 +1214,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
 
       // The branch IS landed either way — cleanup residue is untidiness, never a
       // reason to stall the line or to leave the entry looking unfinished. It is
-      // said once, plainly, where the person running the drain will read it.
+      // said once, plainly, where the person running the landing run will read it.
       if (residue.length) {
         console.log(red(`  ${entry.branch} landed, but its cleanup left residue:`))
         for (const r of residue) console.log(red(`    · ${r}`))
@@ -1232,10 +1232,10 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
 
     // The line ran to the end without stalling. If `main` is nevertheless
     // sitting on a merge the host was told to ignore — the lookahead above can
-    // be wrong, and an entry dropped between two drains leaves exactly this —
+    // be wrong, and an entry dequeued between two landing runs leaves exactly this —
     // publish it. On the ordinary path the last merge was unmarked and this does
     // nothing. Deliberately reached even when this run landed nothing, because
-    // "the final entry was dropped" is the case where nothing lands and the
+    // "the final entry was dequeued" is the case where nothing lands and the
     // undeployed tip is somebody else's leftover.
     settleDeploy(repo, dryRun)
   } finally {
@@ -1243,7 +1243,7 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
   }
 
   if (!landed.length) {
-    console.log(dim('\nnothing admitted to drain'))
+    console.log(dim('\nnothing approved to land'))
     return { landed }
   }
 
@@ -1255,39 +1255,39 @@ function cmdDrain (cfg, args, { resuming = false } = {}) {
     console.log(ok ? green('  final check passed') : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
   }
 
-  console.log(`\n${green(bold('drained'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
+  console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
   landed.forEach(b => console.log(`  · ${b}`))
   return { landed }
 }
 
 function cmdResume (cfg, args) {
-  return cmdDrain(cfg, args, { resuming: true })
+  return cmdLand(cfg, args, { resuming: true })
 }
 
 function cmdHelp () {
   console.log(`
 ${bold('local-merge-queue')} — a local merge queue for git repositories
 
-  ${bold('local-merge-queue handoff')} [--repo R] [--branch B] [--after DEP] [--note "…"]
-      Hand a finished branch to the queue. Run it from the branch's worktree and
+  ${bold('local-merge-queue enqueue')} [--repo R] [--branch B] [--after DEP] [--note "…"]
+      Enqueue a finished branch. Run it from the branch's worktree and
       repo/branch are detected. Refuses unpushed or uncommitted work. The entry
-      sits ${dim('held')} until the owner admits it — handing off never merges anything.
+      sits ${dim('enqueued')} until the owner approves it — enqueuing never merges anything.
 
   ${bold('local-merge-queue status')} [repo]        Show the queue, each entry's state and delta.
-  ${bold('local-merge-queue admit')} <branch>… | --all [--repo R]
-      ${bold('The owner\'s word.')} Moves entries from held to admitted.
-  ${bold('local-merge-queue unadmit')} <branch>… | --all [--repo R]
-      Put admitted entries back to held. The entry keeps its place in the queue;
+  ${bold('local-merge-queue approve')} <branch>… | --all [--repo R]
+      ${bold('The owner\'s word.')} Moves entries from enqueued to approved.
+  ${bold('local-merge-queue unapprove')} <branch>… | --all [--repo R]
+      Put approved entries back to enqueued. The entry keeps its place in the queue;
       nothing about the branch or its worktree moves. Refuses a stalled entry.
   ${bold('local-merge-queue order')} <branch> --first | --last | <position>
       Reorder. Land refactors early — everything behind one rebases over it anyway.
-  ${bold('local-merge-queue drain')} [repo] [--dry-run]
-      Land every admitted entry, one at a time: rebase → gate → merge --no-ff →
+  ${bold('local-merge-queue land')} [repo] [--dry-run]
+      Land every approved entry, one at a time: rebase → gate → merge --no-ff →
       push → remove worktree → delete branch → delete roster row. Stalls on the
       first conflict; nothing behind it lands out of order.
   ${bold('local-merge-queue resume')} [repo] [--owner-approved]
       Continue after a stall has been resolved in the worktree.
-  ${bold('local-merge-queue drop')} <branch>       Remove an entry; the branch is left untouched.
+  ${bold('local-merge-queue dequeue')} <branch>       Remove an entry; the branch is left untouched.
 
 Full contract: ${path.join(HERE, 'README.md')}
 `)
@@ -1314,13 +1314,13 @@ if (!cmd || cmd === 'help' || cmd === '--help') { cmdHelp(); process.exit(0) }
 
 const cfg = loadConfig()
 const commands = {
-  handoff: cmdHandoff,
+  enqueue: cmdEnqueue,
   status: cmdStatus,
-  admit: cmdAdmit,
-  unadmit: cmdUnadmit,
-  drain: cmdDrain,
+  approve: cmdApprove,
+  unapprove: cmdUnapprove,
+  land: cmdLand,
   resume: cmdResume,
-  drop: cmdDrop,
+  dequeue: cmdDequeue,
   order: cmdOrder
 }
 const fn = commands[cmd]

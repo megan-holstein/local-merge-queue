@@ -4,20 +4,20 @@
   "//root": "What a RELATIVE checkout path resolves against. Defaults to the directory this config file sits in. A checkout beginning with `~/` or `/` ignores it entirely, so a registry of absolute paths never needs this key. Set it when your checkouts live together under one directory and you would rather name them once: root `~/code` turns `\"checkout\": \"desktop-app\"` into `~/code/desktop-app`.",
   "root": "~/code",
 
-  "//checkout": "The PRIMARY checkout — the one that stays on the main branch. Branches land here, and their worktrees are expected to be separate directories (git worktree add). The merge queue refuses to drain while this checkout is dirty or on some other branch, because it is where the merge happens.",
+  "//checkout": "The PRIMARY checkout — the one that stays on the main branch. Branches land here, and their worktrees are expected to be separate directories (git worktree add). The merge queue refuses to land while this checkout is dirty or on some other branch, because it is where the merge happens.",
   "//mainBranch": "The branch everything lands on. Defaults to `main`.",
   "//gate": "The verification a branch must pass before it merges. Each step is a shell command run in the BRANCH's worktree, on exactly the content that will land, after the rebase and before the merge. The first failing step stalls the queue; nothing behind it lands out of order. Keep it to what would reach a user as broken — minutes here are paid on every landing.",
   "//gateEnv": "Environment for every gate step and for `finalCheck`. Use it for the flag that puts a build in its release shape, never for a secret: this file is a config file, not a vault.",
   "//finalCheck": "One command run in the PRIMARY checkout after the whole batch has landed. It REPORTS; it does not gate, because each entry already passed the gate on its own content. Omit the key and nothing runs.",
   "//setup": "The repo's fresh-worktree setup, run by the merge queue in the BRANCH's worktree after the rebase and before the gate. A branch whose own work needed no build never runs these by hand, and the first thing anyone notices is the gate dying minutes in on an empty `node_modules`. Three environment variables are set for these commands and for `setupWhen`: `$LOCAL_MERGE_QUEUE_CHECKOUT` (the primary checkout, which is where a worktree's missing pieces are usually copied from), `$LOCAL_MERGE_QUEUE_WORKTREE`, and `$LOCAL_MERGE_QUEUE_REPO`.",
-  "//setupWhen": "A probe run in the worktree whose NONZERO exit means setup is needed. It must cover every step of `setup`, so a half-set-up worktree is completed rather than passed over; a drain of a working worktree then costs one `test`. Configure `setup` without a probe and every drain pays the full setup.",
-  "//protectedPaths": "Path prefixes whose content is the owner's to resolve, not an agent's — prose, generated contracts, anything a rebase could quietly rewrite. A rebase conflict touching one of these hard-stops the drain and `local-merge-queue resume` refuses without `--owner-approved`.",
-  "//githubRepo": "`owner/name` on GitHub, read through the `gh` CLI. The pull request is the branch roster, so with this key set the merge queue requires an open PR at handoff and verifies it closed as MERGED after landing. Omit it and both checks are skipped — no `gh`, no network, nothing else changes.",
-  "//deploy": "ONE BUILD PER DRAIN, NOT ONE PER BRANCH — for a repo whose host builds every push to the main branch. `skipMarker` is appended to the merge commit message of every entry that has another entry behind it, so only the LAST merge of a run is built. Your host reads it out of the commit message and declines the build (on Vercel that is `vercel.json`'s `ignoreCommand`). The pushes are NOT batched: an unpushed merge is unbacked-up work. Omit the key and no marker is ever written.",
+  "//setupWhen": "A probe run in the worktree whose NONZERO exit means setup is needed. It must cover every step of `setup`, so a half-set-up worktree is completed rather than passed over; a landing run of a working worktree then costs one `test`. Configure `setup` without a probe and every landing run pays the full setup.",
+  "//protectedPaths": "Path prefixes whose content is the owner's to resolve, not an agent's — prose, generated contracts, anything a rebase could quietly rewrite. A rebase conflict touching one of these hard-stops the landing run and `local-merge-queue resume` refuses without `--owner-approved`.",
+  "//githubRepo": "`owner/name` on GitHub, read through the `gh` CLI. The pull request is the branch roster, so with this key set the merge queue requires an open PR at enqueue and verifies it closed as MERGED after landing. Omit it and both checks are skipped — no `gh`, no network, nothing else changes.",
+  "//deploy": "ONE BUILD PER LANDING RUN, NOT ONE PER BRANCH — for a repo whose host builds every push to the main branch. `skipMarker` is appended to the merge commit message of every entry that has another entry behind it, so only the LAST merge of a run is built. Your host reads it out of the commit message and declines the build (on Vercel that is `vercel.json`'s `ignoreCommand`). The pushes are NOT batched: an unpushed merge is unbacked-up work. Omit the key and no marker is ever written.",
 
   "repos": {
     "desktop-app": {
-      "//": "An Electron desktop app. Nothing it does is published by a push, so it has no `deploy` key: its merges carry no marker and the drain behaves as it would without the feature.",
+      "//": "An Electron desktop app. Nothing it does is published by a push, so it has no `deploy` key: its merges carry no marker and the landing run behaves as it would without the feature.",
       "checkout": "desktop-app",
       "mainBranch": "main",
       "//setupWhen2": "Native modules are the case a plain `test -d node_modules` misses: the directory exists and the binary inside it was built against the wrong ABI, so the probe asks for the built artifact itself.",
@@ -37,10 +37,10 @@
     },
 
     "marketing-site": {
-      "//": "A Next.js site whose production deploy IS the push to its main branch. Draining N branches therefore shipped N builds, and every one but the last was live for about as long as the next gate took — which is what `deploy.skipMarker` exists to stop.",
+      "//": "A Next.js site whose production deploy IS the push to its main branch. Landing N branches therefore shipped N builds, and every one but the last was live for about as long as the next gate took — which is what `deploy.skipMarker` exists to stop.",
       "checkout": "marketing-site",
       "mainBranch": "main",
-      "//setup2": "A fresh worktree begins with no configuration whatever — env files and hook paths are gitignored or per-checkout — so they come from the primary checkout. The env copy is conditional because a file that stops existing must not stall a drain on a step naming it.",
+      "//setup2": "A fresh worktree begins with no configuration whatever — env files and hook paths are gitignored or per-checkout — so they come from the primary checkout. The env copy is conditional because a file that stops existing must not stall a landing run on a step naming it.",
       "setupWhen": "test -d node_modules && test -f .env.local && test -n \"$(git config core.hooksPath)\"",
       "setup": [
         "npm install",

@@ -48,61 +48,61 @@ cat > "$ROOT/repos.json" <<JSON
 JSON
 
 echo
-echo "── 1. handoff guards ─────────────────────────────────────────────"
+echo "── 1. enqueue guards ─────────────────────────────────────────────"
 cd "$ROOT/repo-alpha"
 echo dirty > untracked-dirt.txt
-out=$($LOCAL_MERGE_QUEUE handoff 2>&1); check "refuses a dirty worktree" '[[ "$out" == *dirty* ]]'
+out=$($LOCAL_MERGE_QUEUE enqueue 2>&1); check "refuses a dirty worktree" '[[ "$out" == *dirty* ]]'
 rm untracked-dirt.txt
 echo more >> alpha.txt && git add -A && git commit -qm "unpushed"
-out=$($LOCAL_MERGE_QUEUE handoff 2>&1); check "refuses unpushed commits" '[[ "$out" == *unpushed* ]]'
+out=$($LOCAL_MERGE_QUEUE enqueue 2>&1); check "refuses unpushed commits" '[[ "$out" == *unpushed* ]]'
 git push -q origin alpha
-out=$($LOCAL_MERGE_QUEUE handoff --note "the alpha branch" 2>&1)
-check "accepts a clean pushed branch" '[[ "$out" == *"handed off"* ]]'
-cd "$ROOT/repo-beta" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE enqueue --note "the alpha branch" 2>&1)
+check "accepts a clean pushed branch" '[[ "$out" == *"enqueued"* ]]'
+cd "$ROOT/repo-beta" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
 
 echo
-echo "── 2. nothing merges without admission ───────────────────────────"
+echo "── 2. nothing merges without approval ───────────────────────────"
 before=$(git -C "$ROOT/repo" rev-parse main)
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 after=$(git -C "$ROOT/repo" rev-parse main)
-check "drain with nothing admitted is a no-op" '[[ "$before" == "$after" && "$out" == *"nothing admitted"* ]]'
+check "land with nothing approved is a no-op" '[[ "$before" == "$after" && "$out" == *"nothing approved"* ]]'
 
 echo
 echo "── 3. dry run does not mutate the queue ──────────────────────────"
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
 q1=$(cat "$LOCAL_MERGE_QUEUE_STATE/queue.json")
-$LOCAL_MERGE_QUEUE drain t --dry-run >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t --dry-run >/dev/null 2>&1
 q2=$(cat "$LOCAL_MERGE_QUEUE_STATE/queue.json")
 main_now=$(git -C "$ROOT/repo" rev-parse main)
 check "dry run leaves the queue byte-identical" '[[ "$q1" == "$q2" ]]'
 check "dry run leaves main where it was" '[[ "$main_now" == "$before" ]]'
 
 echo
-echo "── 3b. unadmit puts an entry back without moving it ──────────────"
-# Admission is reversible right up to the drain, and the entry must keep its
-# place: unadmit is the alternative to `drop`, which would take it out of the
+echo "── 3b. unapprove puts an entry back without moving it ──────────────"
+# Approval is reversible right up to the landing run, and the entry must keep its
+# place: unapprove is the alternative to `dequeue`, which would take it out of the
 # queue entirely and lose the order the branches were meant to land in.
 order_before=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json")).entries.map(e=>e.branch).join(","))')
-$LOCAL_MERGE_QUEUE unadmit alpha >/dev/null 2>&1
-st=$(node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));const e=q.entries.find(x=>x.branch=="alpha");console.log(e.status+"|"+("admitted" in e))')
+$LOCAL_MERGE_QUEUE unapprove alpha >/dev/null 2>&1
+st=$(node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));const e=q.entries.find(x=>x.branch=="alpha");console.log(e.status+"|"+("approved" in e))')
 order_after=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json")).entries.map(e=>e.branch).join(","))')
-check "unadmit returns the entry to held"        '[[ "$st" == "held|false" ]]'
-check "unadmit keeps its place in the queue"     '[[ "$order_before" == "$order_after" ]]'
-out=$($LOCAL_MERGE_QUEUE unadmit alpha 2>&1)
-check "unadmitting a held entry changes nothing" '[[ "$out" == *"nothing to unadmit"* ]]'
-out=$($LOCAL_MERGE_QUEUE unadmit 2>&1)
-check "unadmit refuses to guess a branch"        '[[ "$out" == *"name the branches"* ]]'
-# beta is still admitted from section 3, so clear the whole repo before asking
-# whether an unadmitted queue lands anything.
-$LOCAL_MERGE_QUEUE unadmit --all --repo t >/dev/null 2>&1
+check "unapprove returns the entry to enqueued"        '[[ "$st" == "enqueued|false" ]]'
+check "unapprove keeps its place in the queue"     '[[ "$order_before" == "$order_after" ]]'
+out=$($LOCAL_MERGE_QUEUE unapprove alpha 2>&1)
+check "unapproving an enqueued entry changes nothing" '[[ "$out" == *"nothing to unapprove"* ]]'
+out=$($LOCAL_MERGE_QUEUE unapprove 2>&1)
+check "unapprove refuses to guess a branch"        '[[ "$out" == *"name the branches"* ]]'
+# beta is still approved from section 3, so clear the whole repo before asking
+# whether an unapproved queue lands anything.
+$LOCAL_MERGE_QUEUE unapprove --all --repo t >/dev/null 2>&1
 before2=$(git -C "$ROOT/repo" rev-parse main)
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
-check "an unadmitted branch does not land"       '[[ "$(git -C "$ROOT/repo" rev-parse main)" == "$before2" && "$out" == *"nothing admitted"* ]]'
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
+check "an unapproved branch does not land"       '[[ "$(git -C "$ROOT/repo" rev-parse main)" == "$before2" && "$out" == *"nothing approved"* ]]'
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
 
 echo
-echo "── 4. a clean drain lands both, and cleans up ────────────────────"
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+echo "── 4. a clean land lands both, and cleans up ────────────────────"
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 cd "$ROOT/repo"
 check "main gained two merge commits"      '[[ $(git rev-list --count --merges main) == 2 ]]'
 check "alpha.txt landed"                   '[[ -f "$ROOT/repo/alpha.txt" ]]'
@@ -136,13 +136,13 @@ mk_branch follower   follower.txt "follower"
 cd "$ROOT/repo"
 printf 'line one\nMAIN MOVED\nline three\n' > shared.txt
 git commit -qam "main touches shared.txt" && git push -q origin main
-cd "$ROOT/repo-conflictor" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-cd "$ROOT/repo-follower"   && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
+cd "$ROOT/repo-conflictor" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+cd "$ROOT/repo-follower"   && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
 main_before=$(git -C "$ROOT/repo" rev-parse main)
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1; rc=$?
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1; rc=$?
 main_after=$(git -C "$ROOT/repo" rev-parse main)
-check "drain exits 2 on a stall"           '[[ $rc == 2 ]]'
+check "land exits 2 on a stall"           '[[ $rc == 2 ]]'
 check "main did not move"                  '[[ "$main_before" == "$main_after" ]]'
 check "follower did NOT land out of order" '[[ ! -f "$ROOT/repo/follower.txt" ]]'
 check "a stall report was written"         '[[ -f "$LOCAL_MERGE_QUEUE_STATE/reports/t-conflictor.md" ]]'
@@ -151,8 +151,8 @@ check "a stall report was written"         '[[ -f "$LOCAL_MERGE_QUEUE_STATE/repo
 # a conflict stall is the ONE kind where resolve-and-continue is the right advice.
 check "…telling the fixer to finish the rebase" 'grep -q "git rebase --continue" "$LOCAL_MERGE_QUEUE_STATE/reports/t-conflictor.md"'
 check "the rebase is left in progress"     '[[ -d "$ROOT/repo/.git/worktrees/repo-conflictor/rebase-merge" || -d "$ROOT/repo/.git/worktrees/repo-conflictor/rebase-apply" ]]'
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
-check "a second drain refuses while stalled" '[[ "$out" == *stalled* ]]'
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
+check "a second land refuses while stalled" '[[ "$out" == *stalled* ]]'
 
 echo
 echo "── 6. resume after the fixer resolves ────────────────────────────"
@@ -170,9 +170,9 @@ echo "── 7. a protected path escalates to the owner ────────
 mk_branch prosefix harness/voice.md "branch prose"
 cd "$ROOT/repo"
 echo "main prose" > harness/voice.md && git commit -qam "main touches harness" && git push -q origin main
-cd "$ROOT/repo-prosefix" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+cd "$ROOT/repo-prosefix" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 check "protected conflict is flagged as owner's call" '[[ "$out" == *"A conflicted path is protected"* ]]'
 check "report says OWNER DECISION REQUIRED" 'grep -q "OWNER DECISION REQUIRED" "$LOCAL_MERGE_QUEUE_STATE/reports/t-prosefix.md"'
 cd "$ROOT/repo-prosefix"
@@ -187,19 +187,19 @@ echo
 echo "── 8. a failing gate stalls instead of landing ───────────────────"
 mk_branch gatebreaker base.txt "x"
 cd "$ROOT/repo-gatebreaker" && git rm -q base.txt && git commit -qm "remove base.txt" && git push -q origin gatebreaker
-$LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
 main_before=$(git -C "$ROOT/repo" rev-parse main)
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1; rc=$?
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1; rc=$?
 check "failing gate exits 2"        '[[ $rc == 2 ]]'
 check "failing gate does not land"  '[[ "$main_before" == $(git -C "$ROOT/repo" rev-parse main) ]]'
 check "base.txt still on main"      '[[ -f "$ROOT/repo/base.txt" ]]'
 
 echo
 echo "── 9. preflight refuses a dirty primary checkout ─────────────────"
-$LOCAL_MERGE_QUEUE drop gatebreaker >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE dequeue gatebreaker >/dev/null 2>&1
 echo dirt > "$ROOT/repo/dirt.txt"
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 check "refuses to merge onto a dirty main" '[[ "$out" == *"uncommitted changes"* ]]'
 rm "$ROOT/repo/dirt.txt"
 
@@ -209,9 +209,9 @@ mk_branch leftover leftover.txt "leftover"
 cd "$ROOT/repo"
 git merge -q --no-ff -m "merged by hand, as the old workflow did" leftover && git push -q origin main
 merges_before=$(git rev-list --count --merges main)
-cd "$ROOT/repo-leftover" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+cd "$ROOT/repo-leftover" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 cd "$ROOT/repo"
 check "recognised as already in main"   '[[ "$out" == *"cleanup only"* ]]'
 check "no second merge commit made"     '[[ $(git rev-list --count --merges main) == $merges_before ]]'
@@ -231,9 +231,9 @@ cat > "$ROOT/repo-scaffolded/BRANCH.md" <<'MD'
 # scaffolded — working notes that must never land
 MD
 cd "$ROOT/repo-scaffolded" && git add -A && git commit -qm "branch notes" && git push -q origin scaffolded
-$LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
 cd "$ROOT/repo"
 check "the branch's work landed"            '[[ -f "$ROOT/repo/scaffold.txt" ]]'
 check "its BRANCH.md did NOT land"          '[[ ! -f "$ROOT/repo/BRANCH.md" ]]'
@@ -251,9 +251,9 @@ echo "── 12. a proven-contained ref is deleted even if -d balks ────
 # for a reason we cannot reproduce (four branches on 2026-08-19), the merge queue
 # answers that question directly instead of leaving the ref behind.
 mk_branch stubborn stubborn.txt "stubborn"
-cd "$ROOT/repo-stubborn" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
+cd "$ROOT/repo-stubborn" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
 cd "$ROOT/repo"
 check "stubborn landed"                 '[[ -f "$ROOT/repo/stubborn.txt" ]]'
 check "its local ref is gone"           '! git rev-parse --verify -q refs/heads/stubborn >/dev/null'
@@ -262,7 +262,7 @@ check "and status reports no residue"   '[[ "$($LOCAL_MERGE_QUEUE status t 2>&1)
 echo
 echo "── 13. status names the residue a failed cleanup leaves ──────────"
 # The failure this covers is silent by nature: a cleanup step fails at the end
-# of a drain whose last two hundred lines are gate output, and the only trace is
+# of a landing run whose last two hundred lines are gate output, and the only trace is
 # a local ref nobody looks at. Three accumulated in one repo here in one day
 # (2026-08-19) before a roster sweep found them.
 # SCOPED TO THE SANDBOX REPO (`status t`). Unscoped, it reports every repo the
@@ -320,10 +320,10 @@ git worktree add -q "$ROOT/repo-fold" fold >/dev/null 2>&1
 cd "$ROOT/repo-fold" && git push -qu origin fold 2>/dev/null
 tested=$(git rev-parse HEAD^{tree})
 tested_shared=$(cat shared.txt)
-$LOCAL_MERGE_QUEUE handoff --note "four folded branches" >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
-[[ -n "${LOCAL_MERGE_QUEUE_TEST_DEBUG:-}" ]] && { echo "--- drain output ---"; echo "$out"; echo "---"; }
+$LOCAL_MERGE_QUEUE enqueue --note "four folded branches" >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
+[[ -n "${LOCAL_MERGE_QUEUE_TEST_DEBUG:-}" ]] && { echo "--- land output ---"; echo "$out"; echo "---"; }
 cd "$ROOT/repo"
 check "a folded branch does not stall on itself" '[[ "$out" != *STALLED* ]]'
 check "…it lands"                                'git merge-base --is-ancestor origin/fold main 2>/dev/null || [[ "$out" == *landed* ]]'
@@ -339,7 +339,7 @@ echo
 echo "── 15. a worktree with no generated environment is set up, not stalled on ─"
 # THE REGRESSION THIS GUARDS. An agent whose own work needed no build never runs
 # the repo's fresh-worktree setup, so the gate is the first thing to meet the
-# empty node_modules — minutes into a drain, dying on something that is not the
+# empty node_modules — minutes into a landing run, dying on something that is not the
 # branch's fault. Three times on 2026-08-24, twice as `esbuild ENOENT`, each one
 # costing a person a diagnose-install-resume cycle.
 #
@@ -361,11 +361,11 @@ cat > "$ROOT/repos.json" <<JSON
 } } }
 JSON
 mk_branch unset-env unset-env.txt "unset"
-cd "$ROOT/repo-unset-env" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+cd "$ROOT/repo-unset-env" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 cd "$ROOT/repo"
-check "the drain says it is setting the worktree up" '[[ "$out" == *"no generated environment"* ]]'
+check "the landing run says it is setting the worktree up" '[[ "$out" == *"no generated environment"* ]]'
 check "the setup commands ran"                       '[[ -f "$ROOT/setup.log" && $(grep -c ran "$ROOT/setup.log") == 1 ]]'
 # The gate step `test -f .setup-done` can only pass on a worktree setup reached
 # first, so this asserts the ORDER as well as the fact.
@@ -378,16 +378,16 @@ check "LOCAL_MERGE_QUEUE_CHECKOUT names the primary checkout" \
 
 echo
 echo "── 16. an already-set-up worktree pays for no setup ──────────────"
-# The probe is what keeps this free: a drain of a working worktree runs one
+# The probe is what keeps this free: a landing run of a working worktree runs one
 # `test` and nothing else. Without it every landing would pay a full npm install.
 mk_branch already-set already-set.txt "already"
-cd "$ROOT/repo-already-set" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-# AFTER the handoff: the marker is untracked, and handoff refuses a dirty
-# worktree — which is the guard working, and is why setup runs during a drain
+cd "$ROOT/repo-already-set" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+# AFTER the enqueue: the marker is untracked, and enqueue refuses a dirty
+# worktree — which is the guard working, and is why setup runs during a landing run
 # rather than being something a branch agent leaves lying in the tree.
 touch "$ROOT/repo-already-set/.setup-done"
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 check "and it lands as normal"              '[[ -f "$ROOT/repo/already-set.txt" ]]'
 check "the probe short-circuits the setup"  '[[ "$out" != *"no generated environment"* ]]'
 check "…no setup step is even printed"      '[[ "$out" != *"setup: "* ]]'
@@ -407,10 +407,10 @@ cat > "$ROOT/repos.json" <<JSON
 } } }
 JSON
 mk_branch bad-setup bad-setup.txt "bad"
-cd "$ROOT/repo-bad-setup" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
+cd "$ROOT/repo-bad-setup" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
 main_before=$(git -C "$ROOT/repo" rev-parse main)
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1); rc=$?
+out=$($LOCAL_MERGE_QUEUE land t 2>&1); rc=$?
 check "a failing setup exits 2"        '[[ $rc == 2 ]]'
 check "…and lands nothing"             '[[ "$main_before" == $(git -C "$ROOT/repo" rev-parse main) ]]'
 check "…naming the step that failed"   '[[ "$out" == *"the step that failed"* ]]'
@@ -441,7 +441,7 @@ check "the fixed branch lands"                   '[[ -f "$ROOT/repo/bad-setup.tx
 check "queue empty after the setup stall clears" '[[ $(node -e "console.log(JSON.parse(require(\"fs\").readFileSync(\"$LOCAL_MERGE_QUEUE_STATE/queue.json\")).entries.length)") == 0 ]]'
 
 echo
-echo "── 19. with no deploy config, nothing about a drain changes ──────"
+echo "── 19. with no deploy config, nothing about a landing run changes ──────"
 # INVARIANT: the skip marker is per-repo configuration, never a global change of
 # behaviour. Another repo lands through this same queue and its main is not a
 # deploy trigger; a marker in its merge messages would be noise at best and a
@@ -460,20 +460,20 @@ subj_for () { git -C "$ROOT/repo" log main --format=%s | grep -m1 -E "^Merge $1(
 markers ()  { git -C "$ROOT/repo" log main --format=%s | grep -cF '[skip-deploy]'; }
 mk_branch nodeploy-one nodeploy-one.txt "one"
 mk_branch nodeploy-two nodeploy-two.txt "two"
-cd "$ROOT/repo-nodeploy-one" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-cd "$ROOT/repo-nodeploy-two" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
+cd "$ROOT/repo-nodeploy-one" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+cd "$ROOT/repo-nodeploy-two" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
 cd "$ROOT/repo"
 check "both land as they always did"        '[[ -f "$ROOT/repo/nodeploy-one.txt" && -f "$ROOT/repo/nodeploy-two.txt" ]]'
 check "no merge message carries a marker"   '[[ $(markers) == 0 ]]'
 check "and no redeploy commit was invented" '[[ -z "$(git log main --format=%s --grep="^Redeploy")" ]]'
 
 echo
-echo "── 20. one build per drain: every merge but the last is marked ───"
+echo "── 20. one build per landing run: every merge but the last is marked ───"
 # The owner's ask, 2026-08-29: "main should just redeploy at the end of the
-# draining." That site's production deploy IS the push to main, so a
-# drain of three branches shipped three builds and two of them were states that
+# landing." That site's production deploy IS the push to main, so a
+# land of three branches shipped three builds and two of them were states that
 # existed for as long as the next gate took.
 cat > "$ROOT/repos.json" <<JSON
 { "repos": { "t": {
@@ -489,13 +489,13 @@ before_markers=$(markers)
 mk_branch deploy-a deploy-a.txt "a"
 mk_branch deploy-b deploy-b.txt "b"
 mk_branch deploy-c deploy-c.txt "c"
-for b in deploy-a deploy-b deploy-c; do (cd "$ROOT/repo-$b" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1); done
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t --dry-run 2>&1)
+for b in deploy-a deploy-b deploy-c; do (cd "$ROOT/repo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1); done
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t --dry-run 2>&1)
 check "a dry run says which one the host would build" \
   '[[ "$out" == *"its merge would be unmarked"* && "$out" == *"the host skips that build"* ]]'
 check "…and still leaves main where it was" '[[ $(markers) == $before_markers ]]'
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
 cd "$ROOT/repo"
 check "all three landed"                     '[[ -f "$ROOT/repo/deploy-a.txt" && -f "$ROOT/repo/deploy-b.txt" && -f "$ROOT/repo/deploy-c.txt" ]]'
 check "the first merge is marked"            '[[ "$(subj_for deploy-a)" == *"[skip-deploy]"* ]]'
@@ -512,22 +512,22 @@ check "no branch commit carries the marker" \
 check "no redeploy commit was needed"         '[[ -z "$(git log main --format=%s --grep="^Redeploy")" ]]'
 
 echo
-echo "── 21. a single-entry drain deploys normally, marker-free ────────"
+echo "── 21. a single-entry land deploys normally, marker-free ────────"
 before_markers=$(markers)
 mk_branch deploy-solo deploy-solo.txt "solo"
-cd "$ROOT/repo-deploy-solo" && $LOCAL_MERGE_QUEUE handoff --note "on its own" >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+cd "$ROOT/repo-deploy-solo" && $LOCAL_MERGE_QUEUE enqueue --note "on its own" >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 cd "$ROOT/repo"
 check "it lands"                          '[[ -f "$ROOT/repo/deploy-solo.txt" ]]'
 check "its merge is unmarked"             '[[ "$(subj_for deploy-solo)" != *"[skip-deploy]"* ]]'
-check "the drain says so"                 '[[ "$out" == *"the last of this run, so the host builds it"* ]]'
+check "the landing run says so"                 '[[ "$out" == *"the last of this run, so the host builds it"* ]]'
 check "no marker was written at all"      '[[ $(markers) == $before_markers ]]'
 check "and no redeploy commit"            '[[ -z "$(git log main --format=%s --grep="^Redeploy")" ]]'
 
 echo
 echo "── 22. a stall on the final entry: no deploy until resume lands it ─"
-# The half-drained state is the thing this feature exists to keep off
+# The half-landed state is the thing this feature exists to keep off
 # production, so a stall deliberately does NOT publish. The resume that lands
 # the last entry is what deploys.
 mk_branch dep-first dep-first.txt "first"
@@ -535,12 +535,12 @@ mk_branch dep-stall shared.txt $'line one\nBRANCH CLAIMS THIS\nline three\n'
 cd "$ROOT/repo"
 printf 'line one\nMAIN CLAIMS THIS\nline three\n' > shared.txt
 git commit -qam "main touches shared.txt again" && git push -q origin main
-cd "$ROOT/repo-dep-first" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-cd "$ROOT/repo-dep-stall" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1; rc=$?
+cd "$ROOT/repo-dep-first" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+cd "$ROOT/repo-dep-stall" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1; rc=$?
 cd "$ROOT/repo"
-check "the drain stalls"                       '[[ $rc == 2 ]]'
+check "the landing run stalls"                       '[[ $rc == 2 ]]'
 check "the entry ahead of it landed, marked"   '[[ "$(subj_for dep-first)" == *"[skip-deploy]"* ]]'
 check "main is left NOT deploying, on purpose" '[[ "$(git log -1 --format=%B main)" == *"[skip-deploy]"* ]]'
 check "no redeploy commit papered over it"     '[[ -z "$(git log main --format=%s --grep="^Redeploy")" ]]'
@@ -561,15 +561,15 @@ out=$($LOCAL_MERGE_QUEUE status t 2>&1)
 check "status stops reporting an undeployed tip" '[[ "$out" != *"told to skip"* ]]'
 
 echo
-echo "── 23. the last entry dropped MID-DRAIN: the new last one deploys ─"
+echo "── 23. the last entry dequeued MID-LANDING: the new last one deploys ─"
 # The lookahead is asked of the queue as it stands at the merge, not of the
 # snapshot taken before the gate — a gate takes minutes and an entry can leave
-# inside them. Simulated exactly: a gate step drops the trailing entry while the
+# inside them. Simulated exactly: a gate step dequeues the trailing entry while the
 # middle one is being gated, so the middle one becomes the last of the run and
 # must be the one the host builds.
-cat > "$ROOT/drop-last.sh" <<SH
+cat > "$ROOT/dequeue-last.sh" <<SH
 #!/bin/bash
-[[ "\$PWD" == *repo-drop-mid ]] && $LOCAL_MERGE_QUEUE drop drop-last >/dev/null 2>&1
+[[ "\$PWD" == *repo-dequeue-mid ]] && $LOCAL_MERGE_QUEUE dequeue dequeue-last >/dev/null 2>&1
 exit 0
 SH
 cat > "$ROOT/repos.json" <<JSON
@@ -577,30 +577,30 @@ cat > "$ROOT/repos.json" <<JSON
   "checkout": "$ROOT/repo",
   "mainBranch": "main",
   "deploy": { "skipMarker": "[skip-deploy]" },
-  "gate": ["test -f base.txt", "bash $ROOT/drop-last.sh"],
+  "gate": ["test -f base.txt", "bash $ROOT/dequeue-last.sh"],
   "finalCheck": "true",
   "protectedPaths": ["harness/"]
 } } }
 JSON
-mk_branch drop-head drop-head.txt "head"
-mk_branch drop-mid  drop-mid.txt  "mid"
-mk_branch drop-last drop-last.txt "last"
-for b in drop-head drop-mid drop-last; do (cd "$ROOT/repo-$b" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1); done
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
+mk_branch dequeue-head dequeue-head.txt "head"
+mk_branch dequeue-mid  dequeue-mid.txt  "mid"
+mk_branch dequeue-last dequeue-last.txt "last"
+for b in dequeue-head dequeue-mid dequeue-last; do (cd "$ROOT/repo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1); done
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
 cd "$ROOT/repo"
-check "the head merge is marked"                '[[ "$(subj_for drop-head)" == *"[skip-deploy]"* ]]'
-check "the dropped entry never landed"          '[[ ! -f "$ROOT/repo/drop-last.txt" ]]'
-check "THE NEW LAST ENTRY IS UNMARKED"          '[[ "$(subj_for drop-mid)" != *"[skip-deploy]"* ]]'
+check "the head merge is marked"                '[[ "$(subj_for dequeue-head)" == *"[skip-deploy]"* ]]'
+check "the dequeued entry never landed"          '[[ ! -f "$ROOT/repo/dequeue-last.txt" ]]'
+check "THE NEW LAST ENTRY IS UNMARKED"          '[[ "$(subj_for dequeue-mid)" != *"[skip-deploy]"* ]]'
 check "so the tip deploys"                      '[[ "$(git log -1 --format=%B main)" != *"[skip-deploy]"* ]]'
 
 echo
-echo "── 24. an entry dropped AFTER a stall: the tip is republished ─────"
+echo "── 24. an entry dequeued AFTER a stall: the tip is republished ─────"
 # The lookahead cannot see this one coming: the trailing entry is still queued
 # when the entry ahead of it merges, and only afterwards does a person decide to
-# drop it rather than fix it. main is then landed, pushed, and sitting on a
+# dequeue it rather than fix it. main is then landed, pushed, and sitting on a
 # build the host was told to ignore, with an empty queue and a healthy-looking
-# log. The next drain settles it from the state rather than from memory.
+# log. The next landing run settles it from the state rather than from memory.
 cat > "$ROOT/repos.json" <<JSON
 { "repos": { "t": {
   "checkout": "$ROOT/repo",
@@ -616,16 +616,16 @@ mk_branch res-stall shared.txt $'line one\nBRANCH AGAIN\nline three\n'
 cd "$ROOT/repo"
 printf 'line one\nMAIN AGAIN\nline three\n' > shared.txt
 git commit -qam "main touches shared.txt once more" && git push -q origin main
-cd "$ROOT/repo-res-first" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-cd "$ROOT/repo-res-stall" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
+cd "$ROOT/repo-res-first" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+cd "$ROOT/repo-res-stall" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
 cd "$ROOT/repo"
 check "main is left on a skipped build"    '[[ "$(git log -1 --format=%B main)" == *"[skip-deploy]"* ]]'
-$LOCAL_MERGE_QUEUE drop res-stall >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE dequeue res-stall >/dev/null 2>&1
 tip_before=$(git rev-parse main)
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
-check "the drain says it is publishing"    '[[ "$out" == *"sitting on a skipped build"* ]]'
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
+check "the landing run says it is publishing"    '[[ "$out" == *"sitting on a skipped build"* ]]'
 check "a redeploy commit was pushed"       '[[ -n "$(git log main --format=%s --grep="^Redeploy")" ]]'
 check "…on top of the merge, landing nothing else" '[[ "$(git rev-parse main~1)" == "$tip_before" ]]'
 # THE SELF-CANCELLING COMMIT. The natural sentence to write in that message
@@ -635,10 +635,10 @@ check "THE REDEPLOY COMMIT CARRIES NO MARKER" '[[ "$(git log -1 --format=%B main
 check "origin has it too"                     '[[ "$(git rev-parse main)" == "$(git rev-parse origin/main)" ]]'
 out=$($LOCAL_MERGE_QUEUE status t 2>&1)
 check "status is quiet again"                 '[[ "$out" != *"told to skip"* ]]'
-# And it is idempotent: a second drain over a deploying tip changes nothing.
+# And it is idempotent: a second land over a deploying tip changes nothing.
 tip_after=$(git rev-parse main)
-$LOCAL_MERGE_QUEUE drain t >/dev/null 2>&1
-check "a drain over a deploying tip adds nothing" '[[ "$(git rev-parse main)" == "$tip_after" ]]'
+$LOCAL_MERGE_QUEUE land t >/dev/null 2>&1
+check "a landing run over a deploying tip adds nothing" '[[ "$(git rev-parse main)" == "$tip_after" ]]'
 
 echo
 echo "── 25. a PR stacked on the landing branch is retargeted, not closed ─"
@@ -686,10 +686,10 @@ cat > "$ROOT/repos.json" <<JSON
 } } }
 JSON
 mk_branch based-on based-on.txt "based on"
-cd "$ROOT/repo-based-on" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
+cd "$ROOT/repo-based-on" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
 : > "$GH_STUB_LOG"
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 cd "$ROOT/repo"
 check "the branch still lands"          '[[ -f "$ROOT/repo/based-on.txt" ]]'
 check "the stacked PR is retargeted"    '[[ "$out" == *"pr #91 (stacked-on-it) retargeted from based-on onto main"* ]]'
@@ -708,9 +708,9 @@ if [[ "$1 $2" == "pr list" && -n "$head" ]]; then echo '[{"number":92,"state":"M
 exit 1
 STUB
 mk_branch based-on-two based-on-two.txt "two"
-cd "$ROOT/repo-based-on-two" && $LOCAL_MERGE_QUEUE handoff >/dev/null 2>&1
-$LOCAL_MERGE_QUEUE admit --all >/dev/null 2>&1
-out=$($LOCAL_MERGE_QUEUE drain t 2>&1)
+cd "$ROOT/repo-based-on-two" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve --all >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
 cd "$ROOT/repo"
 check "a failed retarget says so"        '[[ "$out" == *"COULD NOT LIST THE PULL REQUESTS BASED ON based-on-two"* ]]'
 check "…and lands the branch anyway"     '[[ -f "$ROOT/repo/based-on-two.txt" ]]'
@@ -719,16 +719,16 @@ rm -f "$ROOT/bin/gh"
 
 # ── a branch name two repos share (2026-09-26) ──────────────────────────────
 # `order fitness-functions --first` moved the website's entry when the app's was
-# meant, because order and drop took the first entry with that name anywhere in
+# meant, because order and dequeue took the first entry with that name anywhere in
 # the queue. They now scope by --repo or the worktree, and refuse to guess.
 cd "$ROOT"
 cp "$LOCAL_MERGE_QUEUE_STATE/queue.json" "$ROOT/queue.saved"
 cat > "$LOCAL_MERGE_QUEUE_STATE/queue.json" <<'QJSON'
 {"entries":[
- {"repo":"r1","branch":"first","status":"held"},
- {"repo":"r1","branch":"shared","status":"held"},
- {"repo":"r2","branch":"other","status":"held"},
- {"repo":"r2","branch":"shared","status":"held"}
+ {"repo":"r1","branch":"first","status":"enqueued"},
+ {"repo":"r1","branch":"shared","status":"enqueued"},
+ {"repo":"r2","branch":"other","status":"enqueued"},
+ {"repo":"r2","branch":"shared","status":"enqueued"}
 ]}
 QJSON
 qorder () { node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json")).entries.map(e=>e.repo+"/"+e.branch).join(","))'; }
@@ -736,15 +736,15 @@ out=$($LOCAL_MERGE_QUEUE order shared --first 2>&1)
 check "order refuses a name two repos share"   '[[ "$out" == *"queued in r1 and r2"* && "$(qorder)" == "r1/first,r1/shared,r2/other,r2/shared" ]]'
 $LOCAL_MERGE_QUEUE order shared --first --repo r2 >/dev/null 2>&1
 check "order --repo moves the entry in that repo"   '[[ "$(qorder)" == "r2/shared,r1/first,r1/shared,r2/other" ]]'
-out=$($LOCAL_MERGE_QUEUE drop shared 2>&1)
-check "drop refuses a name two repos share"    '[[ "$out" == *"is queued in r2 and r1"* && "$(qorder)" == "r2/shared,r1/first,r1/shared,r2/other" ]]'
-out=$($LOCAL_MERGE_QUEUE admit shared 2>&1)
-check "admit refuses a name two repos share"   '[[ "$out" == *"is queued in r2 and r1"* ]]'
-$LOCAL_MERGE_QUEUE admit shared --repo r1 >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE dequeue shared 2>&1)
+check "dequeue refuses a name two repos share"    '[[ "$out" == *"is queued in r2 and r1"* && "$(qorder)" == "r2/shared,r1/first,r1/shared,r2/other" ]]'
+out=$($LOCAL_MERGE_QUEUE approve shared 2>&1)
+check "approve refuses a name two repos share"   '[[ "$out" == *"is queued in r2 and r1"* ]]'
+$LOCAL_MERGE_QUEUE approve shared --repo r1 >/dev/null 2>&1
 st=$(node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));console.log(q.entries.filter(e=>e.branch=="shared").map(e=>e.repo+":"+e.status).join(","))')
-check "admit --repo admits the entry in that repo only" '[[ "$st" == "r2:held,r1:admitted" ]]'
-$LOCAL_MERGE_QUEUE drop shared --repo r1 >/dev/null 2>&1
-check "drop --repo drops the entry in that repo only"   '[[ "$(qorder)" == "r2/shared,r1/first,r2/other" ]]'
+check "approve --repo approves the entry in that repo only" '[[ "$st" == "r2:enqueued,r1:approved" ]]'
+$LOCAL_MERGE_QUEUE dequeue shared --repo r1 >/dev/null 2>&1
+check "dequeue --repo dequeues the entry in that repo only"   '[[ "$(qorder)" == "r2/shared,r1/first,r2/other" ]]'
 cp "$ROOT/queue.saved" "$LOCAL_MERGE_QUEUE_STATE/queue.json"
 cd "$ROOT/repo"
 

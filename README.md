@@ -1,9 +1,9 @@
 # local-merge-queue
 
 A local merge queue for git, for the case where several branches are in flight at once
-against a `main` that moves under them. Coding agents finish a branch and hand it to the
-queue instead of merging it. The owner admits the entries that should land. Then
-`local-merge-queue drain <repo>` lands each admitted branch one at a time, putting it on top of the
+against a `main` that moves under them. Coding agents finish a branch and enqueue it
+queue instead of merging it. The owner approves the entries that should land. Then
+`local-merge-queue land <repo>` lands each approved branch one at a time, putting it on top of the
 `main` it will actually live on, running a gate you configure, merging `--no-ff`, pushing,
 and removing the worktree and deleting the branch both locally and on the remote.
 
@@ -52,23 +52,23 @@ curl -o ~/.config/local-merge-queue/repos.json \
   https://raw.githubusercontent.com/megan-holstein/local-merge-queue/main/repos.example.json
 ```
 
-Then work a branch in its own worktree, as usual, and hand it over from inside that
+Then work a branch in its own worktree, as usual, and enqueue it from inside that
 worktree when it is finished:
 
 ```sh
 cd ~/code/myapp-somefeature
 git push -u origin somefeature
-local-merge-queue handoff --note "what this is, in one clause"
+local-merge-queue enqueue --note "what this is, in one clause"
 ```
 
-Nothing has merged. The entry sits `held`. Look at the queue, admit what should land, and
-drain:
+Nothing has merged. The entry sits `enqueued`. Look at the queue, approve what should land, and
+land:
 
 ```sh
 local-merge-queue status
-local-merge-queue admit somefeature
-local-merge-queue drain myapp --dry-run    # the order it would land in, nothing touched
-local-merge-queue drain myapp
+local-merge-queue approve somefeature
+local-merge-queue land myapp --dry-run    # the order it would land in, nothing touched
+local-merge-queue land myapp
 ```
 
 ## The lifecycle
@@ -78,11 +78,11 @@ local-merge-queue drain myapp
  ────────────                   ─────────                     ───────────
  finish + verify
  push
- local-merge-queue handoff ──►  held
-                                local-merge-queue admit  ──►  admitted
-                                local-merge-queue unadmit ◄─  (back to held, any
-                                                              time before the drain)
-                                                              local-merge-queue drain
+ local-merge-queue enqueue ──►  enqueued
+                                local-merge-queue approve  ──►  approved
+                                local-merge-queue unapprove ◄─  (back to enqueued, any
+                                                              time before the landing run)
+                                                              local-merge-queue land
                                                                 rebase onto origin/main
                                                                   (skipped if already on top)
                                                                 set the worktree up, if unset
@@ -95,24 +95,24 @@ local-merge-queue drain myapp
                                                                 exactly one deploy, at the end
 ```
 
-**Handing off is not merging.** An entry sits `held` until the owner admits it, so a
-standing rule that branches land only on the owner's word survives intact. Admission is
-that word. Hand off freely the moment a branch is genuinely ready.
+**Enqueuing is not merging.** An entry sits `enqueued` until the owner approves it, so a
+standing rule that branches land only on the owner's word survives intact. Approval is
+that word. Enqueue freely the moment a branch is genuinely ready.
 
-**Admission is reversible right up to the drain.** `local-merge-queue unadmit` puts an admitted
-entry back to `held`, for a change of mind or one more look before it lands, and it is
-the command to reach for rather than `drop`, which takes the entry out of the queue
+**Approval is reversible right up to the landing run.** `local-merge-queue unapprove` puts an approved
+entry back to `enqueued`, for a change of mind or one more look before it lands, and it is
+the command to reach for rather than `dequeue`, which takes the entry out of the queue
 altogether and loses the order the branches were meant to land in. Once a branch is
-actually landing, unadmit stops applying. A stalled entry is refused, and `resume` or
-`drop` govern that one instead.
+actually landing, unapprove stops applying. A stalled entry is refused, and `resume` or
+`dequeue` govern that one instead.
 
 ## What a branch agent does
 
 Finish the work, verify it, commit, push. Then, **from inside the branch's worktree**,
-hand it over:
+enqueue it:
 
 ```sh
-local-merge-queue handoff --note "what this is, in one clause"
+local-merge-queue enqueue --note "what this is, in one clause"
 ```
 
 The merge queue detects the repo and the branch from the worktree. It refuses a dirty
@@ -135,7 +135,7 @@ If the branch must land after another one, in the same repo or a different one, 
 that and the merge queue holds it back until the dependency is contained in its own `main`.
 
 ```sh
-local-merge-queue handoff --after otherrepo:some-prerequisite
+local-merge-queue enqueue --after otherrepo:some-prerequisite
 ```
 
 Then report and stop. Do not merge, do not clean up, do not touch `main`.
@@ -149,58 +149,58 @@ pull request list disagreeing with git.
 - `git worktree remove` for a landed branch
 - `git branch -d` or `git push origin --delete` for a landed branch
 - closing a landed branch's pull request by hand, since the merge closes it as **merged**
-- rebasing a handed-off branch onto `main` to keep it fresh
-- `local-merge-queue drain` on the strength of approval language alone. "Approved for the merge queue"
-  and "admit these" authorize `admit` and nothing more, and the drain runs on its own
+- rebasing an enqueued branch onto `main` to keep it fresh
+- `local-merge-queue land` on the strength of approval language alone. "Approved for the merge queue"
+  and "approve these" authorize `approve` and nothing more, and the landing run runs on its own
   explicit word.
-- `local-merge-queue drop`, `local-merge-queue order`, `local-merge-queue unadmit` or `local-merge-queue resume` on an entry
-  somebody else handed off, which the next section covers
+- `local-merge-queue dequeue`, `local-merge-queue order`, `local-merge-queue unapprove` or `local-merge-queue resume` on an entry
+  somebody else enqueued, which the next section covers
 
 Creating a branch, its worktree and its pull request is unchanged and still the branch
-agent's, and the PR is now load-bearing, since `handoff` refuses a branch that has none.
+agent's, and the PR is now load-bearing, since `enqueue` refuses a branch that has none.
 
 ## The queue is shared, and other agents' entries are the point
 
-**Several agents hand off to one queue at the same time.** That is what a queue is for. A
+**Several agents enqueue into one queue at the same time.** That is what a queue is for. A
 queue holding only your own branch is the unusual case, and one holding three branches
 from three sessions you know nothing about is the ordinary one.
 
 So an entry you did not create is not a stray, not a leak, not a fault, and not evidence
-that something went wrong, and it needs no investigation and no warning in your hand-off.
-Do not drop it, reorder it, unadmit it, resume it, or tidy it. `drop`, `order`, `unadmit`
-and `resume` belong to whoever handed the branch off; using them on someone else's
-entry is the same class of mistake as merging by hand, with the extra cost that dropping
-or unadmitting a branch somebody had already approved takes that approval back silently.
+that something went wrong, and it needs no investigation and no warning in your enqueue note.
+Do not dequeue it, reorder it, unapprove it, resume it, or tidy it. `dequeue`, `order`, `unapprove`
+and `resume` belong to whoever enqueued the branch; using them on someone else's
+entry is the same class of mistake as merging by hand, with the extra cost that dequeuing
+or unapproving a branch somebody had already approved takes that approval back silently.
 
-**The one thing a shared queue does change is the check before a drain.** Admission is a
+**The one thing a shared queue does change is the check before a landing run.** Approval is a
 word given about the entries the owner was looking at, and it is not a standing
-certificate for whatever has been admitted since. So when the word to drain arrives, read
+certificate for whatever has been approved since. So when the word to land arrives, read
 the queue back first:
 
 ```sh
 local-merge-queue status                        # what is actually queued, and in what state
-local-merge-queue drain <repo> --dry-run        # the order it would land in, nothing touched
+local-merge-queue land <repo> --dry-run        # the order it would land in, nothing touched
 ```
 
-Confirm the admitted set is the set that was meant, and drain then. If something is
-admitted that nobody mentioned, name it in one line and ask. The two failure modes are
+Confirm the approved set is the set that was meant, and land then. If something is
+approved that nobody mentioned, name it in one line and ask. The two failure modes are
 landing it silently and treating its presence as an alarm.
 
 ## What the owner does
 
 ```sh
 local-merge-queue status                        # the whole queue, with each entry's delta
-local-merge-queue admit <branch> [<branch>…]    # the word
-local-merge-queue admit --all --repo mysite
-local-merge-queue unadmit <branch> [<branch>…]  # take the word back; the entry keeps its place
-local-merge-queue unadmit --all --repo myapp
+local-merge-queue approve <branch> [<branch>…]    # the word
+local-merge-queue approve --all --repo mysite
+local-merge-queue unapprove <branch> [<branch>…]  # take the word back; the entry keeps its place
+local-merge-queue unapprove --all --repo myapp
 local-merge-queue order <branch> --first        # land refactors early (see below)
-local-merge-queue drain myapp                   # land everything admitted
-local-merge-queue drain myapp --dry-run
-local-merge-queue drop <branch>                 # take it back out; the branch is untouched
+local-merge-queue land myapp                   # land everything approved
+local-merge-queue land myapp --dry-run
+local-merge-queue dequeue <branch>                 # take it back out; the branch is untouched
 ```
 
-**A branch name belongs to its repo.** Two repos can each queue a branch with the same name. `order`, `drop`, `admit` and `unadmit` take `--repo <repo>`, or use the repo of the worktree they run in; given a name two repos share and neither, they refuse and ask for `--repo` rather than guess, because a guess can move, admit or drop another session's entry.
+**A branch name belongs to its repo.** Two repos can each queue a branch with the same name. `order`, `dequeue`, `approve` and `unapprove` take `--repo <repo>`, or use the repo of the worktree they run in; given a name two repos share and neither, they refuse and ask for `--repo` rather than guess, because a guess can move, approve or dequeue another session's entry.
 
 ## A branch that already contains `main` is not rebased
 
@@ -276,7 +276,7 @@ local-merge-queue order the-refactor --first
 
 ## A worktree that arrives unset is set up rather than stalled on
 
-**A drain never stalls because a worktree lacks its generated environment.** Before the
+**A land never stalls because a worktree lacks its generated environment.** Before the
 gate runs, the merge queue asks the repo's `setupWhen` probe whether this worktree is a
 working checkout, and where the answer is no it runs the repo's `setup` itself, meaning
 `npm install`, the env files, the native rebuild, whatever that repo's fresh-worktree
@@ -285,7 +285,7 @@ steps happen to be.
 It exists because the seam it heals is structural rather than careless. A branch whose own
 work needed no build — a doc-adjacent fix, a test edit — is verified without one, so its
 worktree never acquires an environment at all, and the first thing anybody notices is the
-merge queue's gate dying minutes into a drain over something that is not the branch's fault.
+merge queue's gate dying minutes into a landing run over something that is not the branch's fault.
 Three branches went that way on 2026-08-24, twice as `esbuild ENOENT` out of an empty
 `node_modules`, each costing a person a diagnose-install-resume cycle for a queue whose
 whole point is not needing one.
@@ -293,7 +293,7 @@ whole point is not needing one.
 - **After the rebase, before the gate.** `npm install` then installs what the branch's own
   manifest asks for, on top of the `main` it will land on, and a branch that stalls at the
   rebase pays for no install at all.
-- **The probe is what keeps it free.** A drain of an already-working worktree runs one
+- **The probe is what keeps it free.** A land of an already-working worktree runs one
   `test`, moves on, installs nothing, copies nothing, and prints nothing about setup.
   Configure `setup` without a `setupWhen` and every landing pays the full cost, which is
   why each probe should cover every step of its own `setup`, so that a half-set-up
@@ -303,7 +303,7 @@ whole point is not needing one.
   prebuilt binary or a gitignored env file.
 
 None of this relieves a branch agent of setting up its own worktree, since an agent that
-builds or runs anything still needs one that works. It relieves the handoff seam, which is
+builds or runs anything still needs one that works. It relieves the enqueue seam, which is
 the one place nobody was looking.
 
 **A setup failure stalls, with its own report.** It is not a gate failure and says so,
@@ -317,9 +317,9 @@ they can never contradict the worktree. Fix the environment in the named worktre
 That correction reaches the gate-failure report too, which had been sending fixers to
 resolve a rebase that had already finished, since the day it was written.
 
-## One deploy per drain rather than one per branch
+## One deploy per landing run rather than one per branch
 
-**A repo whose host builds every push to `main` gets one build per drain run.** You
+**A repo whose host builds every push to `main` gets one build per landing run.** You
 configure that per repo, and the merge queue stays silent about it everywhere you have not.
 
 ```json
@@ -327,10 +327,10 @@ configure that per repo, and the merge queue stays silent about it everywhere yo
 ```
 
 The site this was built for deploys production from `main` through Vercel's git
-integration, so the push that lands each branch *is* a production build. Draining N
+integration, so the push that lands each branch *is* a production build. Landing N
 branches shipped N of them, and every one but the last shipped a state that existed for as
 long as the next gate took. The owner's ask, 2026-08-29, was that the site should simply
-redeploy at the end of the draining.
+redeploy at the end of the landing.
 
 So the merge queue appends the marker to the merge commit message of every entry that has
 another entry behind it, and leaves the **last merge of the run unmarked**. The site's own
@@ -348,26 +348,26 @@ cadence is load-bearing, and only the build per push is suppressed.
 Three properties are worth knowing before changing any of it:
 
 - **The lookahead is asked of the queue at the merge rather than before the gate.** A gate
-  takes minutes and an entry can be dropped inside them, which makes the entry being landed
-  the last one after all. Re-reading is what lets that drop land correctly.
+  takes minutes and an entry can be dequeued inside them, which makes the entry being landed
+  the last one after all. Re-reading is what lets that dequeue land correctly.
 - **A stall does not deploy.** The line is expected to continue, and shipping the
-  half-drained state mid-stall is the thing this exists to prevent. The `resume` that lands
+  half-landed state mid-stall is the thing this exists to prevent. The `resume` that lands
   the last entry is what deploys.
 - **The end of a run settles from the state rather than from memory.** The lookahead can
   still be wrong in two ways, since the entry behind this one may stall and then be
-  dropped, or may turn out to be cleanup-only and push nothing, and both leave `main` on a
+  dequeued, or may turn out to be cleanup-only and push nothing, and both leave `main` on a
   merge the host was told to ignore, with an empty queue and a healthy-looking log. So
   every run that does not stall ends by asking whether the tip of `main` carries the
   marker, and publishes it with an empty commit where it does. On the ordinary path the tip
   is unmarked and this does nothing at all. `local-merge-queue status` reports the same state, for
-  the stretch between the drop and the next drain.
+  the stretch between the dequeue and the next landing run.
 
 The one thing that must never appear in that empty commit's message is the marker itself.
 Naming the thing being fixed is the natural sentence to write, and it would make the commit
 that exists to trigger a build the next one skipped, silently and permanently. There is an
 assertion against it in the code and another in the suite.
 
-**Verified in production on 2026-09-01**, on the first real drain of a site configured this
+**Verified in production on 2026-09-01**, on the first real land of a site configured this
 way, three branches deep. Vercel canceled the two marked intermediate merges' builds and
 ran exactly one production build, on the final unmarked commit, 60s, Ready. What had not
 been verifiable locally, that Vercel actually skips on the marker, has its live
@@ -390,7 +390,7 @@ machine.
 
 A branch that is **already contained in `main`**, merged by hand before the merge queue
 existed with its worktree and its row still standing, is handled by handing it off and
-draining it like anything else. The merge queue notices that the branch is an ancestor of
+landing it like anything else. The merge queue notices that the branch is an ancestor of
 `main`, skips the rebase, the gate and the merge, and does the cleanup alone; that is the
 right way to clear a row nobody wants to resolve by hand.
 
@@ -411,16 +411,16 @@ any `gateEnv` those steps and the final check need in their environment, its `fi
 its `protectedPaths`, its `githubRepo` slug, and, where its host builds every push to
 `main`, its `deploy.skipMarker`.
 
-`githubRepo` is `owner/name`. Omit it and both pull request checks, the handoff
+`githubRepo` is `owner/name`. Omit it and both pull request checks, the enqueue step
 requirement and the post-landing verification, skip silently, which is what lets the test
 suite run against a bare local repo and what lets you use the merge queue on a repo that has
 no forge behind it at all.
 
 ## Safety properties, and the one thing it will not protect you from
 
-- One drain per repo at a time, enforced by an atomic `mkdir` lock. A lock whose holder
+- One land per repo at a time, enforced by an atomic `mkdir` lock. A lock whose holder
   died is broken automatically, and the merge queue says so when it breaks one.
-- It refuses to drain a repo whose primary checkout is dirty or off `main`, naming what is
+- It refuses to land a repo whose primary checkout is dirty or off `main`, naming what is
   dirty, so that another session's in-flight edit is never swept into a landing.
 - A push failure rolls the local merge back rather than leaving `main` ahead of `origin`.
 - `git branch -d` rather than `-D` does the deletion, so an unmerged branch survives.
@@ -454,7 +454,7 @@ Landing a branch ends in three cleanup steps, removing the worktree and deleting
 locally and on the remote, plus a read-back of its pull request, and the merge queue does all
 of them so that nobody has to remember to. **A step that fails says so in red and leaves a
 residue line**, rather than reporting failure in the same dim grey as success at the end of
-a drain whose last two hundred lines are gate output. Three branches in a row landed on
+a landing run whose last two hundred lines are gate output. Three branches in a row landed on
 2026-08-19 leaving their local ref behind, and it took a hand sweep to notice.
 
 Three things guard the branch deletion. `git worktree prune` runs between the removal and
@@ -523,8 +523,8 @@ length. Here is the field, and where this tool sits in it.
 
 Four of the merge queue's behaviours have no counterpart in anything surveyed. Protected paths
 that hard-stop a rebase and refuse to resume without the owner's word, deploy coalescing so
-that a drain of N branches triggers one host build, the rule against rebasing a branch that
-already merged `main`, and the held-until-admitted lifecycle with a reversible admission.
+that a landing run of N branches triggers one host build, the rule against rebasing a branch that
+already merged `main`, and the enqueue-then-approve lifecycle with a reversible approval.
 Whether you need any of those is the question worth asking, because if you do not, several
 of the tools below are better maintained than this one.
 
@@ -544,7 +544,7 @@ The field splits three ways:
   entrants, nearly all under six months old, under 150 stars, and single-repo. The most
   popular, [funador/claude-code-local-merge-queue](https://github.com/funador/claude-code-local-merge-queue),
   states its design directly. "No human reviews any of this before it lands. `checkCommand`
-  passing is the only gate." That is the assumption admission exists to refuse, and if you
+  passing is the only gate." That is the assumption approval exists to refuse, and if you
   do not share the objection, that tool is a smaller thing to adopt than this one.
 
 Two specific findings worth keeping:
@@ -577,8 +577,8 @@ by definition.
 ## Verification
 
 `test-local-merge-queue.sh`, kept with this tool, builds a throwaway repo with a bare origin and
-worktrees, and exercises the whole of it end to end. Handoff guards, admission gating,
-dry-run purity, a clean two-branch drain with full cleanup, a conflict stall with the
+worktrees, and exercises the whole of it end to end. Enqueue guards, approval gating,
+dry-run purity, a clean two-branch land with full cleanup, a conflict stall with the
 follower held back, resume, the protected-path escalation, a failing gate, the
 dirty-checkout refusal, the already-merged cleanup path, the scaffolding strip, the
 proven-contained force-delete, the residue report, the pre-merge publish that lets a pull
@@ -586,11 +586,11 @@ request close as merged, a branch that folded two sub-branches and caught up to 
 landing as it was tested rather than being reflattened, and the fresh-worktree setup in all
 three of its states, run when the probe fails, skipped entirely when it passes, and
 stalling on its own terms with a report that does not invent a rebase. Then the
-one-deploy-per-drain marker across every path it has, meaning a repo with no `deploy` key
-behaving byte-identically, a three-branch drain marking all but the last, a single-entry
-drain marking nothing, a stall on the final entry leaving `main` undeployed until `resume`
-lands it, the trailing entry dropped *during* the gate ahead of it, and the trailing entry
-dropped after a stall, where the next drain republishes the tip with an empty commit
+one-deploy-per-land marker across every path it has, meaning a repo with no `deploy` key
+behaving byte-identically, a three-branch land marking all but the last, a single-entry
+land marking nothing, a stall on the final entry leaving `main` undeployed until `resume`
+lands it, the trailing entry dequeued *during* the gate ahead of it, and the trailing entry
+dequeued after a stall, where the next landing run republishes the tip with an empty commit
 carrying no marker. Then the stacked-PR retarget, against a `gh` stubbed on `PATH` so that
 nothing here reaches GitHub: the PR moved onto `main` by a real `gh pr edit --base` argv,
 that call landing *before* the branch deletion rather than after it, and a `gh` that refuses

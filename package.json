@@ -1,7 +1,7 @@
 {
   "name": "local-merge-queue",
   "version": "0.2.0",
-  "description": "A local merge queue for git branches: hand off, admit, then land each one rebased onto current main, gated, merged --no-ff, pushed, and cleaned up.",
+  "description": "A local merge queue for git branches: enqueue, approve, then land each one rebased onto current main, gated, merged --no-ff, pushed, and cleaned up.",
   "type": "module",
   "bin": {
     "local-merge-queue": "./local-merge-queue.mjs"
