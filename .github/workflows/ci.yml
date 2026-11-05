@@ -9,8 +9,8 @@ on:
 jobs:
   test:
     # The suite is hermetic: it builds a throwaway bare repo as its own origin,
-    # registers it under a sandbox DRAINER_CONFIG with no `githubRepo`, and
-    # points DRAINER_STATE at a temporary directory. So it needs no network, no
+    # registers it under a sandbox LOCAL_MERGE_QUEUE_CONFIG with no `githubRepo`, and
+    # points LOCAL_MERGE_QUEUE_STATE at a temporary directory. So it needs no network, no
     # `gh` CLI and no credentials, and every section runs here — the PR checks
     # take the documented skip path rather than being switched off for CI.
     name: ${{ matrix.os }} · node ${{ matrix.node }}
@@ -27,24 +27,24 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # The drainer merges and commits on the runner's behalf. The suite sets an
+      # The merge queue merges and commits on the runner's behalf. The suite sets an
       # identity in the sandbox repo it builds, but a global one costs nothing
       # and keeps any step that reaches outside it from dying on "please tell me
       # who you are".
       - name: Give git an identity
         run: |
-          git config --global user.name  "drainer ci"
+          git config --global user.name  "local-merge-queue ci"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
 
       - name: Syntax check
-        run: node --check drainer.mjs
+        run: node --check local-merge-queue.mjs
 
       - name: The example config loads
         run: |
-          DRAINER_CONFIG="$PWD/repos.example.json" \
-          DRAINER_STATE="$(mktemp -d)" \
-          node drainer.mjs status
+          LOCAL_MERGE_QUEUE_CONFIG="$PWD/repos.example.json" \
+          LOCAL_MERGE_QUEUE_STATE="$(mktemp -d)" \
+          node local-merge-queue.mjs status
 
       - name: End-to-end suite
-        run: bash test-drainer.sh
+        run: bash test-local-merge-queue.sh

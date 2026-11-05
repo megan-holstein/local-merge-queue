@@ -1,3 +1,3 @@
-.drainer/
+.local-merge-queue/
 node_modules/
 .DS_Store

@@ -1,16 +1,20 @@
-# drainer
+# local-merge-queue
 
 A local merge queue for git, for the case where several branches are in flight at once
 against a `main` that moves under them. Coding agents finish a branch and hand it to the
 queue instead of merging it. The owner admits the entries that should land. Then
-`drainer drain <repo>` lands each admitted branch one at a time, putting it on top of the
+`local-merge-queue drain <repo>` lands each admitted branch one at a time, putting it on top of the
 `main` it will actually live on, running a gate you configure, merging `--no-ff`, pushing,
 and removing the worktree and deleting the branch both locally and on the remote.
+
+## Why
+
+GitHub's own merge queue is available only in public repositories owned by an organization, or in private repositories owned by organizations on GitHub Enterprise Cloud. A repository owned by a personal account cannot use it on any plan, and a private organization repository needs the Enterprise plan. local-merge-queue is a free alternative that gives any git repository the same discipline: each branch is rebased onto current `main`, gated, then merged one at a time, with the gates running on your own machine and no hosted service or GitHub App. See GitHub's documentation, [Managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
 
 It was written because one repository's `main` took 190 merges in 30 days. A branch
 verified on Tuesday's `main` is not a branch that works on Friday's, and every sweep of
 that repo turned up branches 40 and 70 commits behind whatever they would land on. The
-drainer exists so that nobody has to hold that in their head, and so that the answer to
+merge queue exists so that nobody has to hold that in their head, and so that the answer to
 "is this branch still good?" comes from rebasing it and running the gate rather than from
 somebody's recollection.
 
@@ -25,14 +29,14 @@ the `gh` CLI where you give it a repository slug, and it runs without one.
 One file, Node ESM, no dependencies. Node 20 or newer.
 
 ```sh
-npx github:megan-holstein/drainer --help
+npx github:megan-holstein/local-merge-queue --help
 ```
 
 Or clone it and put the bin somewhere on your PATH.
 
 ```sh
-git clone https://github.com/megan-holstein/drainer.git
-ln -s "$PWD/drainer/drainer.mjs" ~/bin/drainer
+git clone https://github.com/megan-holstein/local-merge-queue.git
+ln -s "$PWD/local-merge-queue/local-merge-queue.mjs" ~/bin/local-merge-queue
 ```
 
 It is deliberately not published to the npm registry.
@@ -43,9 +47,9 @@ Copy `repos.example.json` to your config path and edit it to name your checkout,
 gate, and whatever a fresh worktree of yours needs before the gate can run:
 
 ```sh
-mkdir -p ~/.config/drainer
-curl -o ~/.config/drainer/repos.json \
-  https://raw.githubusercontent.com/megan-holstein/drainer/main/repos.example.json
+mkdir -p ~/.config/local-merge-queue
+curl -o ~/.config/local-merge-queue/repos.json \
+  https://raw.githubusercontent.com/megan-holstein/local-merge-queue/main/repos.example.json
 ```
 
 Then work a branch in its own worktree, as usual, and hand it over from inside that
@@ -54,48 +58,48 @@ worktree when it is finished:
 ```sh
 cd ~/code/myapp-somefeature
 git push -u origin somefeature
-drainer handoff --note "what this is, in one clause"
+local-merge-queue handoff --note "what this is, in one clause"
 ```
 
 Nothing has merged. The entry sits `held`. Look at the queue, admit what should land, and
 drain:
 
 ```sh
-drainer status
-drainer admit somefeature
-drainer drain myapp --dry-run    # the order it would land in, nothing touched
-drainer drain myapp
+local-merge-queue status
+local-merge-queue admit somefeature
+local-merge-queue drain myapp --dry-run    # the order it would land in, nothing touched
+local-merge-queue drain myapp
 ```
 
 ## The lifecycle
 
 ```
- branch agent            the owner           the drainer
- ────────────            ─────────           ───────────
+ branch agent                   the owner                     the merge queue
+ ────────────                   ─────────                     ───────────
  finish + verify
  push
- drainer handoff  ──►   held
-                        drainer admit  ──►  admitted
-                        drainer unadmit ◄─  (back to held, any
-                                            time before the drain)
-                                            drainer drain
-                                              rebase onto origin/main
-                                                (skipped if already on top)
-                                              set the worktree up, if unset
-                                              run the gate
-                                              merge --no-ff, push
-                                              remove worktree
-                                              delete branch, local + remote
-                                              (its PR closes itself, as merged)
-                                            ─ and, where the host builds main,
-                                              exactly one deploy, at the end
+ local-merge-queue handoff ──►  held
+                                local-merge-queue admit  ──►  admitted
+                                local-merge-queue unadmit ◄─  (back to held, any
+                                                              time before the drain)
+                                                              local-merge-queue drain
+                                                                rebase onto origin/main
+                                                                  (skipped if already on top)
+                                                                set the worktree up, if unset
+                                                                run the gate
+                                                                merge --no-ff, push
+                                                                remove worktree
+                                                                delete branch, local + remote
+                                                                (its PR closes itself, as merged)
+                                                              ─ and, where the host builds main,
+                                                                exactly one deploy, at the end
 ```
 
 **Handing off is not merging.** An entry sits `held` until the owner admits it, so a
 standing rule that branches land only on the owner's word survives intact. Admission is
 that word. Hand off freely the moment a branch is genuinely ready.
 
-**Admission is reversible right up to the drain.** `drainer unadmit` puts an admitted
+**Admission is reversible right up to the drain.** `local-merge-queue unadmit` puts an admitted
 entry back to `held`, for a change of mind or one more look before it lands, and it is
 the command to reach for rather than `drop`, which takes the entry out of the queue
 altogether and loses the order the branches were meant to land in. Once a branch is
@@ -108,10 +112,10 @@ Finish the work, verify it, commit, push. Then, **from inside the branch's workt
 hand it over:
 
 ```sh
-drainer handoff --note "what this is, in one clause"
+local-merge-queue handoff --note "what this is, in one clause"
 ```
 
-The drainer detects the repo and the branch from the worktree. It refuses a dirty
+The merge queue detects the repo and the branch from the worktree. It refuses a dirty
 worktree or unpushed commits, because it will not carry unbacked-up work, **and where you
 have configured a repository slug it refuses a branch with no open pull request**, on the
 reasoning that the pull request list is the roster of what is in flight. Open the PR when
@@ -128,17 +132,17 @@ that belongs to the owner rather than to whoever wrote the branch. Keep it curre
 `gh pr edit <n> --body-file`.
 
 If the branch must land after another one, in the same repo or a different one, declare
-that and the drainer holds it back until the dependency is contained in its own `main`.
+that and the merge queue holds it back until the dependency is contained in its own `main`.
 
 ```sh
-drainer handoff --after otherrepo:some-prerequisite
+local-merge-queue handoff --after otherrepo:some-prerequisite
 ```
 
 Then report and stop. Do not merge, do not clean up, do not touch `main`.
 
 ## What a branch agent must not do
 
-The drainer owns all of this, and doing any of it by hand races the queue and leaves the
+The merge queue owns all of this, and doing any of it by hand races the queue and leaves the
 pull request list disagreeing with git.
 
 - `git merge` into any `main`
@@ -146,10 +150,10 @@ pull request list disagreeing with git.
 - `git branch -d` or `git push origin --delete` for a landed branch
 - closing a landed branch's pull request by hand, since the merge closes it as **merged**
 - rebasing a handed-off branch onto `main` to keep it fresh
-- `drainer drain` on the strength of approval language alone. "Approved for the drainer"
+- `local-merge-queue drain` on the strength of approval language alone. "Approved for the merge queue"
   and "admit these" authorize `admit` and nothing more, and the drain runs on its own
   explicit word.
-- `drainer drop`, `drainer order`, `drainer unadmit` or `drainer resume` on an entry
+- `local-merge-queue drop`, `local-merge-queue order`, `local-merge-queue unadmit` or `local-merge-queue resume` on an entry
   somebody else handed off, which the next section covers
 
 Creating a branch, its worktree and its pull request is unchanged and still the branch
@@ -174,8 +178,8 @@ certificate for whatever has been admitted since. So when the word to drain arri
 the queue back first:
 
 ```sh
-drainer status                        # what is actually queued, and in what state
-drainer drain <repo> --dry-run        # the order it would land in, nothing touched
+local-merge-queue status                        # what is actually queued, and in what state
+local-merge-queue drain <repo> --dry-run        # the order it would land in, nothing touched
 ```
 
 Confirm the admitted set is the set that was meant, and drain then. If something is
@@ -185,15 +189,15 @@ landing it silently and treating its presence as an alarm.
 ## What the owner does
 
 ```sh
-drainer status                        # the whole queue, with each entry's delta
-drainer admit <branch> [<branch>…]    # the word
-drainer admit --all --repo mysite
-drainer unadmit <branch> [<branch>…]  # take the word back; the entry keeps its place
-drainer unadmit --all --repo myapp
-drainer order <branch> --first        # land refactors early (see below)
-drainer drain myapp                   # land everything admitted
-drainer drain myapp --dry-run
-drainer drop <branch>                 # take it back out; the branch is untouched
+local-merge-queue status                        # the whole queue, with each entry's delta
+local-merge-queue admit <branch> [<branch>…]    # the word
+local-merge-queue admit --all --repo mysite
+local-merge-queue unadmit <branch> [<branch>…]  # take the word back; the entry keeps its place
+local-merge-queue unadmit --all --repo myapp
+local-merge-queue order <branch> --first        # land refactors early (see below)
+local-merge-queue drain myapp                   # land everything admitted
+local-merge-queue drain myapp --dry-run
+local-merge-queue drop <branch>                 # take it back out; the branch is untouched
 ```
 
 **A branch name belongs to its repo.** Two repos can each queue a branch with the same name. `order`, `drop`, `admit` and `unadmit` take `--repo <repo>`, or use the repo of the worktree they run in; given a name two repos share and neither, they refuse and ask for `--repo` rather than guess, because a guess can move, admit or drop another session's entry.
@@ -211,7 +215,7 @@ That shape is not exotic. It is what you get whenever several pieces are develop
 tested together before any of them lands. One branch in the repo this was built for,
 `frameworks`, had folded four sub-branches. On 2026-08-21 it had merged current `main`,
 and it merged clean, and a plain rebase of it conflicted in **9 files on the first of 47
-commits**. The drainer would have stalled a branch with nothing wrong with it — one that
+commits**. The merge queue would have stalled a branch with nothing wrong with it — one that
 had been kept deliberately current.
 
 So the rebase step asks `git merge-base --is-ancestor origin/<main> <branch>` first, and
@@ -227,11 +231,11 @@ conflict again. Skipping is exact where replaying is a guess.
 
 What this does not relax is the ordinary case. A branch that does not contain current
 `main` is still rebased, still gated on the `main` it will live on, and still stalls if it
-conflicts. Being behind is the case the drainer was built for, and it is untouched.
+conflicts. Being behind is the case the merge queue was built for, and it is untouched.
 
 ## When it stalls
 
-**It stalls; it does not evict.** On a rebase conflict or a gate failure the drainer
+**It stalls; it does not evict.** On a rebase conflict or a gate failure the merge queue
 stops where it stands, leaves the rebase in progress in that worktree, writes a report to
 `<state>/reports/<repo>-<branch>.md`, and exits 2. Nothing behind it lands out of order — which is
 deliberate. Branches that are in flight together usually overlap, so landing one of them
@@ -243,7 +247,7 @@ A fixer resolves it in place, in the named worktree:
 cd <the worktree named in the report>
 # resolve the conflict
 git add -A && git rebase --continue
-drainer resume <repo>
+local-merge-queue resume <repo>
 ```
 
 The line then continues from that entry. Two things about that are worth saying out loud.
@@ -259,7 +263,7 @@ The line then continues from that entry. Two things about that are worth saying 
 
 ## Order matters, and refactors go first
 
-Because the drainer stalls rather than evicting, position in the queue is a commitment.
+Because the merge queue stalls rather than evicting, position in the queue is a commitment.
 Put a refactor at the **front** of the line rather than the back. Every branch behind it
 must rebase over it regardless, and first in line each one conflicts once against a
 settled `main`, where last in line the refactor meets every branch's changes at once — in
@@ -267,13 +271,13 @@ one person's context, all together. A branch that rewrote a document from 178k t
 the case that taught this.
 
 ```sh
-drainer order the-refactor --first
+local-merge-queue order the-refactor --first
 ```
 
 ## A worktree that arrives unset is set up rather than stalled on
 
 **A drain never stalls because a worktree lacks its generated environment.** Before the
-gate runs, the drainer asks the repo's `setupWhen` probe whether this worktree is a
+gate runs, the merge queue asks the repo's `setupWhen` probe whether this worktree is a
 working checkout, and where the answer is no it runs the repo's `setup` itself, meaning
 `npm install`, the env files, the native rebuild, whatever that repo's fresh-worktree
 steps happen to be.
@@ -281,7 +285,7 @@ steps happen to be.
 It exists because the seam it heals is structural rather than careless. A branch whose own
 work needed no build — a doc-adjacent fix, a test edit — is verified without one, so its
 worktree never acquires an environment at all, and the first thing anybody notices is the
-drainer's gate dying minutes into a drain over something that is not the branch's fault.
+merge queue's gate dying minutes into a drain over something that is not the branch's fault.
 Three branches went that way on 2026-08-24, twice as `esbuild ENOENT` out of an empty
 `node_modules`, each costing a person a diagnose-install-resume cycle for a queue whose
 whole point is not needing one.
@@ -294,7 +298,7 @@ whole point is not needing one.
   Configure `setup` without a `setupWhen` and every landing pays the full cost, which is
   why each probe should cover every step of its own `setup`, so that a half-set-up
   worktree is completed rather than passed over.
-- **`$DRAINER_CHECKOUT` names the primary checkout** inside setup steps, since most of
+- **`$LOCAL_MERGE_QUEUE_CHECKOUT` names the primary checkout** inside setup steps, since most of
   what a worktree lacks is a copy of something the primary checkout already has, such as a
   prebuilt binary or a gitignored env file.
 
@@ -305,10 +309,10 @@ the one place nobody was looking.
 **A setup failure stalls, with its own report.** It is not a gate failure and says so,
 because the gate never ran and nothing about the failure is a verdict on the branch. The
 report names the step that exited non-zero and, since a setup failure happens after the
-rebase has finished cleanly, it does not tell the fixer to resolve a conflict. The drainer
+rebase has finished cleanly, it does not tell the fixer to resolve a conflict. The merge queue
 chooses those instructions by asking git whether a rebase is genuinely in progress, so
 they can never contradict the worktree. Fix the environment in the named worktree and run
-`drainer resume <repo>`, with nothing to `git rebase --continue`.
+`local-merge-queue resume <repo>`, with nothing to `git rebase --continue`.
 
 That correction reaches the gate-failure report too, which had been sending fixers to
 resolve a rebase that had already finished, since the day it was written.
@@ -316,7 +320,7 @@ resolve a rebase that had already finished, since the day it was written.
 ## One deploy per drain rather than one per branch
 
 **A repo whose host builds every push to `main` gets one build per drain run.** You
-configure that per repo, and the drainer stays silent about it everywhere you have not.
+configure that per repo, and the merge queue stays silent about it everywhere you have not.
 
 ```json
 "deploy": { "skipMarker": "[skip-deploy]" }
@@ -328,7 +332,7 @@ branches shipped N of them, and every one but the last shipped a state that exis
 long as the next gate took. The owner's ask, 2026-08-29, was that the site should simply
 redeploy at the end of the draining.
 
-So the drainer appends the marker to the merge commit message of every entry that has
+So the merge queue appends the marker to the merge commit message of every entry that has
 another entry behind it, and leaves the **last merge of the run unmarked**. The site's own
 ignore script, wired up as `vercel.json`'s `ignoreCommand`, reads the marker out of
 `VERCEL_GIT_COMMIT_MESSAGE` and skips those builds, Vercel's documented contract being
@@ -355,7 +359,7 @@ Three properties are worth knowing before changing any of it:
   merge the host was told to ignore, with an empty queue and a healthy-looking log. So
   every run that does not stall ends by asking whether the tip of `main` carries the
   marker, and publishes it with an empty commit where it does. On the ordinary path the tip
-  is unmarked and this does nothing at all. `drainer status` reports the same state, for
+  is unmarked and this does nothing at all. `local-merge-queue status` reports the same state, for
   the stretch between the drop and the next drain.
 
 The one thing that must never appear in that empty commit's message is the marker itself.
@@ -384,9 +388,9 @@ machine.
 
 ## The already-merged backlog
 
-A branch that is **already contained in `main`**, merged by hand before the drainer
+A branch that is **already contained in `main`**, merged by hand before the merge queue
 existed with its worktree and its row still standing, is handled by handing it off and
-draining it like anything else. The drainer notices that the branch is an ancestor of
+draining it like anything else. The merge queue notices that the branch is an ancestor of
 `main`, skips the rebase, the gate and the merge, and does the cleanup alone; that is the
 right way to clear a row nobody wants to resolve by hand.
 
@@ -395,10 +399,10 @@ right way to clear a row nobody wants to resolve by hand.
 The config is a JSON registry of repos. `repos.example.json`, beside this file, is the
 reference example; copy it and edit it rather than writing one from this description.
 
-The drainer resolves the config path as `$DRAINER_CONFIG`, else
-`$XDG_CONFIG_HOME/drainer/repos.json`, else `~/.config/drainer/repos.json`. It resolves
-its state directory as `$DRAINER_STATE`, else `$XDG_STATE_HOME/drainer`, else
-`~/.local/state/drainer`. State means the queue, the locks and the stall reports, all of
+The merge queue resolves the config path as `$LOCAL_MERGE_QUEUE_CONFIG`, else
+`$XDG_CONFIG_HOME/local-merge-queue/repos.json`, else `~/.config/local-merge-queue/repos.json`. It resolves
+its state directory as `$LOCAL_MERGE_QUEUE_STATE`, else `$XDG_STATE_HOME/local-merge-queue`, else
+`~/.local/state/local-merge-queue`. State means the queue, the locks and the stall reports, all of
 which are per-machine and volatile, and none of which belongs in a repository.
 
 Each repo entry names its primary checkout, its main branch where that is not `main`, its
@@ -409,13 +413,13 @@ its `protectedPaths`, its `githubRepo` slug, and, where its host builds every pu
 
 `githubRepo` is `owner/name`. Omit it and both pull request checks, the handoff
 requirement and the post-landing verification, skip silently, which is what lets the test
-suite run against a bare local repo and what lets you use the drainer on a repo that has
+suite run against a bare local repo and what lets you use the merge queue on a repo that has
 no forge behind it at all.
 
 ## Safety properties, and the one thing it will not protect you from
 
 - One drain per repo at a time, enforced by an atomic `mkdir` lock. A lock whose holder
-  died is broken automatically, and the drainer says so when it breaks one.
+  died is broken automatically, and the merge queue says so when it breaks one.
 - It refuses to drain a repo whose primary checkout is dirty or off `main`, naming what is
   dirty, so that another session's in-flight edit is never swept into a landing.
 - A push failure rolls the local merge back rather than leaving `main` ahead of `origin`.
@@ -427,7 +431,7 @@ stays with whoever was going to make that judgment anyway.
 
 ## Scaffolding never lands
 
-**The drainer deletes the branch's `BRANCH.md` itself**, as a commit on the rebased
+**The merge queue deletes the branch's `BRANCH.md` itself**, as a commit on the rebased
 branch, after the rebase and before the gate, so that the gate's claim to have run on
 exactly what will land stays a fact rather than a sentence.
 
@@ -447,7 +451,7 @@ one as a scratch file.
 ## Cleanup, and what happens when it fails
 
 Landing a branch ends in three cleanup steps, removing the worktree and deleting the branch
-locally and on the remote, plus a read-back of its pull request, and the drainer does all
+locally and on the remote, plus a read-back of its pull request, and the merge queue does all
 of them so that nobody has to remember to. **A step that fails says so in red and leaves a
 residue line**, rather than reporting failure in the same dim grey as success at the end of
 a drain whose last two hundred lines are gate output. Three branches in a row landed on
@@ -456,7 +460,7 @@ a drain whose last two hundred lines are gate output. Three branches in a row la
 Three things guard the branch deletion. `git worktree prune` runs between the removal and
 the deletion, because `git branch -d` refuses a branch git still believes is checked out
 somewhere. The deletion retries once after fetching `main`, the other way `-d` refuses
-being to read a branch as unmerged. **And where it still refuses, the drainer asks the
+being to read a branch as unmerged. **And where it still refuses, the merge queue asks the
 question `-d` is asking and answers it directly.** Is the branch tip an ancestor of
 `origin/main`? Where it is, the ref points at nothing that is not already landed, and `-D`
 destroys nothing, which is the whole guarantee `-d` exists to provide, verified rather than
@@ -474,7 +478,7 @@ One branch landed that way on 2026-08-25. Its tip was published, its head genuin
 reachable from `main`, and its PR read CLOSED while the three entries either side of it
 read MERGED, seconds apart. Since the roster *is* the record, a false entry in it is worse
 than a branch left behind — one being a lie nobody can correct, the other a line of
-cleanup. So the drainer polls briefly, deletes only on MERGED, and otherwise keeps the
+cleanup. So the merge queue polls briefly, deletes only on MERGED, and otherwise keeps the
 branch, says why in red, and prints the one command that finishes the job. It skips all of
 that where a repo configures no `githubRepo`.
 
@@ -486,7 +490,7 @@ branch is deleted. That close is permanent in both directions: `gh pr reopen` an
 branch of a closed pull request", so a live branch ends up recorded as abandoned in the one
 list that is the record, and the only repair is opening a replacement PR by hand. That is
 what happened to #91 when `templates-rename` landed underneath it. So between the merge and
-the deletion the drainer asks `gh pr list --base <branch> --state open` and retargets each
+the deletion the merge queue asks `gh pr list --base <branch> --state open` and retargets each
 answer onto `main`, naming every one it moves. The placement is the point: after the merge
 is pushed, so a retargeted PR's diff is the stack minus what just landed, and before the
 branch goes, which is the act that would have closed it. **A retarget that fails never
@@ -504,7 +508,7 @@ are cheap guards against plausible causes, and **the change that earns its place
 reporting**, which is what will make the next occurrence diagnosable instead of another
 silent one.
 
-**`drainer status` reports residue even when the queue is empty**, which is exactly when
+**`local-merge-queue status` reports residue even when the queue is empty**, which is exactly when
 nobody is looking. It looks for a local ref that is fully merged into `main`, has no
 worktree, and belongs to no queue entry. It names those and never deletes them, because a
 shelf branch is fully merged by construction, given that it preserves code removed from
@@ -517,7 +521,7 @@ before deleting anything.
 Whether something off the shelf should replace this was asked and answered once, at some
 length. Here is the field, and where this tool sits in it.
 
-Four of the drainer's behaviours have no counterpart in anything surveyed. Protected paths
+Four of the merge queue's behaviours have no counterpart in anything surveyed. Protected paths
 that hard-stop a rebase and refuse to resume without the owner's word, deploy coalescing so
 that a drain of N branches triggers one host build, the rule against rebasing a branch that
 already merged `main`, and the held-until-admitted lifecycle with a reversible admission.
@@ -538,7 +542,7 @@ The field splits three ways:
   `wt merge` squashes and rebases unconditionally.
 - **The 2026 crop of agent merge queues assumes the agent lands its own work.** A dozen
   entrants, nearly all under six months old, under 150 stars, and single-repo. The most
-  popular, [funador/claude-code-merge-queue](https://github.com/funador/claude-code-merge-queue),
+  popular, [funador/claude-code-local-merge-queue](https://github.com/funador/claude-code-local-merge-queue),
   states its design directly. "No human reviews any of this before it lands. `checkCommand`
   passing is the only gate." That is the assumption admission exists to refuse, and if you
   do not share the objection, that tool is a smaller thing to adopt than this one.
@@ -572,7 +576,7 @@ by definition.
 
 ## Verification
 
-`test-drainer.sh`, kept with this tool, builds a throwaway repo with a bare origin and
+`test-local-merge-queue.sh`, kept with this tool, builds a throwaway repo with a bare origin and
 worktrees, and exercises the whole of it end to end. Handoff guards, admission gating,
 dry-run purity, a clean two-branch drain with full cleanup, a conflict stall with the
 follower held back, resume, the protected-path escalation, a failing gate, the
@@ -594,7 +598,7 @@ the query leaving the branch landed and the worktree cleaned up regardless. 133 
 Run it before changing anything.
 
 ```sh
-bash test-drainer.sh
+bash test-local-merge-queue.sh
 ```
 
 ## Status and support
