@@ -962,6 +962,140 @@ check "a shared/ path runs both gates, in config order"              '[[ "$(grep
 check "a lane's setup runs when an entry in that lane lands"         'grep -qx "setup-a srepo-a-conflict" "$SLOG"'
 check "each lane that landed runs its final check once"              '[[ "$(grep -cx final-a "$SLOG")" == 1 && "$(grep -cx final-b "$SLOG")" == 1 ]]'
 
+echo
+echo "── lanes: the deploy marker and the settle are per lane ─────────────"
+# A fourth fixture repo with lanes `a` and `b`. Lane a carries a `deploy`
+# key and lane b does not, so a b-lane entry never writes a marker and never
+# needs a settle. Lane a's gate refuses any branch that carries a/broken.txt,
+# and lane b's gate refuses b/broken.txt.
+export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/deploy-repos.json"
+export LOCAL_MERGE_QUEUE_STATE="$ROOT/deploy-state"
+git init -q --bare "$ROOT/dorigin.git"
+git init -q -b main "$ROOT/drepo"
+cd "$ROOT/drepo"
+git config user.email t@t.t; git config user.name T
+git remote add origin "$ROOT/dorigin.git"
+mkdir -p a b && echo a > a/base.txt && echo b > b/base.txt
+git add -A && git commit -qm "base" && git push -qu origin main
+write_deploy_config () {  # lane a's marker, then lane b's deploy object or nothing
+  local bdeploy=""
+  [[ -n "${2:-}" ]] && bdeploy=", \"deploy\": { \"skipMarker\": \"$2\" }"
+  cat > "$ROOT/deploy-repos.json" <<JSON
+{ "repos": { "d": {
+  "checkout": "$ROOT/drepo",
+  "lanes": {
+    "a": { "paths": ["a/"], "gate": ["test ! -e a/broken.txt"], "deploy": { "skipMarker": "$1" } },
+    "b": { "paths": ["b/"], "gate": ["test ! -e b/broken.txt"]$bdeploy }
+  }
+} } }
+JSON
+}
+write_deploy_config "[skip-a]"
+dbranch () {  # name, then file=content pairs
+  local name="$1"; shift
+  git -C "$ROOT/drepo" worktree add -q "$ROOT/drepo-$name" -b "$name" >/dev/null 2>&1
+  cd "$ROOT/drepo-$name"
+  local pair
+  for pair in "$@"; do mkdir -p "$(dirname "${pair%%=*}")"; printf '%s' "${pair#*=}" > "${pair%%=*}"; done
+  git add -A && git commit -qm "$name" && git push -qu origin "$name" 2>/dev/null
+  cd "$ROOT/drepo"
+}
+denqueue () { for b in "$@"; do (cd "$ROOT/drepo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1); done; $LOCAL_MERGE_QUEUE approve --all --repo d >/dev/null 2>&1; }
+dsubj () { git -C "$ROOT/drepo" log main --first-parent --format=%s | grep -m1 -E "^Merge $1( |\$)"; }
+dredeploys () { git -C "$ROOT/drepo" log main --format=%s | grep -c '^Redeploy'; }
+dstatus () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));const e=q.entries.find(e=>e.branch==process.argv[1]);console.log(e?e.status:"gone")' "$1"; }
+
+# Three entries: the a-lane entry with another a-lane entry behind it is marked;
+# the b-lane entry between them is not, since lane b has no deploy key; the last
+# a-lane entry is not, since nothing is behind it.
+dbranch a1 a/1.txt=x
+dbranch b1 b/1.txt=x
+dbranch a2 a/2.txt=x
+denqueue a1 b1 a2
+out=$($LOCAL_MERGE_QUEUE land d --dry-run 2>&1)
+check "--dry-run says the first a-lane merge would carry the marker, naming the lane" '[[ "$out" == *"would carry [skip-a] for lane a"* ]]'
+check "--dry-run says the last a-lane merge would be unmarked, naming the lane"       '[[ "$out" == *"would be unmarked for lane a"* ]]'
+check "--dry-run prints nothing about a marker for a b-lane entry"                    '[[ "$(grep -c "dry run — its merge would" <<<"$out")" == 2 ]]'
+out=$($LOCAL_MERGE_QUEUE land d 2>&1); rc=$?
+check "the three entries land"                                                        '[[ $rc == 0 && -f "$ROOT/drepo/a/1.txt" && -f "$ROOT/drepo/b/1.txt" && -f "$ROOT/drepo/a/2.txt" ]]'
+check "a1, with a2 behind it in lane a, is marked"                                    '[[ "$(dsubj a1)" == *"[skip-a]"* ]]'
+check "b1, in a lane with no deploy key, is unmarked"                                 '[[ "$(dsubj b1)" != *"[skip-a]"* ]]'
+check "a2, the last in lane a, is unmarked"                                           '[[ "$(dsubj a2)" != *"[skip-a]"* ]]'
+check "no redeploy commit was needed"                                                 '[[ "$(dredeploys)" == 0 ]]'
+check "the run says which lane each marked merge waited in"                           '[[ "$out" == *"marked [skip-a] — another branch in lane a is queued behind it"* ]]'
+
+# A run of b-lane entries alone writes no marker and no republish.
+dbranch b2 b/2.txt=x
+dbranch b3 b/3.txt=x
+denqueue b2 b3
+before=$(git -C "$ROOT/drepo" rev-list --count main)
+$LOCAL_MERGE_QUEUE land d >/dev/null 2>&1
+check "two b-lane entries land as two merges and nothing else"                        '[[ "$(git -C "$ROOT/drepo" rev-list --count main)" == $((before + 4)) && "$(dredeploys)" == 0 ]]'
+check "…and neither merge carries a marker"                                           '[[ "$(dsubj b2)" != *"[skip-"* && "$(dsubj b3)" != *"[skip-"* ]]'
+
+# a3 is marked because a4 waits behind it; a4 stalls on its gate. b4 lands
+# unmarked in lane b, which the stall does not hold. `main`'s last a/ commit is
+# then the marked a3 merge, buried under an unmarked b-lane merge, so a plain
+# `git log -- a/` (which follows the branch's own commit) would never find it.
+dbranch a3 a/3.txt=x
+dbranch a4 a/4.txt=x a/broken.txt=x
+dbranch b4 b/4.txt=x
+denqueue a3 a4 b4
+out=$($LOCAL_MERGE_QUEUE land d 2>&1); rc=$?
+check "a4 stalls on its gate, a3 and b4 land"                                         '[[ $rc == 2 && "$(dstatus a4)" == stalled && -f "$ROOT/drepo/a/3.txt" && -f "$ROOT/drepo/b/4.txt" ]]'
+check "a3 carries the marker, being followed by a4 at its merge"                      '[[ "$(dsubj a3)" == *"[skip-a]"* && "$(dsubj b4)" != *"[skip-"* ]]'
+check "the stall holds lane a, so the run does not settle it"                         '[[ "$(dredeploys)" == 0 ]]'
+out=$($LOCAL_MERGE_QUEUE status d 2>&1)
+check "status reports the undeployed lane tip, naming the lane"                       '[[ "$out" == *"told to skip in lane a"* ]]'
+$LOCAL_MERGE_QUEUE dequeue a4 --repo d >/dev/null 2>&1
+tip_before=$(git -C "$ROOT/drepo" rev-parse main)
+out=$($LOCAL_MERGE_QUEUE land d 2>&1)
+check "the next land says it is publishing lane a"                                    '[[ "$out" == *"sitting on a skipped build in lane a — publishing it"* ]]'
+check "…with one empty commit on top of main"                                         '[[ "$(dredeploys)" == 1 && "$(git -C "$ROOT/drepo" rev-parse main~1)" == "$tip_before" && -z "$(git -C "$ROOT/drepo" diff --name-only main~1 main)" ]]'
+check "THE REPUBLISH CARRIES NO MARKER"                                               '[[ "$(git -C "$ROOT/drepo" log -1 --format=%B main)" != *"[skip-"* ]]'
+check "origin has it too"                                                             '[[ "$(git -C "$ROOT/drepo" rev-parse main)" == "$(git -C "$ROOT/drepo" rev-parse origin/main)" ]]'
+out=$($LOCAL_MERGE_QUEUE status d 2>&1)
+check "status is quiet again"                                                         '[[ "$out" != *"told to skip"* ]]'
+# THE SECOND FAILURE MODE: the republish is an empty commit that no path-limited
+# log lists, so a settle that looked only at path history would republish again
+# on every later land.
+tip_after=$(git -C "$ROOT/drepo" rev-parse main)
+$LOCAL_MERGE_QUEUE land d >/dev/null 2>&1
+check "a second land does not republish again"                                        '[[ "$(git -C "$ROOT/drepo" rev-parse main)" == "$tip_after" && "$(dredeploys)" == 1 ]]'
+dbranch b5 b/5.txt=x
+denqueue b5
+$LOCAL_MERGE_QUEUE land d >/dev/null 2>&1
+check "…nor after a later b-lane merge lands over the republish"                       '[[ "$(dredeploys)" == 1 ]]'
+
+# Two lanes that share one marker write it once.
+write_deploy_config "[skip-deploy]" "[skip-deploy]"
+dbranch both a/both.txt=x b/both.txt=x
+dbranch after-a a/after.txt=x
+denqueue both after-a
+$LOCAL_MERGE_QUEUE land d >/dev/null 2>&1
+check "a marker shared by two lanes is written once"                                  '[[ "$(dsubj both | grep -o -F "[skip-deploy]" | wc -l | tr -d " ")" == 1 ]]'
+
+# Each lane has its own marker; an entry in both lanes carries both. Both
+# lanes' follow-on entries stall and are dequeued, so main sits on a merge that
+# skipped both builds, and one empty commit publishes both lanes.
+write_deploy_config "[skip-a]" "[skip-b]"
+dbranch both2 a/both2.txt=x b/both2.txt=x
+dbranch after-a2 a/after2.txt=x a/broken.txt=y
+dbranch after-b2 b/after2.txt=x b/broken.txt=y
+denqueue both2 after-a2 after-b2
+$LOCAL_MERGE_QUEUE land d >/dev/null 2>&1
+check "an entry in both lanes carries both markers when both lanes have entries behind it" '[[ "$(dsubj both2)" == *"[skip-a]"* && "$(dsubj both2)" == *"[skip-b]"* ]]'
+check "both follow-on entries stall"                                                  '[[ "$(dstatus after-a2)" == stalled && "$(dstatus after-b2)" == stalled ]]'
+out=$($LOCAL_MERGE_QUEUE status d 2>&1)
+check "status names both undeployed lanes"                                            '[[ "$out" == *"told to skip in lanes a, b"* ]]'
+$LOCAL_MERGE_QUEUE dequeue after-a2 --repo d >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE dequeue after-b2 --repo d >/dev/null 2>&1
+before=$(dredeploys)
+out=$($LOCAL_MERGE_QUEUE land d 2>&1)
+check "a run that finds two lanes undeployed publishes once"                          '[[ "$(dredeploys)" == $((before + 1)) && "$out" == *"in lanes a, b — publishing it"* ]]'
+check "…and that one commit settles both"                                             '[[ "$($LOCAL_MERGE_QUEUE status d 2>&1)" != *"told to skip"* ]]'
+cd "$ROOT/drepo"
+
 export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
 cd "$ROOT/repo"
 
