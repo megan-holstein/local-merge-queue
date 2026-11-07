@@ -749,6 +749,108 @@ cp "$ROOT/queue.saved" "$LOCAL_MERGE_QUEUE_STATE/queue.json"
 cd "$ROOT/repo"
 
 echo
+echo "── lanes: one repo, two deployables, one queue ──────────────────────"
+# A second fixture repo declares lanes `a` and `b` (plus `rest`, which takes "*")
+# and a `shared/` prefix that belongs to every lane. The earlier sections ran
+# with no `lanes` key at all; these exercise the model itself.
+SAVED_CONFIG="$LOCAL_MERGE_QUEUE_CONFIG"; SAVED_STATE="$LOCAL_MERGE_QUEUE_STATE"
+export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/lanes-repos.json"
+export LOCAL_MERGE_QUEUE_STATE="$ROOT/lanes-state"
+git init -q --bare "$ROOT/lorigin.git"
+git init -q -b main "$ROOT/lrepo"
+cd "$ROOT/lrepo"
+git config user.email t@t.t; git config user.name T
+git remote add origin "$ROOT/lorigin.git"
+mkdir -p a b shared && echo a > a/base.txt && echo b > b/base.txt && echo s > shared/base.txt && echo r > root.txt
+git add -A && git commit -qm "base" && git push -qu origin main
+lane_branch () {  # name, then file=content pairs; no pairs makes a branch with no diff
+  local name="$1"; shift
+  git -C "$ROOT/lrepo" worktree add -q "$ROOT/lrepo-$name" -b "$name" >/dev/null 2>&1
+  cd "$ROOT/lrepo-$name"
+  local pair
+  for pair in "$@"; do mkdir -p "$(dirname "${pair%%=*}")"; printf '%s' "${pair#*=}" > "${pair%%=*}"; done
+  if [[ $# -gt 0 ]]; then git add -A && git commit -qm "$name"; fi
+  git push -qu origin "$name" 2>/dev/null
+  cd "$ROOT/lrepo"
+}
+write_lanes_config () {  # the `rest` lane's paths: "*" or a prefix
+  cat > "$ROOT/lanes-repos.json" <<JSON
+{ "repos": { "m": {
+  "checkout": "$ROOT/lrepo",
+  "shared": ["shared/"],
+  "lanes": {
+    "a":    { "paths": ["a/"], "gate": ["echo gate-a >> $ROOT/lanes.log"], "finalCheck": "echo final-a >> $ROOT/lanes.log" },
+    "b":    { "paths": ["b/"], "gate": ["echo gate-b >> $ROOT/lanes.log"], "finalCheck": "echo final-b >> $ROOT/lanes.log" },
+    "rest": { "paths": $1, "gate": ["echo gate-rest >> $ROOT/lanes.log"] }
+  }
+} } }
+JSON
+}
+write_lanes_config '"*"'
+lane_branch only-a   a/new.txt=x
+lane_branch only-b   b/new.txt=x
+lane_branch both     a/two.txt=x b/two.txt=x
+lane_branch via-shared shared/new.txt=x
+lane_branch loose    root.txt=changed
+lane_branch cleanup
+for b in only-a only-b both via-shared loose cleanup; do
+  (cd "$ROOT/lrepo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1)
+done
+lanes_of () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));console.log(JSON.stringify(q.entries.find(e=>e.branch==process.argv[1]).lanes))' "$1"; }
+check "an entry touching a/ is in [a]"                       '[[ "$(lanes_of only-a)" == "[\"a\"]" ]]'
+check "an entry touching b/ is in [b]"                       '[[ "$(lanes_of only-b)" == "[\"b\"]" ]]'
+check "an entry touching both is in [a, b], in config order" '[[ "$(lanes_of both)" == "[\"a\",\"b\"]" ]]'
+check "a path under shared/ is in every lane"                '[[ "$(lanes_of via-shared)" == "[\"a\",\"b\",\"rest\"]" ]]'
+check "an unclaimed path goes to the * lane"                 '[[ "$(lanes_of loose)" == "[\"rest\"]" ]]'
+check "a cleanup-only entry has no lanes"                    '[[ "$(lanes_of cleanup)" == "[]" ]]'
+
+out=$($LOCAL_MERGE_QUEUE status m 2>&1)
+check "status shows the lanes after the branch name"         '[[ "$out" == *"only-a [a]"* && "$out" == *"both [a, b]"* && "$out" == *"cleanup []"* ]]'
+$LOCAL_MERGE_QUEUE approve --all --repo m >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land m --dry-run 2>&1)
+check "--dry-run shows each entry's lanes"                   '[[ "$out" == *"lanes: [a, b]"* && "$out" == *"lanes: [b]"* && "$out" == *"lanes: []"* ]]'
+check "--dry-run shows the gate steps lane by lane"          '[[ "$out" == *"gate [a]: echo gate-a"* && "$out" == *"gate [b]: echo gate-b"* && "$out" == *"gate [rest]: echo gate-rest"* ]]'
+check "--dry-run runs no gate"                               '[[ ! -e "$ROOT/lanes.log" ]]'
+
+# `land` recomputes the lanes after the rebase and runs the gates of those lanes.
+# Corrupt the stored lanes of `only-a` and check the landing run trusts the diff.
+node -e 'const f=process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json";const fs=require("fs");const q=JSON.parse(fs.readFileSync(f));q.entries.forEach(e=>{if(e.branch!="only-a")e.status="enqueued"});q.entries.find(e=>e.branch=="only-a").lanes=["b"];fs.writeFileSync(f,JSON.stringify(q))'
+out=$($LOCAL_MERGE_QUEUE land m 2>&1)
+check "land recomputes the lanes after the rebase"           '[[ "$(grep -c . "$ROOT/lanes.log")" == 2 && "$(sed -n 1p "$ROOT/lanes.log")" == gate-a && "$(sed -n 2p "$ROOT/lanes.log")" == final-a ]]'
+check "a lane's final check runs only when it landed"        '[[ "$(cat "$ROOT/lanes.log")" != *final-b* ]]'
+: > "$ROOT/lanes.log"
+$LOCAL_MERGE_QUEUE approve --all --repo m >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land m 2>&1); rc=$?
+check "the remaining entries land"                           '[[ $rc == 0 && "$(git -C "$ROOT/lrepo" rev-list --count --merges main)" == 5 ]]'
+check "each entry ran the gates of its own lanes"            '[[ "$(grep -c gate-a "$ROOT/lanes.log")" == 2 && "$(grep -c gate-b "$ROOT/lanes.log")" == 3 && "$(grep -c gate-rest "$ROOT/lanes.log")" == 2 ]]'
+cd "$ROOT/lrepo"
+
+# Config errors name the key.
+echo '{ "repos": { "m": { "checkout": "'"$ROOT"'/lrepo", "gate": ["true"], "lanes": { "a": { "paths": ["a/"] } } } } }' > "$ROOT/bad1.json"
+out=$(LOCAL_MERGE_QUEUE_CONFIG="$ROOT/bad1.json" $LOCAL_MERGE_QUEUE status 2>&1); rc=$?
+check "lanes plus a repo-level gate is a config error naming the key" '[[ $rc != 0 && "$out" == *"\"gate\""* ]]'
+echo '{ "repos": { "m": { "checkout": "'"$ROOT"'/lrepo", "deploy": {"skipMarker":"x"}, "lanes": { "a": { "paths": "*" } } } } }' > "$ROOT/bad2.json"
+out=$(LOCAL_MERGE_QUEUE_CONFIG="$ROOT/bad2.json" $LOCAL_MERGE_QUEUE status 2>&1); rc=$?
+check "…and the same for every other gate-family key"                '[[ $rc != 0 && "$out" == *"\"deploy\""* ]]'
+echo '{ "repos": { "m": { "checkout": "'"$ROOT"'/lrepo", "lanes": { "a": { "paths": "*" }, "b": { "paths": "*" } } } } }' > "$ROOT/bad3.json"
+out=$(LOCAL_MERGE_QUEUE_CONFIG="$ROOT/bad3.json" $LOCAL_MERGE_QUEUE status 2>&1); rc=$?
+check "two * lanes are a config error"                               '[[ $rc != 0 && "$out" == *"both take"* ]]'
+
+# A lanes repo with no * lane loads; the unclaimed path is refused at enqueue and at land.
+write_lanes_config '["rest/"]'
+lane_branch strays stray.txt=x
+out=$(cd "$ROOT/lrepo-strays" && $LOCAL_MERGE_QUEUE enqueue 2>&1); rc=$?
+check "a lanes repo with no * lane loads, and enqueue refuses an unclaimed path by name" '[[ $rc != 0 && "$out" == *"stray.txt"* ]]'
+write_lanes_config '"*"'
+(cd "$ROOT/lrepo-strays" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1) && $LOCAL_MERGE_QUEUE approve strays --repo m >/dev/null 2>&1
+write_lanes_config '["rest/"]'
+out=$($LOCAL_MERGE_QUEUE land m 2>&1); rc=$?
+check "land refuses an unclaimed path by name"                       '[[ $rc != 0 && "$out" == *"stray.txt"* ]]'
+
+export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
+cd "$ROOT/repo"
+
+echo
 echo "════════════════════════════════════════════════════════════════"
 echo "  passed $PASS   failed $FAIL"
 echo "  sandbox left at $ROOT"
