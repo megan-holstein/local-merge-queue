@@ -241,6 +241,8 @@ stops where it stands, leaves the rebase in progress in that worktree, writes a 
 deliberate. Branches that are in flight together usually overlap, so landing one of them
 out of order relocates a conflict rather than avoiding it.
 
+In a repo with more than one lane, a stall holds only the lanes of the entry that stalled, and the line keeps landing entries in other lanes; see [Lanes](#lanes).
+
 A fixer resolves it in place, in the named worktree:
 
 ```sh
@@ -357,7 +359,7 @@ Three properties are worth knowing before changing any of it:
   still be wrong in two ways, since the entry behind this one may stall and then be
   dequeued, or may turn out to be cleanup-only and push nothing, and both leave `main` on a
   merge the host was told to ignore, with an empty queue and a healthy-looking log. So
-  every run that does not stall ends by asking whether the tip of `main` carries the
+  every run that leaves no entry of the repo stalled ends by asking whether the tip of `main` carries the
   marker, and publishes it with an empty commit where it does. On the ordinary path the tip
   is unmarked and this does nothing at all. `local-merge-queue status` reports the same state, for
   the stretch between the dequeue and the next landing run.
@@ -442,7 +444,27 @@ A repo declares lanes in its config entry. `repos.example.json` has a worked mon
 
 `enqueue` and `land` compute an entry's lanes from `git diff --name-only` between the merge base of the main branch and the branch, and from nothing else. A path under a lane's prefix belongs to that lane, a path under `shared` belongs to every lane, and any other path belongs to the `"*"` lane. An entry whose diff is empty, such as a cleanup-only entry, has no lanes. The lanes come back in config order, once each. `enqueue` stores them on the entry, and `land` computes them again after the rebase and stores that answer, since resolving a conflict can touch a file the first diff never saw.
 
-For a repo with more than one lane, `status` prints the lanes after each branch name (`[site]`, `[app, site]`), and `land --dry-run` prints each entry's lanes and the gate steps of each lane. A landing run sets up and gates an entry by running the setup and gate of each lane the entry touches, one lane after another in config order, and runs the final check of each lane that landed an entry. For a repo with one lane the brackets and the extra dry-run lines are left out.
+For a repo with more than one lane, `status` prints the lanes after each branch name (`[site]`, `[app, site]`), and `land --dry-run` prints each entry's lanes and the gate steps of each lane. For a repo with one lane the brackets and the extra dry-run lines are left out.
+
+### Setup, gate and final check, lane by lane
+
+For each lane an entry touches, in config order, `land` runs that lane's `setupWhen` probe and `setup` steps (skipping the steps when the probe passes, with the same environment variables as a repo-level setup), then that lane's `gate` steps with that lane's `gateEnv`. An entry under `shared` therefore runs every lane's setup and gate. The first step that fails stalls the entry, and in a repo with more than one lane the stall reason and the report name the lane: `gate failed after rebase in lane app`, `worktree setup failed in lane site: npm ci`.
+
+A lane's `finalCheck` runs once, at the end of the run, in the primary checkout, and only if an entry in that lane landed. An entry that stalls at its gate lands nothing, so its lane's final check does not run for it. `land` runs the final checks in config order.
+
+The check that makes a rebase conflict the owner's call reads every lane's `protectedPaths`, whichever lanes the entry touches, because protected content is the owner's whatever lane it sits in.
+
+### A stall holds only its own lanes
+
+In a repo with more than one lane, a stall does not end the landing run. `land` records the stall, writes the report, and goes on to the next entry it can land. An entry waits while any stalled entry of its repo shares a lane with it; an entry in other lanes lands as usual, and an entry with no lanes, such as a cleanup-only entry, never waits. Within a lane, nothing lands out of order.
+
+- `land` refuses only when every lane of the repo is held by some stalled entry, with the same message a one-lane repo prints. While only some lanes are held, `land` says which lanes wait behind which stall and lands the rest.
+- The report names the lanes that stalled and says that entries in other lanes keep landing. At the end of the run, `land` prints each stalled entry with its lanes, its reason and its report.
+- A run that ends with any entry of the repo stalled exits 2, and it does not settle the deploy marker.
+
+`resume` retries every stalled entry of the repo in queue order, and lands the approved entries their lanes held behind them. A stalled entry whose rebase is still in progress, or whose conflict needs `--owner-approved` and did not get it, gets the same message a one-lane repo prints, stays stalled, and the run goes on with the others; the run then exits 1. Because the other lanes keep landing during a stall, `main` can move under an entry after its fixer resolved the rebase. `resume` then rebases that entry again onto the new `main`, and a conflict there stalls it again.
+
+A repo with one lane keeps the behaviour it always had: its every entry, a cleanup-only one included, shares the one lane, so the first stall ends the run, and `resume` refuses an unready entry by exiting 1 at once. The lock stays one per repo whatever its lanes.
 
 A repo with no `lanes` key behaves exactly as before. `loadConfig` gives it one implicit lane, named after the repo, with `paths: "*"` and the repo-level keys moved onto it, and everything after loading reads lanes only.
 
@@ -624,7 +646,7 @@ dequeued after a stall, where the next landing run republishes the tip with an e
 carrying no marker. Then the stacked-PR retarget, against a `gh` stubbed on `PATH` so that
 nothing here reaches GitHub: the PR moved onto `main` by a real `gh pr edit --base` argv,
 that call landing *before* the branch deletion rather than after it, and a `gh` that refuses
-the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. 158 assertions.
+the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. 188 assertions.
 Run it before changing anything.
 
 ```sh

@@ -847,6 +847,121 @@ write_lanes_config '["rest/"]'
 out=$($LOCAL_MERGE_QUEUE land m 2>&1); rc=$?
 check "land refuses an unclaimed path by name"                       '[[ $rc != 0 && "$out" == *"stray.txt"* ]]'
 
+echo
+echo "── lanes: a stall holds only its own lanes ──────────────────────────"
+# A third fixture repo with lanes `a` and `b` and a `shared/` prefix. Each lane's
+# setup, gate and final check append a line naming the lane (and, for setup and
+# gate, the worktree) to a log, so the test reads back what ran and in what
+# order. Lane b's gate also fails on any branch that carries b/broken.txt.
+export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/stall-repos.json"
+export LOCAL_MERGE_QUEUE_STATE="$ROOT/stall-state"
+SLOG="$ROOT/stall-lanes.log"
+git init -q --bare "$ROOT/sorigin.git"
+git init -q -b main "$ROOT/srepo"
+cd "$ROOT/srepo"
+git config user.email t@t.t; git config user.name T
+git remote add origin "$ROOT/sorigin.git"
+mkdir -p a b shared && echo a > a/base.txt && echo b > b/base.txt && echo s > shared/base.txt
+printf 'one\ntwo\nthree\n' > a/conflict.txt
+git add -A && git commit -qm "base" && git push -qu origin main
+cat > "$ROOT/stall-repos.json" <<JSON
+{ "repos": { "s": {
+  "checkout": "$ROOT/srepo",
+  "shared": ["shared/"],
+  "lanes": {
+    "a": { "paths": ["a/"],
+           "setupWhen": "test -f .setup-a", "setup": ["echo setup-a \$(basename \$PWD) >> $SLOG", "touch .setup-a"],
+           "gate": ["echo gate-a \$(basename \$PWD) >> $SLOG"],
+           "finalCheck": "echo final-a >> $SLOG" },
+    "b": { "paths": ["b/"],
+           "setupWhen": "test -f .setup-b", "setup": ["echo setup-b \$(basename \$PWD) >> $SLOG", "touch .setup-b"],
+           "gate": ["echo gate-b \$(basename \$PWD) >> $SLOG", "test ! -e b/broken.txt"],
+           "finalCheck": "echo final-b >> $SLOG" }
+  }
+} } }
+JSON
+stall_branch () {  # name, then file=content pairs
+  local name="$1"; shift
+  git -C "$ROOT/srepo" worktree add -q "$ROOT/srepo-$name" -b "$name" >/dev/null 2>&1
+  cd "$ROOT/srepo-$name"
+  local pair
+  for pair in "$@"; do mkdir -p "$(dirname "${pair%%=*}")"; printf '%s' "${pair#*=}" > "${pair%%=*}"; done
+  git add -A && git commit -qm "$name" && git push -qu origin "$name" 2>/dev/null
+  cd "$ROOT/srepo"
+}
+sstatus () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));const e=q.entries.find(e=>e.branch==process.argv[1]);console.log(e?e.status:"gone")' "$1"; }
+sreason () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));const e=q.entries.find(e=>e.branch==process.argv[1]);console.log(e&&e.stallReason||"")' "$1"; }
+stall_branch a-conflict a/conflict.txt=$'one\nBRANCH\nthree\n'
+stall_branch b-first    b/first.txt=x
+stall_branch a-behind   a/behind.txt=x
+stall_branch both       a/both.txt=x b/both.txt=x
+stall_branch via-shared shared/new.txt=x
+stall_branch leftover   a/leftover.txt=x
+stall_branch b-second   b/second.txt=x
+# main moves under a-conflict, on the line it changes, and takes leftover by
+# hand, which makes leftover a cleanup-only entry with no lanes.
+printf 'one\nMAIN\nthree\n' > a/conflict.txt
+git commit -qam "main touches a/conflict.txt"
+git merge -q --no-ff -m "merged by hand" leftover && git push -q origin main
+for b in a-conflict b-first a-behind both via-shared leftover b-second; do
+  (cd "$ROOT/srepo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1)
+done
+$LOCAL_MERGE_QUEUE approve --all --repo s >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land s 2>&1); rc=$?
+check "a stall in lane a exits 2"                                    '[[ $rc == 2 ]]'
+check "…and the b-lane entries queued behind it land in the same run" '[[ -f "$ROOT/srepo/b/first.txt" && -f "$ROOT/srepo/b/second.txt" ]]'
+check "…while main does not carry the stalled entry"                 '! grep -q BRANCH "$ROOT/srepo/a/conflict.txt"'
+check "the stalled entry stays stalled"                              '[[ "$(sstatus a-conflict)" == stalled ]]'
+check "an a-lane entry behind the stall is held"                     '[[ ! -f "$ROOT/srepo/a/behind.txt" && "$(sstatus a-behind)" == approved ]]'
+check "an entry in both lanes is held"                               '[[ ! -f "$ROOT/srepo/a/both.txt" && "$(sstatus both)" == approved ]]'
+check "a shared/ entry is held"                                      '[[ ! -f "$ROOT/srepo/shared/new.txt" && "$(sstatus via-shared)" == approved ]]'
+check "a cleanup-only entry is never held"                           '[[ "$(sstatus leftover)" == gone && ! -d "$ROOT/srepo-leftover" ]]'
+check "a lane's setup runs only for an entry in that lane"           '[[ "$(grep -c "^setup-b" "$SLOG")" == 2 && "$(grep -c "^setup-a" "$SLOG")" == 0 ]]'
+check "a lane's final check runs only when its lane landed"          'grep -qx final-b "$SLOG" && ! grep -q final-a "$SLOG"'
+SREPORT="$LOCAL_MERGE_QUEUE_STATE/reports/s-a-conflict.md"
+check "the stall report names the lanes that stalled"                'grep -q "Lanes stalled:\*\* a$" "$SREPORT"'
+check "…and says entries in other lanes keep landing"                'grep -q "Entries in other lanes keep landing" "$SREPORT"'
+check "the run ends by printing each stall with its lanes"           '[[ "$out" == *"a-conflict [a] — rebase conflict in 1 file(s)"* && "$out" == *"entries in other lanes keep landing"* ]]'
+
+# A gate failure in lane b names the lane, and then every lane is held.
+stall_branch b-broken b/broken.txt=x b/real.txt=x
+(cd "$ROOT/srepo-b-broken" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1)
+$LOCAL_MERGE_QUEUE approve b-broken --repo s >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land s 2>&1); rc=$?
+check "land says which lanes wait behind an earlier stall"           '[[ "$out" == *"lane a waits behind the stall on \"a-conflict\""* ]]'
+check "a gate failure in lane b stalls, exits 2, and names the lane" '[[ $rc == 2 && "$(sreason b-broken)" == "gate failed after rebase in lane b" ]]'
+check "…in the report as well"                                       'grep -q "gate failed after rebase in lane b" "$LOCAL_MERGE_QUEUE_STATE/reports/s-b-broken.md"'
+check "a lane gated but not landed runs no final check"              '[[ "$(grep -cx final-b "$SLOG")" == 1 ]]'
+out=$($LOCAL_MERGE_QUEUE land s 2>&1); rc=$?
+check "land refuses with today's message when every lane is blocked" '[[ $rc == 1 && "$out" == *"s is stalled on \"a-conflict\" — resolve it, then: local-merge-queue resume s"* ]]'
+
+# resume retries each stalled entry in queue order. a-conflict is still
+# mid-rebase, so resume reports it in today's words and goes on to b-broken.
+(cd "$ROOT/srepo-b-broken" && git rm -q b/broken.txt && git commit -qm "b-broken: drop the file the gate refuses")
+out=$($LOCAL_MERGE_QUEUE resume s 2>&1); rc=$?
+check "resume reports a stall whose rebase is still in progress"      '[[ "$out" == *"is still in progress — finish it (git rebase --continue) before resuming"* ]]'
+check "…leaves it stalled and exits nonzero"                         '[[ $rc != 0 && "$(sstatus a-conflict)" == stalled ]]'
+check "…and lands the fixed stall in the other lane"                  '[[ -f "$ROOT/srepo/b/real.txt" && "$(sstatus b-broken)" == gone ]]'
+check "…while the a-lane entries stay held"                          '[[ ! -f "$ROOT/srepo/a/behind.txt" ]]'
+
+# The fixer resolves a-conflict onto the main of the stall; main has moved since,
+# so resume rebases it again before it lands.
+cd "$ROOT/srepo-a-conflict"
+printf 'one\nRESOLVED\nthree\n' > a/conflict.txt
+git add -A && GIT_EDITOR=true git rebase --continue >/dev/null 2>&1
+cd "$ROOT/srepo"
+: > "$SLOG"
+out=$($LOCAL_MERGE_QUEUE resume s 2>&1); rc=$?
+check "resume rebases a stall that main moved under"                 '[[ $rc == 0 && "$out" == *"main moved while a-conflict was stalled — rebasing it again"* ]]'
+check "the resolved entry lands"                                     'grep -q RESOLVED "$ROOT/srepo/a/conflict.txt"'
+check "the held entries land behind it, in queue order" \
+  '[[ "$(git -C "$ROOT/srepo" log --merges --reverse --format=%s main | tail -4 | tr "\n" " ")" == "Merge a-conflict Merge a-behind Merge both Merge via-shared " ]]'
+check "the queue empties"                                            '[[ $(node -e "console.log(JSON.parse(require(\"fs\").readFileSync(\"$LOCAL_MERGE_QUEUE_STATE/queue.json\")).entries.length)") == 0 ]]'
+check "an entry touching both lanes runs both gates, in config order" '[[ "$(grep "^gate-. srepo-both$" "$SLOG" | tr "\n" " ")" == "gate-a srepo-both gate-b srepo-both " ]]'
+check "a shared/ path runs both gates, in config order"              '[[ "$(grep "^gate-. srepo-via-shared$" "$SLOG" | tr "\n" " ")" == "gate-a srepo-via-shared gate-b srepo-via-shared " ]]'
+check "a lane's setup runs when an entry in that lane lands"         'grep -qx "setup-a srepo-a-conflict" "$SLOG"'
+check "each lane that landed runs its final check once"              '[[ "$(grep -cx final-a "$SLOG")" == 1 && "$(grep -cx final-b "$SLOG")" == 1 ]]'
+
 export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
 cd "$ROOT/repo"
 
