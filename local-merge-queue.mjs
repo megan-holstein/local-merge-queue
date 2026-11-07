@@ -130,11 +130,112 @@ function loadConfig () {
     repo.key = key
     repo.checkout = real(expand(repo.checkout))
     repo.mainBranch ||= 'main'
-    repo.gate ||= []
-    repo.setup ||= []
-    repo.protectedPaths ||= []
+    repo.lanes = loadLanes(key, repo)
   }
   return cfg
+}
+
+// A LANE IS A SET OF PATHS WITH ITS OWN SETUP AND GATE. Every repo has lanes
+// once it is loaded: a repo that declares none gets one implicit lane, named
+// after the repo, taking every path, with the repo-level keys moved onto it.
+// Everything after this function reads `repo.lanes` and never the repo-level
+// keys, which is what makes a repo without `lanes` behave exactly as it did
+// before lanes existed.
+const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'finalCheck', 'protectedPaths', 'deploy']
+
+function loadLanes (key, repo) {
+  if (repo.lanes === undefined) {
+    const lane = { paths: '*' }
+    for (const k of LANE_KEYS) if (repo[k] !== undefined) lane[k] = repo[k]
+    for (const k of LANE_KEYS) delete repo[k]
+    repo.shared = []
+    return { [key]: finishLane(lane) }
+  }
+  if (!repo.lanes || typeof repo.lanes !== 'object' || Array.isArray(repo.lanes) || !Object.keys(repo.lanes).length) {
+    die(`repo "${key}": "lanes" must be an object naming at least one lane`)
+  }
+  for (const k of LANE_KEYS) {
+    if (repo[k] !== undefined) {
+      die(`repo "${key}" declares "lanes", so "${k}" belongs inside a lane, not at repo level — move it into the lane it governs`)
+    }
+  }
+  if (repo.shared !== undefined && !(Array.isArray(repo.shared) && repo.shared.every(p => typeof p === 'string'))) {
+    die(`repo "${key}": "shared" must be an array of path prefixes`)
+  }
+  repo.shared ||= []
+  const lanes = {}
+  let catchAll = null
+  for (const [name, lane] of Object.entries(repo.lanes)) {
+    if (!lane || typeof lane !== 'object' || Array.isArray(lane)) die(`repo "${key}": lane "${name}" must be an object`)
+    const p = lane.paths
+    if (p === '*') {
+      if (catchAll) die(`repo "${key}": lanes "${catchAll}" and "${name}" both take "*" — only one lane may`)
+      catchAll = name
+    } else if (!(Array.isArray(p) && p.length && p.every(x => typeof x === 'string'))) {
+      die(`repo "${key}": lane "${name}" needs "paths", an array of path prefixes or the string "*"`)
+    }
+    lanes[name] = finishLane({ ...lane })
+  }
+  return lanes
+}
+
+function finishLane (lane) {
+  lane.gate ||= []
+  lane.setup ||= []
+  lane.protectedPaths ||= []
+  return lane
+}
+
+// Brackets, lane by lane in the output, appear only for a repo with more than
+// one lane, so a one-lane repo prints what it printed before lanes existed.
+function multiLane (repo) { return Object.keys(repo.lanes).length > 1 }
+
+// Which lanes does a branch touch? The paths its diff against the merge base
+// with `mainBranch` changes, each mapped to lanes: a path under a lane's prefix
+// belongs to that lane, a path under `shared` belongs to every lane, and a path
+// no lane claims belongs to the lane that takes "*". A repo with no such lane
+// refuses the path by name. An empty diff (a cleanup-only entry) has no lanes.
+// The result is an array of lane names in config order, without duplicates.
+function lanesOf (repo, cwd, branch) {
+  const base = gitTry(['merge-base', repo.mainBranch, branch], cwd)
+  if (!base.ok) die(`cannot find where "${branch}" left ${repo.mainBranch} to work out its lanes: ${base.err}`)
+  const diff = gitTry(['diff', '--name-only', base.out, branch], cwd)
+  if (!diff.ok) die(`cannot list the files "${branch}" changes to work out its lanes: ${diff.err}`)
+  const names = Object.keys(repo.lanes)
+  const hit = new Set()
+  for (const p of diff.out.split('\n').filter(Boolean)) {
+    if (repo.shared.some(s => p.startsWith(s))) { names.forEach(n => hit.add(n)); continue }
+    const owners = names.filter(n => Array.isArray(repo.lanes[n].paths) && repo.lanes[n].paths.some(s => p.startsWith(s)))
+    if (owners.length) { owners.forEach(n => hit.add(n)); continue }
+    const catchAll = names.find(n => repo.lanes[n].paths === '*')
+    if (!catchAll) die(`"${branch}" changes ${p}, which no lane of ${repo.key} claims and no lane takes "*"`)
+    hit.add(catchAll)
+  }
+  return names.filter(n => hit.has(n))
+}
+
+// The lanes an entry's setup and gate run for. An entry with no lanes (empty
+// diff) runs nothing, except in a one-lane repo, where it still runs the one
+// lane exactly as it did before lanes existed. Until per-lane gating exists, a
+// multi-lane entry runs the setup and gate of each lane it touches, one lane
+// after another in config order.
+function laneNamesFor (repo, entry) {
+  if (entry.lanes && entry.lanes.length) return entry.lanes.filter(n => repo.lanes[n])
+  return multiLane(repo) ? [] : Object.keys(repo.lanes)
+}
+
+// `protectedPaths` is read before an entry's lanes are final (a conflict
+// stops the rebase that would settle them), so every lane's prefixes count.
+function protectedOf (repo) {
+  return Object.values(repo.lanes).flatMap(l => l.protectedPaths)
+}
+
+// The deploy marker is a property of the host that builds `main`, and with
+// several lanes this reads the first lane that declares one. A one-lane repo
+// reads its own, as before.
+function skipMarkerOf (repo) {
+  for (const l of Object.values(repo.lanes)) if (l.deploy?.skipMarker) return l.deploy.skipMarker
+  return undefined
 }
 
 function loadQueue () {
@@ -379,21 +480,27 @@ function preflight (repo) {
  * primary checkout, because most of what a worktree is missing is a copy of
  * something the primary checkout already has.
  */
-function ensureWorktreeSetup (repo, wt) {
-  if (!repo.setup.length) return { ok: true, ran: false }
+function ensureWorktreeSetup (repo, wt, laneNames) {
   const env = {
     LOCAL_MERGE_QUEUE_CHECKOUT: repo.checkout,
     LOCAL_MERGE_QUEUE_WORKTREE: wt,
     LOCAL_MERGE_QUEUE_REPO: repo.key
   }
-  if (repo.setupWhen && run(repo.setupWhen, wt, env)) return { ok: true, ran: false }
-  console.log(yellow(`  this worktree has no generated environment — running ${repo.key}'s setup`))
-  for (const step of repo.setup) {
-    console.log(dim(`  setup: ${step}`))
-    if (!run(step, wt, env)) return { ok: false, ran: true, failed: step }
+  let ran = false
+  for (const name of laneNames) {
+    const lane = repo.lanes[name]
+    if (!lane.setup.length) continue
+    if (lane.setupWhen && run(lane.setupWhen, wt, env)) continue
+    const label = multiLane(repo) ? `${repo.key}/${name}` : repo.key
+    console.log(yellow(`  this worktree has no generated environment — running ${label}'s setup`))
+    for (const step of lane.setup) {
+      console.log(dim(`  setup: ${step}`))
+      if (!run(step, wt, env)) return { ok: false, ran: true, failed: step, probe: lane.setupWhen }
+    }
+    console.log(dim('  setup complete — the gate has an environment to run in'))
+    ran = true
   }
-  console.log(dim('  setup complete — the gate has an environment to run in'))
-  return { ok: true, ran: true }
+  return { ok: true, ran }
 }
 
 // ─── one deploy per landing run, not one per branch ───────────────────────────────
@@ -435,7 +542,7 @@ function ensureWorktreeSetup (repo, wt) {
  * exists to stop; the resume that lands the last entry deploys it.
  */
 function settleDeploy (repo, dryRun) {
-  const marker = repo.deploy?.skipMarker
+  const marker = skipMarkerOf(repo)
   if (!marker || dryRun) return
   gitTry(['fetch', 'origin', repo.mainBranch], repo.checkout)
   const ff = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
@@ -582,9 +689,11 @@ function cmdEnqueue (cfg, args) {
     console.log(dim(`  pull request: #${pr.number}${pr.isDraft ? ' (draft)' : ''}`))
   }
 
+  const lanes = lanesOf(repo, worktree, branch)
   const existing = q.entries.find(e => e.repo === repo.key && e.branch === branch)
   if (existing) {
     existing.worktree = worktree
+    existing.lanes = lanes
     if (args['--note']) existing.note = args['--note']
     if (args['--after']) existing.after = args['--after']
     saveQueue(q)
@@ -598,6 +707,7 @@ function cmdEnqueue (cfg, args) {
     worktree,
     note: args['--note'] || '',
     after: args['--after'] || null,
+    lanes,
     status: 'enqueued',                 // enqueued → approved (the owner's word) → landed
     enqueued: nowISO()
   })
@@ -633,7 +743,8 @@ function cmdStatus (cfg, args) {
         const [behind, ahead] = lr.split(/\s+/)
         delta = dim(`+${ahead} −${behind}`)
       } catch { delta = dim('(delta unknown)') }
-      console.log(`  ${String(i + 1).padStart(2)}. ${e.branch.padEnd(28)} ${mark.padEnd(18)} ${delta}`)
+      const name = multiLane(repo) && e.lanes ? `${e.branch} [${e.lanes.join(', ')}]` : e.branch
+      console.log(`  ${String(i + 1).padStart(2)}. ${name.padEnd(28)} ${mark.padEnd(18)} ${delta}`)
       if (e.after) console.log(dim(`      after: ${e.after}`))
       if (e.note) console.log(dim(`      ${e.note}`))
       if (e.stallReason) console.log(red(`      ${e.stallReason}`))
@@ -668,7 +779,7 @@ function cmdStatus (cfg, args) {
  * Silent for every repo that configures no `deploy`.
  */
 function reportUndeployedTip (key, repo) {
-  const marker = repo.deploy?.skipMarker
+  const marker = skipMarkerOf(repo)
   if (!marker) return
   const tip = gitTry(['log', '-1', '--format=%B', repo.mainBranch], repo.checkout)
   if (!tip.ok || !tip.out.includes(marker)) return
@@ -857,6 +968,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
   }
 
   const landed = []
+  const landedLanes = []              // lanes of every entry gated this run, for the final check
   const simulated = new Set()          // dry-run only; the real queue is never written
   try {
     while (true) {
@@ -868,9 +980,19 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
       console.log(`\n${bold('──')} ${bold(entry.branch)} ${dim(entry.worktree)}`)
       if (dryRun) {
         console.log(dim('  (dry run — would rebase, gate, merge --no-ff, push, clean up)'))
-        if (repo.deploy?.skipMarker) {
+        if (multiLane(repo)) {
+          // Computed live and never stored: a dry run writes nothing.
+          const live = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout).ok
+          const shown = live ? lanesOf(repo, repo.checkout, entry.branch) : (entry.lanes || [])
+          console.log(dim(`  lanes: [${shown.join(', ')}]`))
+          for (const n of shown) {
+            const steps = repo.lanes[n].gate
+            console.log(dim(`  gate [${n}]: ${steps.length ? steps.join(' && ') : '(no steps)'}`))
+          }
+        }
+        if (skipMarkerOf(repo)) {
           console.log(dim(moreEligibleAfter(cfg, key, entry, { queue: q2, simulated, resuming })
-            ? `  (dry run — its merge would carry ${repo.deploy.skipMarker}; the host skips that build)`
+            ? `  (dry run — its merge would carry ${skipMarkerOf(repo)}; the host skips that build)`
             : '  (dry run — its merge would be unmarked; this is the one the host builds)'))
         }
         simulated.add(entry.branch)
@@ -931,7 +1053,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           }
           if (!rb.ok) {
             const conflicted = git(['diff', '--name-only', '--diff-filter=U'], wt).split('\n').filter(Boolean)
-            const ownerCall = conflicted.some(p => repo.protectedPaths.some(pp => p.startsWith(pp)))
+            const ownerCall = conflicted.some(p => protectedOf(repo).some(pp => p.startsWith(pp)))
             entry.status = 'stalled'
             entry.ownerCall = ownerCall
             entry.stallReason = `rebase conflict in ${conflicted.length} file(s)${ownerCall ? ' — OWNER DECISION REQUIRED' : ''}`
@@ -958,6 +1080,14 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           delete entry.stallReason
           saveQueue(q2)
         }
+
+        // 2a. THE ENTRY'S LANES, RECOMPUTED ON THE REBASED BRANCH. This is the
+        //     authoritative set: a conflict resolution can touch a file the
+        //     enqueue-time diff never saw.
+        entry.lanes = lanesOf(repo, wt, entry.branch)
+        saveQueue(q2)
+        const runLanes = laneNamesFor(repo, entry)
+        landedLanes.push(...runLanes)
 
         // 2b. THE BRANCH'S SCAFFOLDING GOES BEFORE THE GATE SEES IT.
         //
@@ -993,13 +1123,13 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         // Which means a setup failure has NO rebase behind it to resolve, and
         // the report says so rather than sending the fixer looking for a
         // conflict that does not exist.
-        const setup = ensureWorktreeSetup(repo, wt)
+        const setup = ensureWorktreeSetup(repo, wt, runLanes)
         if (!setup.ok) {
           entry.status = 'stalled'
           entry.stallReason = `worktree setup failed: ${setup.failed}`
           saveQueue(q2)
           const file = writeStallReport(repo, entry, 'worktree setup failed',
-            `This worktree lacked its generated environment — \`${repo.setupWhen || '(no probe configured)'}\` said so —\n` +
+            `This worktree lacked its generated environment — \`${setup.probe || '(no probe configured)'}\` said so —\n` +
             `and the setup step that fills it in exited non-zero:\n\n` +
             `    ${setup.failed}\n\n` +
             `Its output is above, in the landing run log. The gate never ran; nothing here is a\n` +
@@ -1016,9 +1146,11 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         // 3. The gate: what would break a writer, run on exactly what will land.
         let gateOK = true
         let gateFailed = null
-        for (const step of repo.gate) {
-          console.log(dim(`  gate: ${step}`))
-          if (!run(step, wt, repo.gateEnv || {})) { gateOK = false; gateFailed = step; break }
+        gate: for (const name of runLanes) {
+          for (const step of repo.lanes[name].gate) {
+            console.log(dim(`  gate: ${step}`))
+            if (!run(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; break gate }
+          }
         }
         if (!gateOK) {
           entry.status = 'stalled'
@@ -1068,7 +1200,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         //    make this the last merge after all. See `settleDeploy` for the rest
         //    of the design and for what happens when this lookahead is wrong.
         console.log(dim(`  merging into ${repo.mainBranch}…`))
-        const marker = repo.deploy?.skipMarker
+        const marker = skipMarkerOf(repo)
         const more = marker
           ? moreEligibleAfter(cfg, key, entry, { queue: null, simulated, resuming: false })
           : false
@@ -1249,9 +1381,16 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
 
   // 6. The broad sweep, once, on the final tip. This REPORTS; it does not gate,
   //    because each entry already passed the gate on exactly its own content.
-  if (repo.finalCheck && !dryRun) {
-    console.log(`\n${bold('final check')} ${dim(repo.finalCheck)}`)
-    const ok = run(repo.finalCheck, repo.checkout, repo.gateEnv || {})
+  //    A cleanup-only entry gates no lane, so in a one-lane repo `landedLanes`
+  //    would miss it; the final check there runs whenever anything landed.
+  const finalLanes = multiLane(repo)
+    ? Object.keys(repo.lanes).filter(n => landedLanes.includes(n))
+    : Object.keys(repo.lanes)
+  for (const name of finalLanes) {
+    const lane = repo.lanes[name]
+    if (!lane.finalCheck || dryRun) continue
+    console.log(`\n${bold('final check')} ${dim(lane.finalCheck)}`)
+    const ok = run(lane.finalCheck, repo.checkout, lane.gateEnv || {})
     console.log(ok ? green('  final check passed') : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
   }
 
