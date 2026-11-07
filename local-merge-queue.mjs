@@ -237,6 +237,11 @@ function queueLanesOf (repo, entry) {
   return laneNamesFor(repo, entry)
 }
 
+// "lane a" or "lanes a, b", for the console and the stall report.
+function lanePhrase (names) {
+  return `${names.length === 1 ? 'lane' : 'lanes'} ${names.join(', ')}`
+}
+
 // The stalled entries of a repo, in queue order.
 function stalledIn (key, entries) {
   return entries.filter(e => e.repo === key && e.status === 'stalled')
@@ -666,8 +671,7 @@ environment is not a commit and needs none.`
   // report reads as it did before lanes existed.
   const lanes = multiLane(repo) ? queueLanesOf(repo, entry) : null
   const behind = lanes
-    ? `Entries that share a lane with this one (${lanes.join(', ')}) wait behind it, and
-nothing in those lanes was landed out of order. Entries in other lanes keep landing.`
+    ? `Entries that share ${lanePhrase(lanes)} with this one wait behind it, and nothing in ${lanes.length === 1 ? 'that lane' : 'those lanes'} was landed out of order. Entries in other lanes keep landing.`
     : 'Everything queued behind this entry is still waiting; nothing was landed out of\norder.'
   const body = `# Landing stalled — ${repo.key} / \`${entry.branch}\`
 
@@ -1028,7 +1032,8 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
 
   if (multiLane(repo) && stalledNow.length && !resuming) {
     for (const e of stalledNow) {
-      console.log(yellow(`  lanes ${queueLanesOf(repo, e).join(', ')} wait behind the stall on "${e.branch}"; entries in other lanes keep landing`))
+      const names = queueLanesOf(repo, e)
+      console.log(yellow(`  ${lanePhrase(names)} ${names.length === 1 ? 'waits' : 'wait'} behind the stall on "${e.branch}"; entries in other lanes keep landing`))
     }
   }
 
@@ -1045,7 +1050,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
   // one-lane repo returns at once; a multi-lane repo holds the entry and the
   // loop moves on to the entries in other lanes.
   const stallLine = e => multiLane(repo)
-    ? `Entries in lanes ${queueLanesOf(repo, e).join(', ')} wait behind it; entries in other lanes keep landing.`
+    ? `Entries in ${lanePhrase(queueLanesOf(repo, e))} wait behind it; entries in other lanes keep landing.`
     : null
   try {
     while (true) {
@@ -1540,7 +1545,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     console.error(dim(`    report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`))
   }
   const waiting = Object.keys(repo.lanes).filter(n => blockedLanes(repo, stalledAtEnd).has(n))
-  console.error(dim(`  Entries in lanes ${waiting.join(', ')} wait behind these stalls; entries in other lanes keep landing.`))
+  console.error(dim(`  Entries in ${lanePhrase(waiting)} wait behind ${stalledAtEnd.length === 1 ? 'this stall' : 'these stalls'}; entries in other lanes keep landing.`))
   console.error(dim(`  Resolve each, then: local-merge-queue resume ${key}`))
   return { landed, refused, stalledOn: stalledAtEnd[0].branch }
 }
