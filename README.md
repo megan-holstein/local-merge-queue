@@ -409,12 +409,42 @@ Each repo entry names its primary checkout, its main branch where that is not `m
 fresh-worktree setup as a `setupWhen` probe plus a list of `setup` steps, its `gate` steps,
 any `gateEnv` those steps and the final check need in their environment, its `finalCheck`,
 its `protectedPaths`, its `githubRepo` slug, and, where its host builds every push to
-`main`, its `deploy.skipMarker`.
+`main`, its `deploy.skipMarker`. A repo that holds several deployables declares those per-lane keys inside `lanes` instead; see [Lanes](#lanes).
 
 `githubRepo` is `owner/name`. Omit it and both pull request checks, the enqueue step
 requirement and the post-landing verification, skip silently, which is what lets the test
 suite run against a bare local repo and what lets you use the merge queue on a repo that has
 no forge behind it at all.
+
+## Lanes
+
+Lanes let one repository hold two deployables, a site and an app say, under one merge queue. A lane is a named set of paths with its own setup, gate and final check. The queue works out which lanes each entry touches and records them on the entry.
+
+A repo declares lanes in its config entry. `repos.example.json` has a worked monorepo with a `site` lane and an `app` lane.
+
+```json
+"monorepo": {
+  "checkout": "monorepo",
+  "shared": ["packages/"],
+  "lanes": {
+    "site": { "paths": ["site/"], "gate": ["npm run lint --workspace site"] },
+    "app":  { "paths": ["app/"],  "gate": ["npm run typecheck --workspace app"] },
+    "other": { "paths": "*" }
+  }
+}
+```
+
+- `paths` is an array of path prefixes, or the string `"*"` for the lane that takes every path no other lane claims. At most one lane may be `"*"`; a repo without one is valid, and then `enqueue` and `land` refuse an entry that changes an unclaimed path, naming the path.
+- A lane may carry `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` and `deploy`, with the meanings those keys have at repo level.
+- `shared` is a repo-level array of path prefixes that count as belonging to every lane.
+- `checkout`, `mainBranch` and `githubRepo` stay at repo level.
+- When a repo declares `lanes`, a repo-level `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` or `deploy` is a config error. `loadConfig` names the key and exits, so there is one answer to which gate ran.
+
+`enqueue` and `land` compute an entry's lanes from `git diff --name-only` between the merge base of the main branch and the branch, and from nothing else. A path under a lane's prefix belongs to that lane, a path under `shared` belongs to every lane, and any other path belongs to the `"*"` lane. An entry whose diff is empty, such as a cleanup-only entry, has no lanes. The lanes come back in config order, once each. `enqueue` stores them on the entry, and `land` computes them again after the rebase and stores that answer, since resolving a conflict can touch a file the first diff never saw.
+
+For a repo with more than one lane, `status` prints the lanes after each branch name (`[site]`, `[app, site]`), and `land --dry-run` prints each entry's lanes and the gate steps of each lane. A landing run sets up and gates an entry by running the setup and gate of each lane the entry touches, one lane after another in config order, and runs the final check of each lane that landed an entry. For a repo with one lane the brackets and the extra dry-run lines are left out.
+
+A repo with no `lanes` key behaves exactly as before. `loadConfig` gives it one implicit lane, named after the repo, with `paths: "*"` and the repo-level keys moved onto it, and everything after loading reads lanes only.
 
 ## Safety properties, and the one thing it will not protect you from
 
@@ -594,7 +624,7 @@ dequeued after a stall, where the next landing run republishes the tip with an e
 carrying no marker. Then the stacked-PR retarget, against a `gh` stubbed on `PATH` so that
 nothing here reaches GitHub: the PR moved onto `main` by a real `gh pr edit --base` argv,
 that call landing *before* the branch deletion rather than after it, and a `gh` that refuses
-the query leaving the branch landed and the worktree cleaned up regardless. 133 assertions.
+the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. 158 assertions.
 Run it before changing anything.
 
 ```sh
