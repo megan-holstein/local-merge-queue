@@ -58,6 +58,37 @@
       "protectedPaths": ["src/content/"],
       "deploy": { "skipMarker": "[skip-deploy]" },
       "githubRepo": "your-org/marketing-site"
+    },
+
+    "monorepo": {
+      "//": "One repository holding two deployables, a site and an app, under one merge queue. Each is a lane: a named set of path prefixes with its own setup, gate and final check. The queue works out which lanes an entry touches from its diff against the main branch, and records them. With `lanes` present, the setup, gate, finalCheck, protectedPaths and deploy keys belong inside a lane; at repo level they are a config error. `checkout`, `mainBranch` and `githubRepo` stay at repo level.",
+      "checkout": "monorepo",
+      "mainBranch": "main",
+      "//shared": "Prefixes that count as belonging to every lane. An entry that changes a file under one is in both lanes below.",
+      "shared": ["packages/"],
+      "lanes": {
+        "site": {
+          "//": "`paths` is an array of path prefixes. A path under one of them belongs to this lane.",
+          "paths": ["site/"],
+          "setupWhen": "test -d node_modules",
+          "setup": ["npm install"],
+          "gate": ["npm run lint --workspace site", "npm run build --workspace site"],
+          "protectedPaths": ["site/content/"],
+          "deploy": { "skipMarker": "[skip-deploy]" }
+        },
+        "app": {
+          "paths": ["app/"],
+          "setupWhen": "test -d node_modules",
+          "setup": ["npm install"],
+          "gate": ["npm run typecheck --workspace app", "npm run test:unit --workspace app"],
+          "finalCheck": "npm run smoke --workspace app"
+        },
+        "other": {
+          "//": "The string \"*\" takes every path no other lane claims. At most one lane may; a repo without one refuses an entry that changes an unclaimed path, naming the path.",
+          "paths": "*"
+        }
+      },
+      "githubRepo": "your-org/monorepo"
     }
   }
 }
