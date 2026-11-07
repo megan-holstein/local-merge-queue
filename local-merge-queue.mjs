@@ -216,16 +216,56 @@ function lanesOf (repo, cwd, branch) {
 
 // The lanes an entry's setup and gate run for. An entry with no lanes (empty
 // diff) runs nothing, except in a one-lane repo, where it still runs the one
-// lane exactly as it did before lanes existed. Until per-lane gating exists, a
-// multi-lane entry runs the setup and gate of each lane it touches, one lane
-// after another in config order.
+// lane exactly as it did before lanes existed. A multi-lane entry runs the
+// setup and gate of each lane it touches, one lane after another in config
+// order.
 function laneNamesFor (repo, entry) {
   if (entry.lanes && entry.lanes.length) return entry.lanes.filter(n => repo.lanes[n])
   return multiLane(repo) ? [] : Object.keys(repo.lanes)
 }
 
+// The lanes an entry holds in the queue: the lanes a stalled entry blocks, and
+// the lanes an entry waits on when another entry has stalled. It is
+// `laneNamesFor` with one difference: an entry that carries no `lanes` at all
+// (enqueued before lanes existed) holds every lane, because nobody has worked
+// out which lanes it touches. So in a one-lane repo every entry holds the one
+// lane, a cleanup-only entry included, and a stall there holds everything
+// behind it, as it always has. In a multi-lane repo a cleanup-only entry holds
+// no lane, and no stall ever blocks it.
+function queueLanesOf (repo, entry) {
+  if (!Array.isArray(entry.lanes)) return Object.keys(repo.lanes)
+  return laneNamesFor(repo, entry)
+}
+
+// The stalled entries of a repo, in queue order.
+function stalledIn (key, entries) {
+  return entries.filter(e => e.repo === key && e.status === 'stalled')
+}
+
+// Every lane some stalled entry of this repo holds.
+function blockedLanes (repo, entries) {
+  return new Set(stalledIn(repo.key, entries).flatMap(e => queueLanesOf(repo, e)))
+}
+
+// Does a stall hold this entry back? An approved entry waits while any stalled
+// entry of its repo shares a lane with it. A stalled entry that `resume` is
+// about to retry waits only on a stalled entry AHEAD of it that shares a lane,
+// so two stalls in one lane still land in queue order, and neither waits on
+// itself.
+function heldByStall (repo, entry, entries) {
+  const mine = queueLanesOf(repo, entry)
+  if (!mine.length) return false
+  const at = entries.indexOf(entry)
+  return entries.some((e, i) =>
+    e !== entry && e.repo === repo.key && e.status === 'stalled' &&
+    (entry.status !== 'stalled' || i < at) &&
+    queueLanesOf(repo, e).some(n => mine.includes(n)))
+}
+
 // `protectedPaths` is read before an entry's lanes are final (a conflict
 // stops the rebase that would settle them), so every lane's prefixes count.
+// That is also the rule itself: protected content is the owner's whatever lane
+// it sits in, so a conflict in any lane's protected path is the owner's call.
 function protectedOf (repo) {
   return Object.values(repo.lanes).flatMap(l => l.protectedPaths)
 }
@@ -304,10 +344,17 @@ function dependencyMet (cfg, entry, queued, simulated, quiet = false) {
 // still behind the entry being landed — which is what decides whether its merge
 // commit carries the skip marker (see `moreEligibleAfter`). Two copies of this
 // rule would be two answers to the same question.
-function eligible (cfg, entry, key, { queued, simulated, resuming, quiet = false }) {
+//
+// `held` names the entries this run has already given up on: the ones that
+// stalled during it and the ones `resume` found unready. A run never retries
+// them, which is what lets the loop carry on past a stall without meeting the
+// same entry again.
+function eligible (cfg, entry, key, { queued, simulated, resuming, held = new Set(), quiet = false }) {
   if (entry.repo !== key) return false
   if (simulated.has(entry.branch)) return false
+  if (held.has(entry.branch)) return false
   if (entry.status !== 'approved' && !(resuming && entry.status === 'stalled')) return false
+  if (heldByStall(cfg.repos[key], entry, [...queued.values()])) return false
   if (entry.after && !dependencyMet(cfg, entry, queued, simulated, quiet)) return false
   return true
 }
@@ -319,12 +366,12 @@ function eligible (cfg, entry, key, { queued, simulated, resuming, quiet = false
 // asked the host to make. It is only ever a lookahead, though: the entry behind
 // this one may still stall, or turn out to be cleanup-only and push nothing. The
 // end-of-run settle (`settleDeploy`) is what makes those cases safe.
-function moreEligibleAfter (cfg, key, entry, { queue, simulated, resuming }) {
+function moreEligibleAfter (cfg, key, entry, { queue, simulated, resuming, held }) {
   const q = queue || loadQueue()
   const queued = new Map(q.entries.map(e => [`${e.repo}:${e.branch}`, e]))
   return q.entries.some(e =>
     !(e.repo === entry.repo && e.branch === entry.branch) &&
-    eligible(cfg, e, key, { queued, simulated, resuming, quiet: true }))
+    eligible(cfg, e, key, { queued, simulated, resuming, held, quiet: true }))
 }
 
 // ─── locking ────────────────────────────────────────────────────────────────
@@ -495,7 +542,7 @@ function ensureWorktreeSetup (repo, wt, laneNames) {
     console.log(yellow(`  this worktree has no generated environment — running ${label}'s setup`))
     for (const step of lane.setup) {
       console.log(dim(`  setup: ${step}`))
-      if (!run(step, wt, env)) return { ok: false, ran: true, failed: step, probe: lane.setupWhen }
+      if (!run(step, wt, env)) return { ok: false, ran: true, failed: step, probe: lane.setupWhen, lane: name }
     }
     console.log(dim('  setup complete — the gate has an environment to run in'))
     ran = true
@@ -532,8 +579,8 @@ function ensureWorktreeSetup (repo, wt, laneNames) {
  * two ways — the entry behind this one may stall and then be dequeued, or it may
  * turn out to be cleanup-only and push nothing — and both leave `main` sitting
  * on a merge the host was told to ignore, with production serving the build from
- * before the landing run. So at the end of every run that did not stall, the merge queue
- * asks the state rather than its own memory: does the tip of `main` carry the
+ * before the landing run. So at the end of every run that leaves no entry of the
+ * repo stalled, the merge queue asks the state rather than its own memory: does the tip of `main` carry the
  * marker? If it does, an empty commit publishes it. On the ordinary path the tip
  * is unmarked and this does nothing at all.
  *
@@ -615,12 +662,19 @@ ${fixSteps.length ? fixSteps.join('\n') : '# re-run what failed, and fix the cau
 
 Commit anything that belongs on the branch; a fix to the worktree's untracked
 environment is not a commit and needs none.`
+  // A repo with more than one lane says which lanes wait; a one-lane repo's
+  // report reads as it did before lanes existed.
+  const lanes = multiLane(repo) ? queueLanesOf(repo, entry) : null
+  const behind = lanes
+    ? `Entries that share a lane with this one (${lanes.join(', ')}) wait behind it, and
+nothing in those lanes was landed out of order. Entries in other lanes keep landing.`
+    : 'Everything queued behind this entry is still waiting; nothing was landed out of\norder.'
   const body = `# Landing stalled — ${repo.key} / \`${entry.branch}\`
 
 **When:** ${nowISO()}
 **Why:** ${kind}
 **Worktree:** \`${entry.worktree}\`
-${ownerCall ? '\n> **OWNER DECISION REQUIRED.** The conflict touches a protected path, so the\n> resolution is protected content that is the owner\'s call, not an agent\'s.\n> Resolve nothing without the owner\'s word, then resume with `--owner-approved`.\n' : ''}
+${lanes ? `**Lanes stalled:** ${lanes.join(', ')}\n` : ''}${ownerCall ? '\n> **OWNER DECISION REQUIRED.** The conflict touches a protected path, so the\n> resolution is protected content that is the owner\'s call, not an agent\'s.\n> Resolve nothing without the owner\'s word, then resume with `--owner-approved`.\n' : ''}
 ## Detail
 
 \`\`\`
@@ -637,8 +691,7 @@ Then hand the line back to the merge queue:
 local-merge-queue resume ${repo.key}${ownerCall ? ' --owner-approved' : ''}
 \`\`\`
 
-Everything queued behind this entry is still waiting; nothing was landed out of
-order. If this branch should leave the queue instead, \`local-merge-queue dequeue ${entry.branch}\`
+${behind} If this branch should leave the queue instead, \`local-merge-queue dequeue ${entry.branch}\`
 (that returns the branch to its worktree untouched${midRebase ? ', aborting the rebase' : ''}).
 `
   fs.writeFileSync(file, body)
@@ -949,11 +1002,17 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
   const repo = repoOf(cfg, key)
   const dryRun = !!args['--dry-run']
 
+  // A STALL HOLDS ONLY ITS OWN LANES, so `land` refuses only when every lane
+  // of the repo is held. A one-lane repo's every stalled entry holds its one
+  // lane (see `queueLanesOf`), so it refuses exactly when it always has.
   const q = loadQueue()
-  const stalled = q.entries.find(e => e.repo === key && e.status === 'stalled')
-  if (stalled && !resuming) {
+  const stalledNow = stalledIn(key, q.entries)
+  const blocked = blockedLanes(repo, q.entries)
+  if (stalledNow.length && !resuming && Object.keys(repo.lanes).every(n => blocked.has(n))) {
+    const stalled = stalledNow[0]
     die(`${key} is stalled on "${stalled.branch}" — resolve it, then: local-merge-queue resume ${key}\n` +
-        `  report: ${path.join(REPORT_DIR, `${key}-${stalled.branch}.md`)}`)
+        `  report: ${path.join(REPORT_DIR, `${key}-${stalled.branch}.md`)}` +
+        stalledNow.slice(1).map(e => `\n  also stalled on "${e.branch}" — report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`).join(''))
   }
 
   const problems = preflight(repo)
@@ -967,14 +1026,32 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     die(`${key} is being landed already (pid ${owner?.pid ?? '?'}, since ${owner?.since ?? '?'})`)
   }
 
+  if (multiLane(repo) && stalledNow.length && !resuming) {
+    for (const e of stalledNow) {
+      console.log(yellow(`  lanes ${queueLanesOf(repo, e).join(', ')} wait behind the stall on "${e.branch}"; entries in other lanes keep landing`))
+    }
+  }
+
   const landed = []
-  const landedLanes = []              // lanes of every entry gated this run, for the final check
+  const landedLanes = []              // lanes of every entry landed this run, for the final check
   const simulated = new Set()          // dry-run only; the real queue is never written
+  // Entries this run gives up on: the ones that stall during it, and the ones
+  // `resume` finds unready. Only a multi-lane repo carries on past either; a
+  // one-lane repo still ends the run at the first, as it always has, because
+  // every entry behind a stall there shares its one lane.
+  const held = new Set()
+  let refused = false                  // `resume` found a stalled entry unready
+  // The line a multi-lane stall adds to its console report. At each stall a
+  // one-lane repo returns at once; a multi-lane repo holds the entry and the
+  // loop moves on to the entries in other lanes.
+  const stallLine = e => multiLane(repo)
+    ? `Entries in lanes ${queueLanesOf(repo, e).join(', ')} wait behind it; entries in other lanes keep landing.`
+    : null
   try {
     while (true) {
       const q2 = loadQueue()
       const queued = new Map(q2.entries.map(e => [`${e.repo}:${e.branch}`, e]))
-      const entry = q2.entries.find(e => eligible(cfg, e, key, { queued, simulated, resuming }))
+      const entry = q2.entries.find(e => eligible(cfg, e, key, { queued, simulated, resuming, held }))
       if (!entry) break
 
       console.log(`\n${bold('──')} ${bold(entry.branch)} ${dim(entry.worktree)}`)
@@ -991,7 +1068,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           }
         }
         if (skipMarkerOf(repo)) {
-          console.log(dim(moreEligibleAfter(cfg, key, entry, { queue: q2, simulated, resuming })
+          console.log(dim(moreEligibleAfter(cfg, key, entry, { queue: q2, simulated, resuming, held })
             ? `  (dry run — its merge would carry ${skipMarkerOf(repo)}; the host skips that build)`
             : '  (dry run — its merge would be unmarked; this is the one the host builds)'))
         }
@@ -1014,11 +1091,54 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
       // is declared out here rather than beside its use.
       let current = false
 
+      // Lanes of the entry being landed, set at step 2a; the final check reads
+      // them once the merge is pushed.
+      let runLanes = []
+
       if (alreadyIn) {
         console.log(dim(`  already contained in ${repo.mainBranch} — cleanup only, no merge`))
       } else {
+        // 0. Resuming a stalled entry: the fixer finished the rebase in place.
+        //    A setup or gate stall leaves no rebase at all, so this passes for
+        //    those without asking anything of the fixer.
+        //
+        //    An entry that is not ready is refused. A one-lane repo refuses by
+        //    ending the run, as it always has. A multi-lane repo reports the
+        //    refusal in the same words, holds the entry stalled, and goes on
+        //    with the other entries; the run then exits 1.
+        let fresh = entry.status !== 'stalled'
+        if (!fresh) {
+          const notReady = rebaseInProgress(wt)
+            ? `the rebase in ${wt} is still in progress — finish it (git rebase --continue) before resuming`
+            : entry.ownerCall && !args['--owner-approved']
+              ? `"${entry.branch}" stalled on a protected path — resume with --owner-approved once the owner has read the resolution`
+              : null
+          if (notReady) {
+            if (!multiLane(repo)) die(notReady)
+            console.error(red(`local-merge-queue: ${notReady}`))
+            held.add(entry.branch)
+            refused = true
+            continue
+          }
+          const anc = gitTry(['merge-base', '--is-ancestor', `origin/${repo.mainBranch}`, entry.branch], repo.checkout)
+          if (!anc.ok) {
+            // In a multi-lane repo the other lanes keep landing while this
+            // entry is stalled, so `main` moves under a fixer who resolved the
+            // rebase onto the `main` of the stall. `resume` rebases the entry
+            // again, through step 1 like any other entry; a conflict there
+            // stalls it again. A one-lane repo lands nothing past a stall, so
+            // there the branch is off `main` only if someone moved it by hand.
+            if (!multiLane(repo)) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
+            console.log(dim(`  ${repo.mainBranch} moved while ${entry.branch} was stalled — rebasing it again`))
+            fresh = true
+          }
+          entry.status = 'approved'
+          delete entry.stallReason
+          saveQueue(q2)
+        }
+
         // 1. Bring main and the branch up to date.
-        if (entry.status !== 'stalled') {
+        if (fresh) {
           console.log(dim('  fetching…'))
           if (!run('git fetch origin --prune', repo.checkout)) die('git fetch failed')
           const pull = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
@@ -1063,22 +1183,14 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
             console.error(`  ${conflicted.length} conflicted file(s); the rebase is left in progress for you to resolve.`)
             if (ownerCall) console.error(red('  A conflicted path is protected — this one is the owner\'s call, not an agent\'s.'))
             console.error(`  report: ${file}`)
-            console.error(dim('  Nothing behind it was landed. Resolve, then: local-merge-queue resume ' + key))
-            return { landed, stalledOn: entry.branch }
+            if (!multiLane(repo)) {
+              console.error(dim('  Nothing behind it was landed. Resolve, then: local-merge-queue resume ' + key))
+              return { landed, stalledOn: entry.branch }
+            }
+            console.error(dim(`  ${stallLine(entry)} Resolve, then: local-merge-queue resume ${key}`))
+            held.add(entry.branch)
+            continue
           }
-        } else {
-          // Resuming: the fixer finished the rebase in place. A setup or gate
-          // stall leaves no rebase at all, so this passes for those without
-          // asking anything of the fixer.
-          if (rebaseInProgress(wt)) die(`the rebase in ${wt} is still in progress — finish it (git rebase --continue) before resuming`)
-          if (entry.ownerCall && !args['--owner-approved']) {
-            die(`"${entry.branch}" stalled on a protected path — resume with --owner-approved once the owner has read the resolution`)
-          }
-          const anc = gitTry(['merge-base', '--is-ancestor', `origin/${repo.mainBranch}`, entry.branch], repo.checkout)
-          if (!anc.ok) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
-          entry.status = 'approved'
-          delete entry.stallReason
-          saveQueue(q2)
         }
 
         // 2a. THE ENTRY'S LANES, RECOMPUTED ON THE REBASED BRANCH. This is the
@@ -1086,8 +1198,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         //     enqueue-time diff never saw.
         entry.lanes = lanesOf(repo, wt, entry.branch)
         saveQueue(q2)
-        const runLanes = laneNamesFor(repo, entry)
-        landedLanes.push(...runLanes)
+        runLanes = laneNamesFor(repo, entry)
 
         // 2b. THE BRANCH'S SCAFFOLDING GOES BEFORE THE GATE SEES IT.
         //
@@ -1125,44 +1236,55 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         // conflict that does not exist.
         const setup = ensureWorktreeSetup(repo, wt, runLanes)
         if (!setup.ok) {
+          // A multi-lane repo names the lane whose setup failed.
+          const inLane = multiLane(repo) ? ` in lane ${setup.lane}` : ''
           entry.status = 'stalled'
-          entry.stallReason = `worktree setup failed: ${setup.failed}`
+          entry.stallReason = `worktree setup failed${inLane}: ${setup.failed}`
           saveQueue(q2)
-          const file = writeStallReport(repo, entry, 'worktree setup failed',
+          const file = writeStallReport(repo, entry, `worktree setup failed${inLane}`,
             `This worktree lacked its generated environment — \`${setup.probe || '(no probe configured)'}\` said so —\n` +
             `and the setup step that fills it in exited non-zero:\n\n` +
             `    ${setup.failed}\n\n` +
             `Its output is above, in the landing run log. The gate never ran; nothing here is a\n` +
             `verdict on the branch.`,
             [], false, [setup.failed])
-          console.error(red(`\n  STALLED — worktree setup failed on ${entry.branch}`))
+          console.error(red(`\n  STALLED — worktree setup failed${inLane} on ${entry.branch}`))
           console.error(`  the step that failed: ${setup.failed}`)
           console.error(dim('  The rebase is complete — there is no conflict to resolve, and the gate'))
           console.error(dim('  has not run. Fix the environment in that worktree, then: local-merge-queue resume ' + key))
           console.error(`  report: ${file}`)
-          return { landed, stalledOn: entry.branch }
+          if (!multiLane(repo)) return { landed, stalledOn: entry.branch }
+          console.error(dim(`  ${stallLine(entry)}`))
+          held.add(entry.branch)
+          continue
         }
 
         // 3. The gate: what would break a writer, run on exactly what will land.
         let gateOK = true
         let gateFailed = null
+        let gateLane = null
         gate: for (const name of runLanes) {
           for (const step of repo.lanes[name].gate) {
             console.log(dim(`  gate: ${step}`))
-            if (!run(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; break gate }
+            if (!run(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; gateLane = name; break gate }
           }
         }
         if (!gateOK) {
+          // A multi-lane repo names the lane whose gate failed.
+          const inLane = multiLane(repo) ? ` in lane ${gateLane}` : ''
           entry.status = 'stalled'
-          entry.stallReason = 'gate failed after rebase'
+          entry.stallReason = `gate failed after rebase${inLane}`
           saveQueue(q2)
-          const file = writeStallReport(repo, entry, 'gate failed after rebase',
+          const file = writeStallReport(repo, entry, `gate failed after rebase${inLane}`,
             `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
             [], false, [gateFailed])
-          console.error(red(`\n  STALLED — the gate failed on ${entry.branch} after rebasing.`))
+          console.error(red(`\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} failed on ${entry.branch} after rebasing.`))
           console.error(dim('  This is the queue working: it passed on the old main and fails on the new one.'))
           console.error(`  report: ${file}`)
-          return { landed, stalledOn: entry.branch }
+          if (!multiLane(repo)) return { landed, stalledOn: entry.branch }
+          console.error(dim(`  ${stallLine(entry)}`))
+          held.add(entry.branch)
+          continue
         }
 
         // 3b. PUBLISH THE REBASED TIP BEFORE THE MERGE. Not optional bookkeeping:
@@ -1202,7 +1324,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         console.log(dim(`  merging into ${repo.mainBranch}…`))
         const marker = skipMarkerOf(repo)
         const more = marker
-          ? moreEligibleAfter(cfg, key, entry, { queue: null, simulated, resuming: false })
+          ? moreEligibleAfter(cfg, key, entry, { queue: null, simulated, resuming, held })
           : false
         if (marker) {
           console.log(dim(more
@@ -1219,6 +1341,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           die(`push to origin/${repo.mainBranch} failed, so the merge was rolled back locally:\n${push.err}`)
         }
         console.log(green(`  landed on ${repo.mainBranch} and pushed`))
+        landedLanes.push(...runLanes)
       }
 
       // 5. Cleanup — the lifecycle the roster rule asks for, done by the thing
@@ -1359,24 +1482,33 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
       q3.entries = q3.entries.filter(x => !(x.repo === entry.repo && x.branch === entry.branch))
       saveQueue(q3)
       landed.push(entry.branch)
-      resuming = false
     }
 
-    // The line ran to the end without stalling. If `main` is nevertheless
+    // The line ran to the end. If `main` is nevertheless
     // sitting on a merge the host was told to ignore — the lookahead above can
     // be wrong, and an entry dequeued between two landing runs leaves exactly this —
     // publish it. On the ordinary path the last merge was unmarked and this does
     // nothing. Deliberately reached even when this run landed nothing, because
     // "the final entry was dequeued" is the case where nothing lands and the
     // undeployed tip is somebody else's leftover.
-    settleDeploy(repo, dryRun)
+    //
+    // A run that leaves an entry of the repo stalled does not settle, for the
+    // reason `settleDeploy` gives: the line is expected to continue. A one-lane
+    // repo never reaches this line with a stall, since a stall ends its run.
+    if (!stalledIn(key, loadQueue().entries).length) settleDeploy(repo, dryRun)
   } finally {
     if (!dryRun) releaseLock(key)
   }
 
-  if (!landed.length) {
+  // The entries of this repo still stalled when the run ends: the ones that
+  // stalled during it, the ones `resume` held, and the ones that stalled in an
+  // earlier run and still hold their lanes. Only a multi-lane repo gets here
+  // with any, and a dry run writes nothing, so it reports none.
+  const stalledAtEnd = dryRun ? [] : stalledIn(key, loadQueue().entries)
+
+  if (!landed.length && !stalledAtEnd.length) {
     console.log(dim('\nnothing approved to land'))
-    return { landed }
+    return { landed, refused }
   }
 
   // 6. The broad sweep, once, on the final tip. This REPORTS; it does not gate,
@@ -1394,9 +1526,23 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     console.log(ok ? green('  final check passed') : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
   }
 
-  console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
-  landed.forEach(b => console.log(`  · ${b}`))
-  return { landed }
+  if (landed.length) {
+    console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
+    landed.forEach(b => console.log(`  · ${b}`))
+  }
+  if (!stalledAtEnd.length) return { landed, refused }
+
+  // EACH STALL, SAID AGAIN AT THE END, because the line carried on past it and
+  // its first report may be hundreds of lines of gate output above.
+  console.error(red(`\n${bold('stalled')} ${stalledAtEnd.length} branch(es) in ${key}:`))
+  for (const e of stalledAtEnd) {
+    console.error(red(`  · ${e.branch} [${queueLanesOf(repo, e).join(', ')}] — ${e.stallReason || 'stalled'}`))
+    console.error(dim(`    report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`))
+  }
+  const waiting = Object.keys(repo.lanes).filter(n => blockedLanes(repo, stalledAtEnd).has(n))
+  console.error(dim(`  Entries in lanes ${waiting.join(', ')} wait behind these stalls; entries in other lanes keep landing.`))
+  console.error(dim(`  Resolve each, then: local-merge-queue resume ${key}`))
+  return { landed, refused, stalledOn: stalledAtEnd[0].branch }
 }
 
 function cmdResume (cfg, args) {
@@ -1423,9 +1569,10 @@ ${bold('local-merge-queue')} — a local merge queue for git repositories
   ${bold('local-merge-queue land')} [repo] [--dry-run]
       Land every approved entry, one at a time: rebase → gate → merge --no-ff →
       push → remove worktree → delete branch → delete roster row. Stalls on the
-      first conflict; nothing behind it lands out of order.
+      first conflict; nothing that shares a lane with it lands out of order.
   ${bold('local-merge-queue resume')} [repo] [--owner-approved]
-      Continue after a stall has been resolved in the worktree.
+      Continue after a stall has been resolved in the worktree. Retries every
+      stalled entry in queue order.
   ${bold('local-merge-queue dequeue')} <branch>       Remove an entry; the branch is left untouched.
 
 Full contract: ${path.join(HERE, 'README.md')}
@@ -1465,5 +1612,8 @@ const commands = {
 const fn = commands[cmd]
 if (!fn) { console.error(red(`local-merge-queue: unknown command "${cmd}"`)); cmdHelp(); process.exit(1) }
 
+// A resume that found a stalled entry unready exits 1, as the refusal always
+// has; a run that ends with any entry stalled exits 2.
 const result = fn(cfg, args)
+if (result && result.refused) process.exit(1)
 if (result && result.stalledOn) process.exit(2)
