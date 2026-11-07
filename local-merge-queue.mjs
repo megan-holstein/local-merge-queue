@@ -275,12 +275,61 @@ function protectedOf (repo) {
   return Object.values(repo.lanes).flatMap(l => l.protectedPaths)
 }
 
-// The deploy marker is a property of the host that builds `main`, and with
-// several lanes this reads the first lane that declares one. A one-lane repo
-// reads its own, as before.
-function skipMarkerOf (repo) {
-  for (const l of Object.values(repo.lanes)) if (l.deploy?.skipMarker) return l.deploy.skipMarker
-  return undefined
+// The deploy marker is a property of the host that builds a lane. A lane with a
+// `deploy.skipMarker` has one; a lane without writes none and is never settled.
+// Returns the names of the lanes that have one, in config order.
+function deployLanes (repo) {
+  return Object.keys(repo.lanes).filter(n => repo.lanes[n].deploy?.skipMarker)
+}
+
+// Is the lane's last build one the host was told to skip? The question is asked
+// of `main` and never of the queue's memory.
+//
+// A "*" lane takes every path, so its host builds every push and the answer is
+// the tip, as it was before lanes existed. Any other lane's host is filtered
+// by path, so only a commit that changes one of its paths (its prefixes or a
+// `shared` prefix), or an empty commit, makes it build. The rule walks the
+// first-parent history of `main` from the tip and stops at the first commit
+// that is either of those; the lane is undeployed when that commit carries the
+// marker. A plain `git log -- <paths>` fails twice here: without `--first-parent`
+// it follows the branch side of a `--no-ff` merge and returns the branch's own
+// commit, never the merge that carries the marker; with it, an empty commit
+// changes no path and never appears, so every later run would republish again.
+// An empty commit counts for every lane, because a path-filtered host must
+// build one (see the README), so any unmarked empty commit means every lane's
+// host built.
+function laneUndeployed (repo, name) {
+  const lane = repo.lanes[name]
+  const marker = lane.deploy?.skipMarker
+  if (!marker) return false
+  const cwd = repo.checkout
+  if (lane.paths === '*') {
+    const tip = gitTry(['log', '-1', '--format=%B', repo.mainBranch], cwd)
+    return tip.ok && tip.out.includes(marker)
+  }
+  // A prefix is matched the way `lanesOf` matches it, by `startsWith`, so the
+  // pathspec is the prefix followed by a glob, with the prefix's own glob
+  // characters escaped.
+  const specs = [...lane.paths, ...repo.shared].map(p => `:(top)${p.replace(/[*?[\\]/g, '\\$&')}*`)
+  const touch = gitTry(['log', '-1', '--first-parent', '--format=%H', repo.mainBranch, '--', ...specs], cwd)
+  const touchSha = touch.ok ? touch.out : ''
+  let stop = touchSha
+  // Empty commits after the last commit that touched the lane, newest first. A
+  // commit is empty when its tree equals its first parent's tree, and the
+  // first parent of each commit in this list is the next one down it.
+  const range = touchSha ? `${touchSha}..${repo.mainBranch}` : repo.mainBranch
+  const after = gitTry(['log', '--first-parent', '--format=%H %T', range], cwd)
+  if (after.ok && after.out) {
+    const rows = after.out.split('\n').map(l => l.split(' '))
+    const below = touchSha ? gitTry(['rev-parse', `${touchSha}^{tree}`], cwd) : null
+    for (let i = 0; i < rows.length; i++) {
+      const parentTree = i + 1 < rows.length ? rows[i + 1][1] : (below && below.ok ? below.out : null)
+      if (parentTree && rows[i][1] === parentTree) { stop = rows[i][0]; break }
+    }
+  }
+  if (!stop) return false
+  const msg = gitTry(['log', '-1', '--format=%B', stop], cwd)
+  return msg.ok && msg.out.includes(marker)
 }
 
 function loadQueue () {
@@ -371,11 +420,16 @@ function eligible (cfg, entry, key, { queued, simulated, resuming, held = new Se
 // asked the host to make. It is only ever a lookahead, though: the entry behind
 // this one may still stall, or turn out to be cleanup-only and push nothing. The
 // end-of-run settle (`settleDeploy`) is what makes those cases safe.
-function moreEligibleAfter (cfg, key, entry, { queue, simulated, resuming, held }) {
+//
+// With a `lane`, only another entry that holds that lane counts, since the
+// marker is per lane: an entry behind this one in another lane builds a
+// different host.
+function moreEligibleAfter (cfg, key, entry, { queue, simulated, resuming, held, lane }) {
   const q = queue || loadQueue()
   const queued = new Map(q.entries.map(e => [`${e.repo}:${e.branch}`, e]))
   return q.entries.some(e =>
     !(e.repo === entry.repo && e.branch === entry.branch) &&
+    (!lane || queueLanesOf(cfg.repos[key], e).includes(lane)) &&
     eligible(cfg, e, key, { queued, simulated, resuming, held, quiet: true }))
 }
 
@@ -572,7 +626,10 @@ function ensureWorktreeSetup (repo, wt, laneNames) {
  * message out of the documented `VERCEL_GIT_COMMIT_MESSAGE`. So the merge queue
  * appends `deploy.skipMarker` to the merge commit message of every entry that
  * has another entry behind it, and leaves the LAST merge of the run unmarked.
- * One push, one build, the state a person actually asked for.
+ * One push, one build, the state a person actually asked for. With lanes the
+ * marker is per lane: an entry carries the marker of each of its lanes that has
+ * one when another eligible entry behind it shares that lane, so a run that
+ * touches only lanes without a `deploy` key writes none.
  *
  * WHAT IS NOT DONE, AND WHY: the pushes themselves are not batched or deferred.
  * An unpushed merge is unbacked-up work, and the pull request retires itself
@@ -584,35 +641,41 @@ function ensureWorktreeSetup (repo, wt, laneNames) {
  * two ways — the entry behind this one may stall and then be dequeued, or it may
  * turn out to be cleanup-only and push nothing — and both leave `main` sitting
  * on a merge the host was told to ignore, with production serving the build from
- * before the landing run. So at the end of every run that leaves no entry of the
- * repo stalled, the merge queue asks the state rather than its own memory: does the tip of `main` carry the
- * marker? If it does, an empty commit publishes it. On the ordinary path the tip
- * is unmarked and this does nothing at all.
+ * before the landing run. So at the end of every run, for each lane with a
+ * marker that no stalled entry holds, the merge queue asks the state rather
+ * than its own memory: is the lane's last build a merge that carries the marker
+ * (`laneUndeployed`)? If any is, ONE empty commit publishes every lane. On the
+ * ordinary path the lane's last build is unmarked and this does nothing at all.
  *
- * A stall deliberately does NOT settle. The line is expected to continue, and
- * shipping the half-landed state mid-stall is the thing this whole feature
- * exists to stop; the resume that lands the last entry deploys it.
+ * A stall deliberately does NOT settle the lanes it holds. The line is expected
+ * to continue, and shipping the half-landed state mid-stall is the thing this
+ * whole feature exists to stop; the resume that lands the last entry deploys it.
  */
-function settleDeploy (repo, dryRun) {
-  const marker = skipMarkerOf(repo)
-  if (!marker || dryRun) return
+function settleDeploy (repo, dryRun, blocked = new Set()) {
+  // Each lane with a marker is settled unless a stalled entry holds it: the
+  // line is expected to continue there. A one-lane repo with any stall holds
+  // its one lane, so it settles exactly when it did before lanes existed.
+  const lanes = deployLanes(repo).filter(n => !blocked.has(n))
+  if (!lanes.length || dryRun) return
   gitTry(['fetch', 'origin', repo.mainBranch], repo.checkout)
   const ff = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
   if (!ff.ok) {
     console.log(yellow(`  ${repo.mainBranch} could not fast-forward to origin, so the deploy state was not checked`))
     return
   }
-  const tip = gitTry(['log', '-1', '--format=%B', repo.mainBranch], repo.checkout)
-  if (!tip.ok || !tip.out.includes(marker)) return
+  const undeployed = lanes.filter(n => laneUndeployed(repo, n))
+  if (!undeployed.length) return
 
   // THE MESSAGE MUST NOT CONTAIN THE MARKER. Interpolating it here — naming the
   // thing being fixed, which is the natural sentence to write — would make the
   // commit that exists to trigger a build the next one skipped, permanently and
   // silently. Asserted rather than trusted.
   const msg = `Redeploy ${repo.mainBranch}: the landing run ended on a merge the host was told not to build`
-  if (msg.includes(marker)) die('the redeploy commit message carries the skip marker — refusing to push a commit that cancels itself')
+  if (deployLanes(repo).some(n => msg.includes(repo.lanes[n].deploy.skipMarker))) die('the redeploy commit message carries the skip marker — refusing to push a commit that cancels itself')
 
-  console.log(yellow(`  ${repo.mainBranch} is sitting on a skipped build — publishing it`))
+  // ONE EMPTY COMMIT SERVES EVERY LANE, so a run that finds several lanes
+  // undeployed publishes once.
+  console.log(yellow(`  ${repo.mainBranch} is sitting on a skipped build${multiLane(repo) ? ` in ${lanePhrase(undeployed)}` : ''} — publishing it`))
   const cm = gitTry(['commit', '--allow-empty', '-m', msg], repo.checkout)
   if (!cm.ok) {
     console.log(red(`  THE REDEPLOY COMMIT FAILED: ${cm.err || '(no stderr)'}`))
@@ -836,11 +899,9 @@ function cmdStatus (cfg, args) {
  * Silent for every repo that configures no `deploy`.
  */
 function reportUndeployedTip (key, repo) {
-  const marker = skipMarkerOf(repo)
-  if (!marker) return
-  const tip = gitTry(['log', '-1', '--format=%B', repo.mainBranch], repo.checkout)
-  if (!tip.ok || !tip.out.includes(marker)) return
-  console.log(yellow(`${key}: ${repo.mainBranch} is sitting on a build the host was told to skip`))
+  const undeployed = deployLanes(repo).filter(n => laneUndeployed(repo, n))
+  if (!undeployed.length) return
+  console.log(yellow(`${key}: ${repo.mainBranch} is sitting on a build the host was told to skip${multiLane(repo) ? ` in ${lanePhrase(undeployed)}` : ''}`))
   console.log(dim(`  Production still serves what it served before that merge.`))
   console.log(dim(`  The next landing run of this repo publishes it:  local-merge-queue land ${key}`))
   console.log('')
@@ -1062,20 +1123,25 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
       console.log(`\n${bold('──')} ${bold(entry.branch)} ${dim(entry.worktree)}`)
       if (dryRun) {
         console.log(dim('  (dry run — would rebase, gate, merge --no-ff, push, clean up)'))
+        let dryLanes = Object.keys(repo.lanes)
         if (multiLane(repo)) {
           // Computed live and never stored: a dry run writes nothing.
           const live = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout).ok
           const shown = live ? lanesOf(repo, repo.checkout, entry.branch) : (entry.lanes || [])
+          dryLanes = shown
           console.log(dim(`  lanes: [${shown.join(', ')}]`))
           for (const n of shown) {
             const steps = repo.lanes[n].gate
             console.log(dim(`  gate [${n}]: ${steps.length ? steps.join(' && ') : '(no steps)'}`))
           }
         }
-        if (skipMarkerOf(repo)) {
-          console.log(dim(moreEligibleAfter(cfg, key, entry, { queue: q2, simulated, resuming, held })
-            ? `  (dry run — its merge would carry ${skipMarkerOf(repo)}; the host skips that build)`
-            : '  (dry run — its merge would be unmarked; this is the one the host builds)'))
+        // The marker is per lane: say, for each lane of the entry that has one,
+        // whether this merge would carry it.
+        for (const n of dryLanes.filter(n => repo.lanes[n].deploy?.skipMarker)) {
+          const here = multiLane(repo) ? ` for lane ${n}` : ''
+          console.log(dim(moreEligibleAfter(cfg, key, entry, { queue: q2, simulated, resuming, held, lane: n })
+            ? `  (dry run — its merge would carry ${repo.lanes[n].deploy.skipMarker}${here}; the host skips that build)`
+            : `  (dry run — its merge would be unmarked${here}; this is the one the host builds)`))
         }
         simulated.add(entry.branch)
         landed.push(entry.branch)
@@ -1327,16 +1393,20 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         //    make this the last merge after all. See `settleDeploy` for the rest
         //    of the design and for what happens when this lookahead is wrong.
         console.log(dim(`  merging into ${repo.mainBranch}…`))
-        const marker = skipMarkerOf(repo)
-        const more = marker
-          ? moreEligibleAfter(cfg, key, entry, { queue: null, simulated, resuming, held })
-          : false
-        if (marker) {
+        //    The marker is per lane: each of the entry's lanes that has one is
+        //    marked when another eligible entry behind this one shares the lane,
+        //    and two lanes that share one marker write it once.
+        const markers = []
+        for (const n of runLanes.filter(n => repo.lanes[n].deploy?.skipMarker)) {
+          const marker = repo.lanes[n].deploy.skipMarker
+          const more = moreEligibleAfter(cfg, key, entry, { queue: null, simulated, resuming, held, lane: n })
+          const here = multiLane(repo) ? ` in lane ${n}` : ''
           console.log(dim(more
-            ? `  marked ${marker} — another branch is queued behind it, so the host skips this build`
-            : '  unmarked — the last of this run, so the host builds it'))
+            ? `  marked ${marker} — another branch${here} is queued behind it, so the host skips this build`
+            : `  unmarked${here} — the last of this run, so the host builds it`))
+          if (more && !markers.includes(marker)) markers.push(marker)
         }
-        const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${more ? ` ${marker}` : ''}`
+        const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${markers.map(m => ` ${m}`).join('')}`
         const mg = gitTry(['merge', '--no-ff', '-m', msg, entry.branch], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
 
@@ -1497,10 +1567,10 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     // "the final entry was dequeued" is the case where nothing lands and the
     // undeployed tip is somebody else's leftover.
     //
-    // A run that leaves an entry of the repo stalled does not settle, for the
-    // reason `settleDeploy` gives: the line is expected to continue. A one-lane
-    // repo never reaches this line with a stall, since a stall ends its run.
-    if (!stalledIn(key, loadQueue().entries).length) settleDeploy(repo, dryRun)
+    // A lane held by a stalled entry is not settled, for the reason
+    // `settleDeploy` gives: the line is expected to continue there. A one-lane
+    // repo with a stall holds its one lane, so it settles nothing.
+    settleDeploy(repo, dryRun, blockedLanes(repo, loadQueue().entries))
   } finally {
     if (!dryRun) releaseLock(key)
   }
