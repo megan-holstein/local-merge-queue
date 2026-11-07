@@ -74,6 +74,7 @@
           "setup": ["npm install"],
           "gate": ["npm run lint --workspace site", "npm run build --workspace site"],
           "protectedPaths": ["site/content/"],
+          "//deploy": "The marker is per lane. An entry in this lane is marked when another entry behind it holds this lane, and the `app` lane below has no `deploy` key, so an `app` entry never writes one. At the end of a run the queue checks whether this lane's last build still carries the marker and, if so, publishes it with an empty commit. The host's path filter must build an empty commit (one that changes no file), or the host cancels the republish.",
           "deploy": { "skipMarker": "[skip-deploy]" }
         },
         "app": {

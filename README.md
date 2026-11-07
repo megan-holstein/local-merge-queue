@@ -352,17 +352,33 @@ Three properties are worth knowing before changing any of it:
 - **The lookahead is asked of the queue at the merge rather than before the gate.** A gate
   takes minutes and an entry can be dequeued inside them, which makes the entry being landed
   the last one after all. Re-reading is what lets that dequeue land correctly.
-- **A stall does not deploy.** The line is expected to continue, and shipping the
-  half-landed state mid-stall is the thing this exists to prevent. The `resume` that lands
-  the last entry is what deploys.
+- **A stall does not deploy the lane it holds.** The line is expected to continue, and
+  shipping the half-landed state mid-stall is the thing this exists to prevent. The `resume`
+  that lands the last entry is what deploys.
 - **The end of a run settles from the state rather than from memory.** The lookahead can
   still be wrong in two ways, since the entry behind this one may stall and then be
   dequeued, or may turn out to be cleanup-only and push nothing, and both leave `main` on a
   merge the host was told to ignore, with an empty queue and a healthy-looking log. So
-  every run that leaves no entry of the repo stalled ends by asking whether the tip of `main` carries the
-  marker, and publishes it with an empty commit where it does. On the ordinary path the tip
+  every run ends by asking, for each lane that has a marker and that no stalled entry holds, whether the lane's last build carries the
+  marker, and publishes it with an empty commit where it does. On the ordinary path the last build
   is unmarked and this does nothing at all. `local-merge-queue status` reports the same state, for
   the stretch between the dequeue and the next landing run.
+
+A repo with one lane and a `deploy` key behaves as this section describes. A repo with several lanes marks and settles lane by lane; the next section says how.
+
+### Lanes and the deploy marker
+
+**The marker is per lane.** `deploy` sits inside a lane, and a lane without a `deploy` key never writes a marker, so an entry in such a lane alone lands unmarked, as it does in a repo with no `deploy` key at all. For each of an entry's lanes that has `deploy.skipMarker`, the merge commit message carries that lane's marker when another entry that this run will land holds the same lane. An entry in another lane does not count: it builds a different host. Two lanes that share one marker string write it once. `land --dry-run` prints, for each lane of the entry that has a marker, whether the merge would carry it.
+
+With lane `site` carrying `deploy` and lane `app` carrying none, three queued entries `site-1`, `app-1`, `site-2` land as `site-1` marked, `app-1` unmarked and `site-2` unmarked. A run of `app` entries alone writes no marker.
+
+**The settle is per lane.** At the end of every run, for each lane that has a marker and that no stalled entry holds, `land` asks whether the lane's last build is a merge that carries the marker. A lane whose paths are `"*"` builds on every push, so its last build is the tip of `main`. For any other lane, `land` walks the first-parent history of `main` from the tip and stops at the first commit that either changes a path of the lane (its prefixes or a `shared` prefix, compared with its first parent) or changes no file at all. If that commit carries the lane's marker, the lane is undeployed.
+
+An empty commit counts as a build of every lane, whichever lane's settle wrote it, so one unmarked empty commit settles every lane at once. A run that finds several lanes undeployed publishes one empty commit, and a second `land` over a settled `main` adds nothing. The walk follows first parents because a plain path-limited `git log` follows the branch side of a `--no-ff` merge and returns the branch's own commit, never the merge that carries the marker, and because an empty commit changes no path and would never appear in it.
+
+**A host's path filter must still build an empty commit.** The republish changes no file. A host that skips a build when no path in its filter changed cancels the republish unless the filter lets an empty commit through. Configure the host so that a commit with no changed files builds.
+
+A stall holds its lanes' settle. If `site-1` merges marked and `site-2` stalls on its gate, `main`'s last `site/` commit stays marked under any later `app` merges, `status` reports `main is sitting on a build the host was told to skip in lane site`, and the next `land` after the stalled entry is resolved or dequeued publishes it. The empty commit builds every lane's host, so a run that settles one lane also publishes any other lane's merge that a stall is holding back; keep the marker on the lanes whose half-landed state is safe to build.
 
 The one thing that must never appear in that empty commit's message is the marker itself.
 Naming the thing being fixed is the natural sentence to write, and it would make the commit
@@ -437,7 +453,7 @@ A repo declares lanes in its config entry. `repos.example.json` has a worked mon
 ```
 
 - `paths` is an array of path prefixes, or the string `"*"` for the lane that takes every path no other lane claims. At most one lane may be `"*"`; a repo without one is valid, and then `enqueue` and `land` refuse an entry that changes an unclaimed path, naming the path.
-- A lane may carry `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` and `deploy`, with the meanings those keys have at repo level.
+- A lane may carry `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` and `deploy`, with the meanings those keys have at repo level. The deploy marker is per lane; see [Lanes and the deploy marker](#lanes-and-the-deploy-marker).
 - `shared` is a repo-level array of path prefixes that count as belonging to every lane.
 - `checkout`, `mainBranch` and `githubRepo` stay at repo level.
 - When a repo declares `lanes`, a repo-level `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` or `deploy` is a config error. `loadConfig` names the key and exits, so there is one answer to which gate ran.
@@ -460,7 +476,7 @@ In a repo with more than one lane, a stall does not end the landing run. `land` 
 
 - `land` refuses only when every lane of the repo is held by some stalled entry, with the same message a one-lane repo prints. While only some lanes are held, `land` says which lanes wait behind which stall and lands the rest.
 - The report names the lanes that stalled and says that entries in other lanes keep landing. At the end of the run, `land` prints each stalled entry with its lanes, its reason and its report.
-- A run that ends with any entry of the repo stalled exits 2, and it does not settle the deploy marker.
+- A run that ends with any entry of the repo stalled exits 2. It settles the deploy marker of every lane no stalled entry holds, and leaves the held lanes for the next run; see [Lanes and the deploy marker](#lanes-and-the-deploy-marker).
 
 `resume` retries every stalled entry of the repo in queue order, and lands the approved entries their lanes held behind them. A stalled entry whose rebase is still in progress, or whose conflict needs `--owner-approved` and did not get it, gets the same message a one-lane repo prints, stays stalled, and the run goes on with the others; the run then exits 1. Because the other lanes keep landing during a stall, `main` can move under an entry after its fixer resolved the rebase. `resume` then rebases that entry again onto the new `main`, and a conflict there stalls it again.
 
@@ -646,7 +662,7 @@ dequeued after a stall, where the next landing run republishes the tip with an e
 carrying no marker. Then the stacked-PR retarget, against a `gh` stubbed on `PATH` so that
 nothing here reaches GitHub: the PR moved onto `main` by a real `gh pr edit --base` argv,
 that call landing *before* the branch deletion rather than after it, and a `gh` that refuses
-the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. 188 assertions.
+the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. Then the deploy marker lane by lane, on a fourth fixture repo where lane `a` carries `deploy` and lane `b` does not: three entries in the order `a1`, `b1`, `a2` landing as marked, unmarked, unmarked, with `--dry-run` naming the lane; a run of `b` entries alone writing no marker and no republish; an `a` entry stalling behind a marked `a` merge while a `b` merge lands over it, `status` reporting the undeployed lane, and the next `land` after the dequeue republishing with one empty commit that carries no marker; a second `land` and a later `b` merge adding no further republish; a marker shared by two lanes written once; and an entry in two lanes with their own markers carrying both, with one empty commit settling both lanes. 216 assertions.
 Run it before changing anything.
 
 ```sh
