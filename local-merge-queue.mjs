@@ -707,11 +707,23 @@ function settleDeploy (repo, dryRun, blocked = new Set()) {
  * `fixSteps` names what to actually run, and the rebase paragraph appears only
  * when a rebase is genuinely sitting there.
  */
-function writeStallReport (repo, entry, kind, detail, conflicted, ownerCall, fixSteps = []) {
+function writeStallReport (repo, entry, kind, detail, conflicted, ownerCall, fixSteps = [], { behindMain = false } = {}) {
   fs.mkdirSync(REPORT_DIR, { recursive: true })
   const file = path.join(REPORT_DIR, `${repo.key}-${entry.branch}.md`)
   const midRebase = rebaseInProgress(entry.worktree)
-  const clearIt = midRebase
+  const clearIt = behindMain
+    ? `**This branch was enqueued with \`--no-rebase\`, so the queue started no rebase.**
+\`origin/${repo.mainBranch}\` has commits the branch does not contain. Merge them into
+the branch, in its own worktree:
+
+\`\`\`sh
+cd "${entry.worktree}"
+git merge origin/${repo.mainBranch}
+# resolve any conflict, then commit the merge
+\`\`\`
+
+The merge commit keeps the branch's history as it is; a rebase would rewrite it.`
+    : midRebase
     ? `The rebase is left in progress on purpose — resolve in place, in that worktree:
 
 \`\`\`sh
@@ -816,6 +828,7 @@ function cmdEnqueue (cfg, args) {
     existing.lanes = lanes
     if (args['--note']) existing.note = args['--note']
     if (args['--after']) existing.after = args['--after']
+    if (args['--no-rebase']) existing.noRebase = true
     saveQueue(q)
     console.log(`${bold('updated')} ${repo.key}/${branch} (status: ${existing.status})`)
     return
@@ -828,6 +841,7 @@ function cmdEnqueue (cfg, args) {
     note: args['--note'] || '',
     after: args['--after'] || null,
     lanes,
+    ...(args['--no-rebase'] ? { noRebase: true } : {}),
     status: 'enqueued',                 // enqueued → approved (the owner's word) → landed
     enqueued: nowISO()
   })
@@ -866,6 +880,7 @@ function cmdStatus (cfg, args) {
       const name = multiLane(repo) && e.lanes ? `${e.branch} [${e.lanes.join(', ')}]` : e.branch
       console.log(`  ${String(i + 1).padStart(2)}. ${name.padEnd(28)} ${mark.padEnd(18)} ${delta}`)
       if (e.after) console.log(dim(`      after: ${e.after}`))
+      if (e.noRebase) console.log(dim('      no-rebase'))
       if (e.note) console.log(dim(`      ${e.note}`))
       if (e.stallReason) console.log(red(`      ${e.stallReason}`))
     })
@@ -1120,9 +1135,11 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
       const entry = q2.entries.find(e => eligible(cfg, e, key, { queued, simulated, resuming, held }))
       if (!entry) break
 
-      console.log(`\n${bold('──')} ${bold(entry.branch)} ${dim(entry.worktree)}`)
+      console.log(`\n${bold('──')} ${bold(entry.branch)} ${dim(entry.worktree)}${entry.noRebase ? ' ' + dim('no-rebase') : ''}`)
       if (dryRun) {
-        console.log(dim('  (dry run — would rebase, gate, merge --no-ff, push, clean up)'))
+        console.log(dim(entry.noRebase
+          ? `  (dry run — no-rebase: would stall if origin/${repo.mainBranch} is not in the branch; otherwise gate, merge --no-ff, push, clean up)`
+          : '  (dry run — would rebase, gate, merge --no-ff, push, clean up)'))
         let dryLanes = Object.keys(repo.lanes)
         if (multiLane(repo)) {
           // Computed live and never stored: a dry run writes nothing.
@@ -1199,8 +1216,16 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
             // again, through step 1 like any other entry; a conflict there
             // stalls it again. A one-lane repo lands nothing past a stall, so
             // there the branch is off `main` only if someone moved it by hand.
-            if (!multiLane(repo)) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
-            console.log(dim(`  ${repo.mainBranch} moved while ${entry.branch} was stalled — rebasing it again`))
+            //
+            // A --no-rebase entry is never rebased. It falls through to step 2,
+            // which stalls it again, with the same reason, unless the fixer
+            // has merged origin/main into it.
+            if (entry.noRebase) {
+              console.log(dim(`  ${entry.branch} does not contain origin/${repo.mainBranch} — checking it again (--no-rebase)`))
+            } else {
+              if (!multiLane(repo)) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
+              console.log(dim(`  ${repo.mainBranch} moved while ${entry.branch} was stalled — rebasing it again`))
+            }
             fresh = true
           }
           entry.status = 'approved'
@@ -1235,6 +1260,26 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           //    Skipping is exact where replaying is a guess: with origin/main an
           //    ancestor, the merge --no-ff below lands the tested tree verbatim.
           current = gitTry(['merge-base', '--is-ancestor', `origin/${repo.mainBranch}`, entry.branch], wt).ok
+          if (!current && entry.noRebase) {
+            // The branch is never rebased: it lands as it is or not at all.
+            entry.status = 'stalled'
+            entry.ownerCall = false
+            entry.stallReason = `main moved under a --no-rebase branch — merge origin/${repo.mainBranch} into it and resume`
+            saveQueue(q2)
+            const file = writeStallReport(repo, entry, 'behind main (--no-rebase)',
+              `origin/${repo.mainBranch} is not an ancestor of ${entry.branch}, and the entry is --no-rebase.`, [], false, [],
+              { behindMain: true })
+            console.error(red(`\n  STALLED — ${entry.stallReason}`))
+            console.error(`  In ${wt}: git merge origin/${repo.mainBranch}, resolve if needed, commit.`)
+            console.error(`  report: ${file}`)
+            if (!multiLane(repo)) {
+              console.error(dim('  Nothing behind it was landed. Merge, then: local-merge-queue resume ' + key))
+              return { landed, stalledOn: entry.branch }
+            }
+            console.error(dim(`  ${stallLine(entry)} Merge, then: local-merge-queue resume ${key}`))
+            held.add(entry.branch)
+            continue
+          }
           const rb = current
             ? { ok: true }
             : (console.log(dim(`  rebasing onto origin/${repo.mainBranch}…`)),
@@ -1628,10 +1673,12 @@ function cmdHelp () {
   console.log(`
 ${bold('local-merge-queue')} — a local merge queue for git repositories
 
-  ${bold('local-merge-queue enqueue')} [--repo R] [--branch B] [--after DEP] [--note "…"]
+  ${bold('local-merge-queue enqueue')} [--repo R] [--branch B] [--after DEP] [--note "…"] [--no-rebase]
       Enqueue a finished branch. Run it from the branch's worktree and
       repo/branch are detected. Refuses unpushed or uncommitted work. The entry
       sits ${dim('enqueued')} until the owner approves it — enqueuing never merges anything.
+      ${bold('--no-rebase')}: never rebase this branch; if main moved under it, stall and
+      ask for ${dim('git merge origin/<main>')} in the worktree.
 
   ${bold('local-merge-queue status')} [repo]        Show the queue, each entry's state and delta.
   ${bold('local-merge-queue approve')} <branch>… | --all [--repo R]
