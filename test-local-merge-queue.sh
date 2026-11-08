@@ -336,6 +336,77 @@ check "…and both folded sides are in main's history" \
   '[[ -n "$(git log main --oneline --grep="side-one: claim" )" && -n "$(git log main --oneline --grep="side-two: claim")" ]]'
 
 echo
+echo "── 14b. --no-rebase: a branch that must never be rebased ────────────"
+# THE REGRESSION THIS GUARDS. A branch that carries imported history (the
+# repository fold) must land with its merge commits intact. Even a rebase that
+# conflicts nowhere would replay every one of its commits in one line, so a
+# --no-rebase entry whose branch lacks current main stalls and asks for
+# `git merge origin/main` in its worktree. It never starts a rebase.
+cd "$ROOT/repo"
+git checkout -q main
+# nr1 merged current main, so it lands as it is, merge commit included.
+git worktree add -q "$ROOT/repo-nr1" -b nr1 main >/dev/null 2>&1
+( cd "$ROOT/repo-nr1" && echo nr1 > nr1.txt && git add -A && git commit -qm "nr1: its own work" )
+echo "main moves before nr1" >> base.txt
+git commit -qam "main: moves before nr1 merges it" && git push -q origin main
+cd "$ROOT/repo-nr1"
+git merge -q --no-ff main -m "nr1: merge main in" >/dev/null 2>&1
+git push -qu origin nr1 2>/dev/null
+merges_before=$(git -C "$ROOT/repo" rev-list --count --merges main)
+nr1_head=$(git rev-parse HEAD)
+$LOCAL_MERGE_QUEUE enqueue --no-rebase --note "nr1" >/dev/null 2>&1
+nr_flag () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));console.log(q.entries.find(x=>x.branch==process.argv[1]).noRebase)' "$1"; }
+check "enqueue --no-rebase records the flag on the entry"        '[[ "$(nr_flag nr1)" == true ]]'
+out=$($LOCAL_MERGE_QUEUE status t 2>&1)
+check "status shows no-rebase beside the entry"                  '[[ "$out" == *"no-rebase"* ]]'
+$LOCAL_MERGE_QUEUE approve nr1 >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land t --dry-run 2>&1)
+check "land --dry-run shows no-rebase"                           '[[ "$out" == *"no-rebase"* ]]'
+out=$($LOCAL_MERGE_QUEUE land t 2>&1)
+cd "$ROOT/repo"
+check "a --no-rebase branch that merged main lands"              '[[ "$out" != *STALLED* ]] && git merge-base --is-ancestor "$nr1_head" main'
+check "…with its own merge commit and the --no-ff landing merge on main" \
+  '[[ -n "$(git log main --merges --oneline --grep="nr1: merge main in")" && $(git rev-list --count --merges main) == $((merges_before + 2)) ]]'
+
+# nr2 merged main, then main moved again: the queue must stall, not rebase.
+git worktree add -q "$ROOT/repo-nr2" -b nr2 main >/dev/null 2>&1
+( cd "$ROOT/repo-nr2" && echo nr2 > nr2.txt && git add -A && git commit -qm "nr2: its own work" )
+echo "main moves before nr2" >> base.txt
+git commit -qam "main: moves before nr2 merges it" && git push -q origin main
+cd "$ROOT/repo-nr2"
+git merge -q --no-ff main -m "nr2: merge main in" >/dev/null 2>&1
+git push -qu origin nr2 2>/dev/null
+$LOCAL_MERGE_QUEUE enqueue --no-rebase --note "nr2" >/dev/null 2>&1
+$LOCAL_MERGE_QUEUE approve nr2 >/dev/null 2>&1
+cd "$ROOT/repo"
+echo "main moves under nr2" >> base.txt
+git commit -qam "main: moves under nr2" && git push -q origin main
+wt2="$ROOT/repo-nr2"
+nr2_head=$(git -C "$wt2" rev-parse HEAD)
+out=$($LOCAL_MERGE_QUEUE land t 2>&1); rc=$?
+st=$($LOCAL_MERGE_QUEUE status t 2>&1)
+no_rebase_dir () { [[ ! -e "$(git -C "$wt2" rev-parse --path-format=absolute --git-path rebase-merge)" && ! -e "$(git -C "$wt2" rev-parse --path-format=absolute --git-path rebase-apply)" ]]; }
+check "main moved under a --no-rebase branch: the run stalls and exits 2" '[[ "$out" == *STALLED* && $rc == 2 ]]'
+check "…status gives the reason" \
+  '[[ "$st" == *"main moved under a --no-rebase branch — merge origin/main into it and resume"* ]]'
+check "…no rebase was started in the worktree"                   'no_rebase_dir'
+check "…and the branch did not move"                             '[[ "$(git -C "$wt2" rev-parse HEAD)" == "$nr2_head" ]]'
+report=$(find "$LOCAL_MERGE_QUEUE_STATE" -name 't-nr2.md' | head -1)
+check "…and the report says to merge, not to continue a rebase" \
+  '[[ -n "$report" && "$(cat "$report")" == *"git merge origin/main"* && "$(cat "$report")" != *"left in progress"* && "$(cat "$report")" != *"rebase --continue"* ]]'
+out=$($LOCAL_MERGE_QUEUE resume t 2>&1)
+check "resume without the merge stalls it again, still unrebased" \
+  '[[ "$out" == *STALLED* && "$(git -C "$wt2" rev-parse HEAD)" == "$nr2_head" ]] && no_rebase_dir'
+( cd "$wt2" && git merge -q --no-ff origin/main -m "nr2: merge main in again" >/dev/null 2>&1 && git push -q origin nr2 2>/dev/null )
+nr2_head=$(git -C "$wt2" rev-parse HEAD)
+out=$($LOCAL_MERGE_QUEUE resume t 2>&1)
+cd "$ROOT/repo"
+check "after git merge origin/main in the worktree, resume lands it" \
+  '[[ "$out" != *STALLED* ]] && git merge-base --is-ancestor "$nr2_head" main'
+check "…with the merge commit from the worktree on main" \
+  '[[ -n "$(git log main --merges --oneline --grep="nr2: merge main in again")" ]]'
+
+echo
 echo "── 15. a worktree with no generated environment is set up, not stalled on ─"
 # THE REGRESSION THIS GUARDS. An agent whose own work needed no build never runs
 # the repo's fresh-worktree setup, so the gate is the first thing to meet the
