@@ -404,7 +404,9 @@ and minutes added to a gate are paid on every single landing.
 
 The **final check** runs once, in the primary checkout, after the whole batch has landed.
 It reports rather than gates, because each entry already passed the gate on its own
-content. A failure there is a new task rather than a rollback, since `main` is already
+content. A repo whose full test sweep takes minutes puts the sweep in the gate, where a red
+result stalls the entry and leaves `main` untouched, and keeps the final check to a fast
+tripwire. A failure there is a new task rather than a rollback, since `main` is already
 pushed by design, so that a stall never leaves landed work sitting unbacked-up on the
 machine.
 
@@ -473,6 +475,42 @@ For each lane an entry touches, in config order, `land` runs that lane's `setupW
 A lane's `finalCheck` runs once, at the end of the run, in the primary checkout, and only if an entry in that lane landed. An entry that stalls at its gate lands nothing, so its lane's final check does not run for it. `land` runs the final checks in config order.
 
 The check that makes a rebase conflict the owner's call reads every lane's `protectedPaths`, whichever lanes the entry touches, because protected content is the owner's whatever lane it sits in.
+
+### Reach: a lane that code outside it can break
+
+Lanes are sorted by folder, and a folder does not say what a test imports. A test in the `app` lane may bundle a file from `site/`, so a branch that touches only `site/` can break `app` and never run its gate. A lane says so with `reach`:
+
+```json
+"app": {
+  "paths": "*",
+  "gate": ["npm run typecheck", "bash test/smoke.sh"],
+  "reach": { "when": "bash test/lane-reach.sh", "gate": ["SMOKE_ONLY=pure bash test/smoke.sh"] }
+}
+```
+
+- `when` is a command run in the branch's worktree, with the changed paths on stdin, one per line. Exit 0 means the change reaches this lane, exit 1 means it does not. Any other exit (a missing script, a crash) counts the lane as reached and says so in red, because a lane's tests are not skipped on a failure to ask.
+- It is asked only of a lane the diff did not already hit, and never of an entry with an empty diff.
+- A reached lane joins the entry's lanes at `enqueue` and again after the rebase at `land`, so the entry also holds that lane in a stall and runs that lane's setup. `status` marks it `app~`, and `land --dry-run` says so.
+- The entry runs the lane's `reach.gate` for it, or the lane's `gate` when `reach` has none. An entry that changes the lane's own paths runs the full `gate`.
+- A reached lane's `finalCheck` and `deploy` marker are not owed, since the entry changed nothing in it.
+
+The rule for what a lane reaches belongs to the repo, not to this tool: the example above reads a list of files and uses the same decision function as the repo's change-based test selection.
+
+### The known-red allow-list
+
+A gate that runs a whole test sweep before the merge stalls an entry on any red suite, so a suite one session broke and is fixing stalls every session's entries. A repo can list such a suite for a few days:
+
+```json
+"knownRedRefuse": "test/data-safety.txt",
+"knownRed": [
+  { "suite": "test/sync-first-push-resume.test.mjs", "issue": "owner/repo#1700", "expires": "2026-11-25", "why": "one clause" }
+]
+```
+
+- `issue` and `expires` are required. An entry past its date is `EXPIRED` and not honored, so the suite blocks again. An expiry more than 30 days out is `INVALID`, and at most 5 entries count.
+- `knownRedRefuse` names a file in the primary checkout (one suite path per line, `#` comments) of suites the list may never name. An entry that names one is `REFUSED`; a list whose refuse file is missing refuses every entry.
+- `land`, `land --dry-run`, `resume` and `status` print every entry with its state, and `land` prints it again after the gate output.
+- The honored entries are written to `<state>/known-red/<repo>.tsv` (suite, issue, expiry, tab-separated) and the file's path reaches every setup step, gate step and final check as `$LOCAL_MERGE_QUEUE_KNOWN_RED`; it is unset when nothing is honored. The repo's test runner decides what a listed suite's failure means: the queue only says what is allowed and for how long.
 
 ### A stall holds only its own lanes
 
@@ -666,7 +704,7 @@ dequeued after a stall, where the next landing run republishes the tip with an e
 carrying no marker. Then the stacked-PR retarget, against a `gh` stubbed on `PATH` so that
 nothing here reaches GitHub: the PR moved onto `main` by a real `gh pr edit --base` argv,
 that call landing *before* the branch deletion rather than after it, and a `gh` that refuses
-the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. Then the deploy marker lane by lane, on a fourth fixture repo where lane `a` carries `deploy` and lane `b` does not: three entries in the order `a1`, `b1`, `a2` landing as marked, unmarked, unmarked, with `--dry-run` naming the lane; a run of `b` entries alone writing no marker and no republish; an `a` entry stalling behind a marked `a` merge while a `b` merge lands over it, `status` reporting the undeployed lane, and the next `land` after the dequeue republishing with one empty commit that carries no marker; a second `land` and a later `b` merge adding no further republish; a marker shared by two lanes written once; and an entry in two lanes with their own markers carrying both, with one empty commit settling both lanes. Then `--no-rebase` on the first fixture repo: the flag recorded and shown by `status` and `--dry-run`; a branch that merged current `main` landing with its own merge commit and the `--no-ff` landing merge; `main` moving under a second branch stalling the run with the reason, no rebase started and the branch unmoved, and a report that says to merge; `resume` stalling it again until the fixer runs `git merge origin/main`, then landing it. 229 assertions.
+the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. Then the deploy marker lane by lane, on a fourth fixture repo where lane `a` carries `deploy` and lane `b` does not: three entries in the order `a1`, `b1`, `a2` landing as marked, unmarked, unmarked, with `--dry-run` naming the lane; a run of `b` entries alone writing no marker and no republish; an `a` entry stalling behind a marked `a` merge while a `b` merge lands over it, `status` reporting the undeployed lane, and the next `land` after the dequeue republishing with one empty commit that carries no marker; a second `land` and a later `b` merge adding no further republish; a marker shared by two lanes written once; and an entry in two lanes with their own markers carrying both, with one empty commit settling both lanes. Then `--no-rebase` on the first fixture repo: the flag recorded and shown by `status` and `--dry-run`; a branch that merged current `main` landing with its own merge commit and the `--no-ff` landing merge; `main` moving under a second branch stalling the run with the reason, no rebase started and the branch unmoved, and a report that says to merge; `resume` stalling it again until the fixer runs `git merge origin/main`, then landing it. Then lane reach on a fifth fixture (a site file a test of the app bundles putting the app lane in the entry as reached, `status` marking it, the reach gate and not the full gate running for it, a reach command that cannot answer counting the lane as reached, a reach with no `when` refused) and the known-red allow-list on a sixth (the print, the file handed to the gate steps, and the expired, refused, invalid, missing-refuse-file and over-limit states). 254 assertions.
 Run it before changing anything.
 
 ```sh

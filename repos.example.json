@@ -15,6 +15,8 @@
   "//githubRepo": "`owner/name` on GitHub, read through the `gh` CLI. The pull request is the branch roster, so with this key set the merge queue requires an open PR at enqueue and verifies it closed as MERGED after landing. Omit it and both checks are skipped — no `gh`, no network, nothing else changes.",
   "//deploy": "ONE BUILD PER LANDING RUN, NOT ONE PER BRANCH — for a repo whose host builds every push to the main branch. `skipMarker` is appended to the merge commit message of every entry that has another entry behind it, so only the LAST merge of a run is built. Your host reads it out of the commit message and declines the build (on Vercel that is `vercel.json`'s `ignoreCommand`). The pushes are NOT batched: an unpushed merge is unbacked-up work. Omit the key and no marker is ever written.",
 
+  "//knownRed": "Per repo (not per lane): a temporary allow-list of suites that may be red, so one session's known failure does not stall every other session's landing. Each entry needs `suite`, `issue` (owner/repo#N) and `expires` (YYYY-MM-DD, at most 30 days out); `why` is optional. At most 5 count. `knownRedRefuse` names a file in the checkout (one suite path per line) of suites the list may never name, such as data-safety suites. The queue prints the list in every landing run and `status`, and hands the entries in date to the gate steps in the file named by $LOCAL_MERGE_QUEUE_KNOWN_RED (suite, issue, expiry, tab-separated). Example, on a repo entry: \"knownRedRefuse\": \"test/data-safety.txt\", \"knownRed\": [{ \"suite\": \"test/x.test.mjs\", \"issue\": \"your-org/app#12\", \"expires\": \"2026-12-01\" }]",
+
   "repos": {
     "desktop-app": {
       "//": "An Electron desktop app. Nothing it does is published by a push, so it has no `deploy` key: its merges carry no marker and the landing run behaves as it would without the feature.",
@@ -78,10 +80,12 @@
           "deploy": { "skipMarker": "[skip-deploy]" }
         },
         "app": {
+          "//reach": "A lane the folders above do not put an entry in can still be broken by it, when a test of this lane bundles a file of another. `reach.when` is a command run in the branch's worktree with the changed paths on stdin: exit 0 means the change reaches this lane (the entry then carries the lane too, and `status` marks it `app~`), exit 1 means it does not. `reach.gate` is what the entry runs for the lane when only reach put it there; an entry that changes the lane's own paths runs `gate`.",
           "paths": ["app/"],
           "setupWhen": "test -d node_modules",
           "setup": ["npm install"],
           "gate": ["npm run typecheck --workspace app", "npm run test:unit --workspace app"],
+          "reach": { "when": "bash scripts/lane-reach.sh", "gate": ["npm run test:unit --workspace app"] },
           "finalCheck": "npm run smoke --workspace app"
         },
         "other": {

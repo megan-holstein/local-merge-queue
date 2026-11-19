@@ -141,7 +141,7 @@ function loadConfig () {
 // Everything after this function reads `repo.lanes` and never the repo-level
 // keys, which is what makes a repo without `lanes` behave exactly as it did
 // before lanes existed.
-const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'finalCheck', 'protectedPaths', 'deploy']
+const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'finalCheck', 'protectedPaths', 'deploy', 'reach']
 
 function loadLanes (key, repo) {
   if (repo.lanes === undefined) {
@@ -175,8 +175,26 @@ function loadLanes (key, repo) {
       die(`repo "${key}": lane "${name}" needs "paths", an array of path prefixes or the string "*"`)
     }
     lanes[name] = finishLane({ ...lane })
+    checkReach(key, name, lanes[name])
   }
   return lanes
+}
+
+// A lane's `reach` is how code outside the lane can still break it. Its `when`
+// is a command run in the branch's worktree with the changed paths on stdin
+// (one per line); exit 0 means the change reaches this lane, so the entry
+// carries the lane too, and exit 1 means it does not. `gate` is what the entry
+// runs for the lane when only `reach` put it there (the lane's own `gate` runs
+// when the entry changed a path of the lane itself).
+function checkReach (key, name, lane) {
+  if (lane.reach === undefined) return
+  const r = lane.reach
+  if (!r || typeof r !== 'object' || Array.isArray(r) || typeof r.when !== 'string' || !r.when.trim()) {
+    die(`repo "${key}": lane "${name}" has "reach", which needs a "when" command (exit 0 = the change reaches this lane)`)
+  }
+  if (r.gate !== undefined && !(Array.isArray(r.gate) && r.gate.every(x => typeof x === 'string'))) {
+    die(`repo "${key}": lane "${name}": reach.gate must be an array of commands`)
+  }
 }
 
 function finishLane (lane) {
@@ -196,14 +214,15 @@ function multiLane (repo) { return Object.keys(repo.lanes).length > 1 }
 // no lane claims belongs to the lane that takes "*". A repo with no such lane
 // refuses the path by name. An empty diff (a cleanup-only entry) has no lanes.
 // The result is an array of lane names in config order, without duplicates.
-function lanesOf (repo, cwd, branch) {
+function lanesOf (repo, cwd, branch, out = {}) {
   const base = gitTry(['merge-base', repo.mainBranch, branch], cwd)
   if (!base.ok) die(`cannot find where "${branch}" left ${repo.mainBranch} to work out its lanes: ${base.err}`)
   const diff = gitTry(['diff', '--name-only', base.out, branch], cwd)
   if (!diff.ok) die(`cannot list the files "${branch}" changes to work out its lanes: ${diff.err}`)
   const names = Object.keys(repo.lanes)
   const hit = new Set()
-  for (const p of diff.out.split('\n').filter(Boolean)) {
+  const changed = diff.out.split('\n').filter(Boolean)
+  for (const p of changed) {
     if (repo.shared.some(s => p.startsWith(s))) { names.forEach(n => hit.add(n)); continue }
     const owners = names.filter(n => Array.isArray(repo.lanes[n].paths) && repo.lanes[n].paths.some(s => p.startsWith(s)))
     if (owners.length) { owners.forEach(n => hit.add(n)); continue }
@@ -211,6 +230,27 @@ function lanesOf (repo, cwd, branch) {
     if (!catchAll) die(`"${branch}" changes ${p}, which no lane of ${repo.key} claims and no lane takes "*"`)
     hit.add(catchAll)
   }
+  // REACH: a lane the paths above did not put in the entry can still be broken
+  // by them (a test in one lane that bundles a file of another). The lane says
+  // so with `reach.when`, and the entry then carries the lane as well. The
+  // question is asked only of a lane the diff did not already hit, and only
+  // when the diff is not empty.
+  const reached = []
+  if (changed.length) {
+    for (const n of names) {
+      const r = repo.lanes[n].reach
+      if (hit.has(n) || !r) continue
+      const res = spawnSync('bash', ['-c', r.when], { cwd, input: changed.join('\n') + '\n', encoding: 'utf8', env: process.env })
+      if (res.status === 0) { hit.add(n); reached.push(n) }
+      else if (res.status !== 1) {
+        // The command could not answer (missing script, crash). A lane's tests are
+        // not skipped on a failure to ask, so the lane is counted as reached.
+        console.log(red(`  lane ${n}: reach check exited ${res.status}${res.error ? ` (${res.error.message})` : ''} — counting the lane as reached`))
+        hit.add(n); reached.push(n)
+      }
+    }
+  }
+  out.reached = names.filter(n => reached.includes(n))
   return names.filter(n => hit.has(n))
 }
 
@@ -240,6 +280,20 @@ function queueLanesOf (repo, entry) {
 // "lane a" or "lanes a, b", for the console and the stall report.
 function lanePhrase (names) {
   return `${names.length === 1 ? 'lane' : 'lanes'} ${names.join(', ')}`
+}
+
+// An entry's lanes as `status` shows them: a lane the entry reached through the
+// import graph and not through its own paths carries "~".
+function laneLabels (entry) {
+  return (entry.lanes || []).map(n => (entry.reached || []).includes(n) ? `${n}~` : n)
+}
+
+// The steps an entry runs for one of its lanes: the lane's own gate, or, where
+// the lane was only reached, its `reach.gate` (the lane's gate when it has none).
+function gateStepsFor (repo, entry, name) {
+  const lane = repo.lanes[name]
+  const onlyReached = (entry.reached || []).includes(name)
+  return onlyReached && lane.reach?.gate ? lane.reach.gate : lane.gate
 }
 
 // The stalled entries of a repo, in queue order.
@@ -609,6 +663,107 @@ function ensureWorktreeSetup (repo, wt, laneNames) {
   return { ok: true, ran }
 }
 
+// ─── the known-red allow-list ────────────────────────────────────────────────
+
+/**
+ * A SUITE KNOWN TO BE RED, NAMED, DATED AND ISSUE-BACKED, SO ONE SESSION'S
+ * FAILURE DOES NOT STALL EVERY OTHER SESSION'S LANDING.
+ *
+ * A gate that runs a whole test sweep before the merge stalls an entry on any
+ * red suite, and a suite one session broke and is fixing stalls every
+ * session's entries until it lands. The allow-list is the pressure valve, and
+ * it is deliberately small and temporary:
+ *
+ *   "knownRed": [{ "suite": "test/x.test.mjs", "issue": "owner/repo#12",
+ *                  "expires": "2026-11-25", "why": "optional, one clause" }]
+ *
+ * - `issue` and `expires` are required. An entry past its date is EXPIRED and
+ *   honored no more: the suite blocks again, which is the point of a date.
+ * - An expiry more than 30 days out is INVALID, and at most 5 entries count.
+ * - `knownRedRefuse` names a file in the repo (one suite path per line) that
+ *   lists suites the allow-list may never name, such as the data-safety suites;
+ *   an entry naming one is REFUSED and honored never.
+ *
+ * The queue prints every entry and its state at the start of every landing run
+ * and in `status`. The honored ones are written to a file whose path reaches
+ * every gate step, setup step and final check as $LOCAL_MERGE_QUEUE_KNOWN_RED
+ * (tab-separated: suite, issue, expires), and the repo's test runner decides
+ * what a listed suite's failure means. A run with no honored entry leaves the
+ * variable unset, so a runner that reads it sees nothing.
+ */
+const KNOWN_RED_MAX = 5
+const KNOWN_RED_MAX_DAYS = 30
+
+function todayISO () {
+  if (process.env.LOCAL_MERGE_QUEUE_TODAY) return process.env.LOCAL_MERGE_QUEUE_TODAY
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function daysBetween (a, b) {
+  return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000)
+}
+
+function knownRedEntries (repo) {
+  const raw = repo.knownRed
+  if (raw === undefined) return []
+  if (!Array.isArray(raw)) return [{ suite: '(knownRed)', state: 'invalid', why: '"knownRed" must be an array' }]
+  let refuse = new Set()
+  let refuseMissing = null
+  if (repo.knownRedRefuse) {
+    // Read from the primary checkout, which is on main. A refuse list that is not there refuses every entry: an allow-list
+    // with no way to check what it names is not an allow-list.
+    const file = path.join(repo.checkout, repo.knownRedRefuse)
+    if (fs.existsSync(file)) {
+      refuse = new Set(fs.readFileSync(file, 'utf8').split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')))
+    } else {
+      refuseMissing = `${repo.knownRedRefuse} is not in ${repo.checkout}, so nothing can be checked against it`
+    }
+  }
+  const today = todayISO()
+  let honored = 0
+  return raw.map(e => {
+    const out = { suite: String(e?.suite ?? ''), issue: String(e?.issue ?? ''), expires: String(e?.expires ?? ''), why: e?.why ? String(e.why) : '' }
+    const bad = why => ({ ...out, state: 'invalid', why })
+    if (!out.suite || /\s/.test(out.suite)) return bad('"suite" must be one path with no spaces')
+    if (!/^[\w.-]+\/[\w.-]+#\d+$/.test(out.issue)) return bad('"issue" must look like owner/repo#123')
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(out.expires) || Number.isNaN(Date.parse(`${out.expires}T00:00:00Z`))) return bad('"expires" must be a date, YYYY-MM-DD')
+    if (refuseMissing) return bad(refuseMissing)
+    if (refuse.has(out.suite)) return { ...out, state: 'refused', why: `${out.suite} is on ${repo.knownRedRefuse}; a suite on that list is never allowed to be red` }
+    if (out.expires < today) return { ...out, state: 'expired', why: `expired ${out.expires}; the suite blocks again` }
+    if (daysBetween(today, out.expires) > KNOWN_RED_MAX_DAYS) return bad(`expiry is more than ${KNOWN_RED_MAX_DAYS} days out`)
+    if (honored >= KNOWN_RED_MAX) return { ...out, state: 'over-limit', why: `only ${KNOWN_RED_MAX} entries count` }
+    honored++
+    return { ...out, state: 'active', days: daysBetween(today, out.expires) }
+  })
+}
+
+// Prints the allow-list (every entry, whatever its state) and hands the honored
+// ones to the steps that follow through $LOCAL_MERGE_QUEUE_KNOWN_RED.
+function announceKnownRed (repo, { write = true } = {}) {
+  const entries = knownRedEntries(repo)
+  const file = path.join(STATE_DIR, 'known-red', `${repo.key}.tsv`)
+  if (write) {
+    delete process.env.LOCAL_MERGE_QUEUE_KNOWN_RED
+    fs.rmSync(file, { force: true })
+  }
+  if (!entries.length) return
+  console.log(`\n${bold('known red')} ${dim(`(${repo.key}: temporary allow-list; a listed suite may fail without stalling an entry)`)}`)
+  for (const e of entries) {
+    if (e.state === 'active') {
+      console.log(yellow(`  · ${e.suite} — ${e.issue}, expires ${e.expires} (${e.days === 0 ? 'today' : `${e.days} day${e.days === 1 ? '' : 's'}`})${e.why ? ` — ${e.why}` : ''}`))
+    } else {
+      console.log(red(`  · ${e.suite} — ${e.state.toUpperCase()}: ${e.why}`))
+    }
+  }
+  const active = entries.filter(e => e.state === 'active')
+  if (write && active.length) {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, active.map(e => [e.suite, e.issue, e.expires].join('\t')).join('\n') + '\n')
+    process.env.LOCAL_MERGE_QUEUE_KNOWN_RED = file
+  }
+}
+
 // ─── one deploy per landing run, not one per branch ───────────────────────────────
 
 /**
@@ -821,11 +976,13 @@ function cmdEnqueue (cfg, args) {
     console.log(dim(`  pull request: #${pr.number}${pr.isDraft ? ' (draft)' : ''}`))
   }
 
-  const lanes = lanesOf(repo, worktree, branch)
+  const found = {}
+  const lanes = lanesOf(repo, worktree, branch, found)
   const existing = q.entries.find(e => e.repo === repo.key && e.branch === branch)
   if (existing) {
     existing.worktree = worktree
     existing.lanes = lanes
+    existing.reached = found.reached
     if (args['--note']) existing.note = args['--note']
     if (args['--after']) existing.after = args['--after']
     if (args['--no-rebase']) existing.noRebase = true
@@ -841,6 +998,7 @@ function cmdEnqueue (cfg, args) {
     note: args['--note'] || '',
     after: args['--after'] || null,
     lanes,
+    reached: found.reached,
     ...(args['--no-rebase'] ? { noRebase: true } : {}),
     status: 'enqueued',                 // enqueued → approved (the owner's word) → landed
     enqueued: nowISO()
@@ -867,6 +1025,7 @@ function cmdStatus (cfg, args) {
       const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
       console.log(yellow(`  LOCKED by pid ${owner?.pid ?? '?'} since ${owner?.since ?? '?'}`))
     }
+    announceKnownRed(repo, { write: false })
     mine.forEach((e, i) => {
       const mark = e.status === 'approved' ? green('approved')
         : e.status === 'stalled' ? red('STALLED')
@@ -877,7 +1036,7 @@ function cmdStatus (cfg, args) {
         const [behind, ahead] = lr.split(/\s+/)
         delta = dim(`+${ahead} −${behind}`)
       } catch { delta = dim('(delta unknown)') }
-      const name = multiLane(repo) && e.lanes ? `${e.branch} [${e.lanes.join(', ')}]` : e.branch
+      const name = multiLane(repo) && e.lanes ? `${e.branch} [${laneLabels(e).join(', ')}]` : e.branch
       console.log(`  ${String(i + 1).padStart(2)}. ${name.padEnd(28)} ${mark.padEnd(18)} ${delta}`)
       if (e.after) console.log(dim(`      after: ${e.after}`))
       if (e.noRebase) console.log(dim('      no-rebase'))
@@ -1100,6 +1259,8 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     die(`${key} is not ready to land:\n  - ${problems.join('\n  - ')}`)
   }
 
+  announceKnownRed(repo, { write: !dryRun })
+
   const lock = dryRun ? true : acquireLock(key)
   if (!lock) {
     const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
@@ -1144,11 +1305,13 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         if (multiLane(repo)) {
           // Computed live and never stored: a dry run writes nothing.
           const live = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout).ok
-          const shown = live ? lanesOf(repo, repo.checkout, entry.branch) : (entry.lanes || [])
+          const found = {}
+          const shown = live ? lanesOf(repo, repo.checkout, entry.branch, found) : (entry.lanes || [])
           dryLanes = shown
-          console.log(dim(`  lanes: [${shown.join(', ')}]`))
+          const shownEntry = { lanes: shown, reached: live ? found.reached : (entry.reached || []) }
+          console.log(dim(`  lanes: [${laneLabels(shownEntry).join(', ')}]${shownEntry.reached.length ? '  (~ = reached through what a test imports, not through the entry\'s own paths)' : ''}`))
           for (const n of shown) {
-            const steps = repo.lanes[n].gate
+            const steps = gateStepsFor(repo, shownEntry, n)
             console.log(dim(`  gate [${n}]: ${steps.length ? steps.join(' && ') : '(no steps)'}`))
           }
         }
@@ -1312,9 +1475,12 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         // 2a. THE ENTRY'S LANES, RECOMPUTED ON THE REBASED BRANCH. This is the
         //     authoritative set: a conflict resolution can touch a file the
         //     enqueue-time diff never saw.
-        entry.lanes = lanesOf(repo, wt, entry.branch)
+        const found = {}
+        entry.lanes = lanesOf(repo, wt, entry.branch, found)
+        entry.reached = found.reached
         saveQueue(q2)
         runLanes = laneNamesFor(repo, entry)
+        if (entry.reached.length) console.log(dim(`  lanes: ${runLanes.map(n => entry.reached.includes(n) ? `${n} (reached)` : n).join(', ')}`))
 
         // 2b. THE BRANCH'S SCAFFOLDING GOES BEFORE THE GATE SEES IT.
         //
@@ -1380,7 +1546,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         let gateFailed = null
         let gateLane = null
         gate: for (const name of runLanes) {
-          for (const step of repo.lanes[name].gate) {
+          for (const step of gateStepsFor(repo, entry, name)) {
             console.log(dim(`  gate: ${step}`))
             if (!run(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; gateLane = name; break gate }
           }
@@ -1442,7 +1608,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         //    marked when another eligible entry behind this one shares the lane,
         //    and two lanes that share one marker write it once.
         const markers = []
-        for (const n of runLanes.filter(n => repo.lanes[n].deploy?.skipMarker)) {
+        for (const n of runLanes.filter(n => repo.lanes[n].deploy?.skipMarker && !(entry.reached || []).includes(n))) {
           const marker = repo.lanes[n].deploy.skipMarker
           const more = moreEligibleAfter(cfg, key, entry, { queue: null, simulated, resuming, held, lane: n })
           const here = multiLane(repo) ? ` in lane ${n}` : ''
@@ -1461,7 +1627,9 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           die(`push to origin/${repo.mainBranch} failed, so the merge was rolled back locally:\n${push.err}`)
         }
         console.log(green(`  landed on ${repo.mainBranch} and pushed`))
-        landedLanes.push(...runLanes)
+        // A lane the entry only reached was tested by it and changed nothing, so its
+        // final check and deploy are not owed.
+        landedLanes.push(...runLanes.filter(n => !(entry.reached || []).includes(n)))
       }
 
       // 5. Cleanup — the lifecycle the roster rule asks for, done by the thing
@@ -1645,6 +1813,9 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     const ok = run(lane.finalCheck, repo.checkout, lane.gateEnv || {})
     console.log(ok ? green('  final check passed') : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
   }
+
+  // The allow-list again, after the gate output that buries its first print.
+  if (!dryRun) announceKnownRed(repo, { write: false })
 
   if (landed.length) {
     console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)

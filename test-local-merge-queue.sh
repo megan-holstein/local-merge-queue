@@ -1171,6 +1171,169 @@ export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_
 cd "$ROOT/repo"
 
 echo
+echo "── lanes: reach, a lane a test in another lane can break ─────────────"
+# A fifth fixture repo with lanes `site` and `app` (the "*" lane). A test of the
+# app bundles one file of the site, so the app lane declares `reach`: its `when`
+# command reads the changed paths on stdin and exits 0 when the app lane is
+# reached. A site entry that changes the bundled file carries the app lane too
+# and runs the app's `reach.gate`; one that does not, and a docs-only entry,
+# do not. A cleanup-only entry has no lanes, so the command is never asked.
+export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/reach-repos.json"
+export LOCAL_MERGE_QUEUE_STATE="$ROOT/reach-state"
+git init -q --bare "$ROOT/rorigin.git"
+git init -q -b main "$ROOT/rrepo"
+cd "$ROOT/rrepo"
+git config user.email t@t.t; git config user.name T
+git remote add origin "$ROOT/rorigin.git"
+mkdir -p site/lib app docs scripts
+echo s > site/base.txt; echo a > app/base.txt; echo d > docs/base.txt
+# The table: site paths an app test bundles. Exit 0 when any changed path matches.
+cat > scripts/reach.sh <<'SH'
+#!/bin/bash
+grep -qE '^site/lib/proof/' 
+SH
+git add -A && git commit -qm "base" && git push -qu origin main
+cat > "$ROOT/reach-repos.json" <<JSON
+{ "repos": { "r": {
+  "checkout": "$ROOT/rrepo",
+  "lanes": {
+    "site": { "paths": ["site/"], "gate": ["echo SITE-GATE"] },
+    "docs": { "paths": ["docs/"], "gate": ["echo DOCS-GATE"] },
+    "app": {
+      "paths": "*",
+      "reach": { "when": "bash scripts/reach.sh", "gate": ["echo APP-REACH-GATE"] },
+      "gate": ["echo APP-FULL-GATE"],
+      "finalCheck": "echo APP-FINAL-CHECK"
+    }
+  }
+} } }
+JSON
+rbranch () {  # name, then file=content pairs
+  local name="$1"; shift
+  git -C "$ROOT/rrepo" worktree add -q "$ROOT/rrepo-$name" -b "$name" >/dev/null 2>&1
+  cd "$ROOT/rrepo-$name"
+  local pair
+  for pair in "$@"; do mkdir -p "$(dirname "${pair%%=*}")"; printf '%s' "${pair#*=}" > "${pair%%=*}"; done
+  git add -A && git commit -qm "$name" && git push -qu origin "$name" 2>/dev/null
+  cd "$ROOT/rrepo"
+}
+renqueue () { for b in "$@"; do (cd "$ROOT/rrepo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1); done; $LOCAL_MERGE_QUEUE approve --all --repo r >/dev/null 2>&1; }
+rlanes () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));const e=q.entries.find(e=>e.branch==process.argv[1]);console.log(e?e.lanes.join(",")+"|"+(e.reached||[]).join(","):"gone")' "$1"; }
+
+rbranch site-proof site/lib/proof/merkle.ts=x
+rbranch site-plain site/lib/other.ts=y
+rbranch docs-only  docs/note.md=z
+rbranch app-own    app/new.txt=w
+rbranch site-and-docs site/lib/proof/b.ts=x docs/n2.md=q
+for b in site-proof site-plain docs-only app-own site-and-docs; do (cd "$ROOT/rrepo-$b" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1); done
+check "a site file the app's tests bundle puts the app lane in the entry, as reached"   '[[ "$(rlanes site-proof)" == "site,app|app" ]]'
+check "a site file nothing in the app bundles leaves the app lane out"                  '[[ "$(rlanes site-plain)" == "site|" ]]'
+check "a docs-only entry keeps its one light lane"                                      '[[ "$(rlanes docs-only)" == "docs|" ]]'
+check "an entry that changes the app's own paths is not reached, it is in the lane"     '[[ "$(rlanes app-own)" == "app|" ]]'
+check "an entry in site and docs that also reaches the app carries all three"           '[[ "$(rlanes site-and-docs)" == "site,docs,app|app" ]]'
+out=$($LOCAL_MERGE_QUEUE status r 2>&1)
+check "status marks a reached lane with ~"                                              '[[ "$out" == *"site-proof [site, app~]"* && "$out" == *"site-plain [site]"* ]]'
+$LOCAL_MERGE_QUEUE approve --all --repo r >/dev/null 2>&1
+out=$($LOCAL_MERGE_QUEUE land r --dry-run 2>&1)
+check "--dry-run shows the reached lane's reach.gate, not its full gate, for site-proof" '[[ "$out" == *"gate [app]: echo APP-REACH-GATE"* && "$out" == *"gate [app]: echo APP-FULL-GATE"* ]]'
+out=$($LOCAL_MERGE_QUEUE land r 2>&1); rc=$?
+check "all five land"                                                                   '[[ $rc == 0 && -f "$ROOT/rrepo/site/lib/proof/merkle.ts" && -f "$ROOT/rrepo/docs/note.md" && -f "$ROOT/rrepo/app/new.txt" ]]'
+check "the reached entry ran the reach gate and its site gate, and not the full app gate for itself" '[[ "$(grep -c "gate: echo APP-REACH-GATE" <<<"$out")" == 2 ]]'
+check "the entry that changed the app ran the full app gate"                            '[[ "$(grep -c "gate: echo APP-FULL-GATE" <<<"$out")" == 1 ]]'
+check "docs-only ran only its docs gate"                                                '[[ "$(grep -c "gate: echo DOCS-GATE" <<<"$out")" == 2 ]]'
+check "the app final check ran once, for the entry that changed the app"                '[[ "$(grep -c "^.*final check.*APP-FINAL-CHECK" <<<"$out")" == 1 ]]'
+
+# A reach command that cannot answer counts the lane as reached: tests are not
+# skipped because the question failed.
+cat > "$ROOT/reach-repos.json" <<JSON
+{ "repos": { "r": {
+  "checkout": "$ROOT/rrepo",
+  "lanes": {
+    "site": { "paths": ["site/"] },
+    "app": { "paths": "*", "reach": { "when": "bash scripts/no-such-script.sh" } }
+  }
+} } }
+JSON
+rbranch site-broken-reach site/lib/x.ts=x
+(cd "$ROOT/rrepo-site-broken-reach" && out=$($LOCAL_MERGE_QUEUE enqueue 2>&1); echo "$out" > "$ROOT/reach-enqueue.out")
+check "a reach command that cannot answer counts the lane as reached, and says so"     '[[ "$(rlanes site-broken-reach)" == "site,app|app" && "$(cat "$ROOT/reach-enqueue.out")" == *"counting the lane as reached"* ]]'
+cat > "$ROOT/reach-repos.json" <<JSON
+{ "repos": { "r": { "checkout": "$ROOT/rrepo", "lanes": { "app": { "paths": "*", "reach": {} } } } } }
+JSON
+out=$($LOCAL_MERGE_QUEUE status r 2>&1)
+check "a reach with no when is a config error"                                          '[[ "$out" == *"needs a \"when\" command"* ]]'
+
+echo
+echo "── the known-red allow-list ─────────────────────────────────────────"
+# A repo-level `knownRed` list: each entry a suite, an issue and an expiry. The
+# queue prints it in every run, hands the honored entries to the gate steps in
+# $LOCAL_MERGE_QUEUE_KNOWN_RED, and never honors an expired entry, an invalid
+# one, one over the limit, or one named in the file `knownRedRefuse` points at.
+export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/kr-repos.json"
+export LOCAL_MERGE_QUEUE_STATE="$ROOT/kr-state"
+git init -q --bare "$ROOT/korigin.git"
+git init -q -b main "$ROOT/krepo"
+cd "$ROOT/krepo"
+git config user.email t@t.t; git config user.name T
+git remote add origin "$ROOT/korigin.git"
+mkdir -p test && echo x > base.txt
+printf '# suites that are never allowed to be red\ntest/page-write.test.mjs\n' > test/data-safety.txt
+git add -A && git commit -qm "base" && git push -qu origin main
+export LOCAL_MERGE_QUEUE_TODAY=2026-11-18
+write_kr () {  # the knownRed JSON array
+  cat > "$ROOT/kr-repos.json" <<JSON
+{ "repos": { "k": {
+  "checkout": "$ROOT/krepo",
+  "knownRedRefuse": "test/data-safety.txt",
+  "gate": ["echo KR_FILE=\${LOCAL_MERGE_QUEUE_KNOWN_RED:-unset}; test -z \"\${LOCAL_MERGE_QUEUE_KNOWN_RED:-}\" || cat \"\$LOCAL_MERGE_QUEUE_KNOWN_RED\""],
+  "knownRed": $1
+} } }
+JSON
+}
+kbranch () {
+  git -C "$ROOT/krepo" worktree add -q "$ROOT/krepo-$1" -b "$1" >/dev/null 2>&1
+  cd "$ROOT/krepo-$1"; echo "$1" > "$1.txt"
+  git add -A && git commit -qm "$1" && git push -qu origin "$1" 2>/dev/null
+  cd "$ROOT/krepo"
+  (cd "$ROOT/krepo-$1" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1)
+  $LOCAL_MERGE_QUEUE approve "$1" --repo k >/dev/null 2>&1
+}
+write_kr '[{"suite":"test/sync-first-push-resume.test.mjs","issue":"megan-holstein/proselon#1700","expires":"2026-11-25","why":"storage-epic-2 is fixing it"}]'
+kbranch kr1
+out=$($LOCAL_MERGE_QUEUE land k --dry-run 2>&1)
+check "a dry run prints the entry, its issue, its expiry and the days left"            '[[ "$out" == *"test/sync-first-push-resume.test.mjs — megan-holstein/proselon#1700, expires 2026-11-25 (7 days)"* ]]'
+check "a dry run writes nothing for the gate to read"                                   '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/known-red/k.tsv" ]]'
+out=$($LOCAL_MERGE_QUEUE land k 2>&1); rc=$?
+check "the land prints the list at the start and again at the end"                      '[[ $rc == 0 && "$(grep -c "known red" <<<"$out")" == 2 ]]'
+check "the gate step sees the honored entries through \$LOCAL_MERGE_QUEUE_KNOWN_RED"   '[[ "$out" == *"KR_FILE=$ROOT/kr-state/known-red/k.tsv"* && "$out" == *$'"'"'test/sync-first-push-resume.test.mjs\tmegan-holstein/proselon#1700\t2026-11-25'"'"'* ]]'
+
+# Every state that is not honored is printed, and the gate sees none of them.
+write_kr '[{"suite":"test/old.test.mjs","issue":"o/r#1","expires":"2026-11-10"},{"suite":"test/page-write.test.mjs","issue":"o/r#2","expires":"2026-11-20"},{"suite":"test/far.test.mjs","issue":"o/r#3","expires":"2027-03-01"},{"suite":"test/noissue.test.mjs","expires":"2026-11-20"}]'
+kbranch kr2
+out=$($LOCAL_MERGE_QUEUE land k 2>&1); rc=$?
+check "an expired entry is printed EXPIRED and not honored"                             '[[ "$out" == *"test/old.test.mjs — EXPIRED"* ]]'
+check "a suite on the refuse list is printed REFUSED and not honored"                   '[[ "$out" == *"test/page-write.test.mjs — REFUSED"* ]]'
+check "an expiry more than 30 days out is INVALID"                                      '[[ "$out" == *"test/far.test.mjs — INVALID: expiry is more than 30 days out"* ]]'
+check "an entry with no issue is INVALID"                                               '[[ "$out" == *"test/noissue.test.mjs — INVALID"* ]]'
+check "the gate sees no allow-list when nothing is honored"                             '[[ "$out" == *"KR_FILE=unset"* && ! -e "$ROOT/kr-state/known-red/k.tsv" ]]'
+write_kr '[{"suite":"test/a.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/b.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/c.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/d.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/e.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/f.mjs","issue":"o/r#1","expires":"2026-11-20"}]'
+# A refuse list that cannot be read refuses every entry, since nothing can be checked against it.
+mv "$ROOT/krepo/test/data-safety.txt" "$ROOT/krepo/test/data-safety.txt.away"
+write_kr '[{"suite":"test/a.mjs","issue":"o/r#1","expires":"2026-11-20"}]'
+kbranch kr4
+out=$($LOCAL_MERGE_QUEUE status k 2>&1)
+check "a refuse list that is missing makes every entry INVALID"                         '[[ "$out" == *"test/a.mjs — INVALID: test/data-safety.txt is not in"* ]]'
+mv "$ROOT/krepo/test/data-safety.txt.away" "$ROOT/krepo/test/data-safety.txt"
+write_kr '[{"suite":"test/a.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/b.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/c.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/d.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/e.mjs","issue":"o/r#1","expires":"2026-11-20"},{"suite":"test/f.mjs","issue":"o/r#1","expires":"2026-11-20"}]'
+kbranch kr3
+out=$($LOCAL_MERGE_QUEUE status k 2>&1)
+check "status prints the list; a sixth entry is over the limit"                         '[[ "$out" == *"test/e.mjs — o/r#1, expires 2026-11-20 (2 days)"* && "$out" == *"test/f.mjs — OVER-LIMIT"* ]]'
+unset LOCAL_MERGE_QUEUE_TODAY
+
+export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
+cd "$ROOT/repo"
+
+echo
 echo "════════════════════════════════════════════════════════════════"
 echo "  passed $PASS   failed $FAIL"
 echo "  sandbox left at $ROOT"
