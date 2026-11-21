@@ -15,6 +15,8 @@
   "//githubRepo": "`owner/name` on GitHub, read through the `gh` CLI. The pull request is the branch roster, so with this key set the merge queue requires an open PR at enqueue and verifies it closed as MERGED after landing. Omit it and both checks are skipped — no `gh`, no network, nothing else changes.",
   "//deploy": "ONE BUILD PER LANDING RUN, NOT ONE PER BRANCH — for a repo whose host builds every push to the main branch. `skipMarker` is appended to the merge commit message of every entry that has another entry behind it, so only the LAST merge of a run is built. Your host reads it out of the commit message and declines the build (on Vercel that is `vercel.json`'s `ignoreCommand`). The pushes are NOT batched: an unpushed merge is unbacked-up work. Omit the key and no marker is ever written.",
 
+  "//batch": "OPT-IN, per repo (not per lane): `{ \"max\": 5 }` makes `land` gate up to `max` approved entries ONCE instead of once each. The queue builds the candidate main that landing them one by one would have built, runs the gate of their lanes on its tip, and lands them one by one only if that gate is green. Only entries that carry the same lanes batch, so an entry never waits on a gate of a lane it lacks. Absent, the repo lands one entry at a time. `land --batch` and `land --no-batch` override it for one run; `--batch` on a repo without this key uses a maximum of 5. See README, Batched landing.",
+
   "//knownRed": "Per repo (not per lane): a temporary allow-list of suites that may be red, so one session's known failure does not stall every other session's landing. Each entry needs `suite`, `issue` (owner/repo#N) and `expires` (YYYY-MM-DD, at most 30 days out); `why` is optional. At most 5 count. `knownRedRefuse` names a file in the checkout (one suite path per line) of suites the list may never name, such as data-safety suites. The queue prints the list in every landing run and `status`, and hands the entries in date to the gate steps in the file named by $LOCAL_MERGE_QUEUE_KNOWN_RED (suite, issue, expiry, tab-separated). Example, on a repo entry: \"knownRedRefuse\": \"test/data-safety.txt\", \"knownRed\": [{ \"suite\": \"test/x.test.mjs\", \"issue\": \"your-org/app#12\", \"expires\": \"2026-12-01\" }]",
 
   "repos": {
@@ -33,6 +35,7 @@
         "npm run test:unit"
       ],
       "finalCheck": "npm run smoke",
+      "batch": { "max": 5 },
       "//protectedPaths2": "Template and content directories: a rebase conflict in one of these is a question about words, and the merge queue stops rather than letting an agent answer it.",
       "protectedPaths": ["templates/", "content/"],
       "githubRepo": "your-org/desktop-app"

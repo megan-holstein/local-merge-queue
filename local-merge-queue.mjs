@@ -30,6 +30,8 @@ const STATE_DIR = process.env.LOCAL_MERGE_QUEUE_STATE || path.join(XDG_STATE, 'l
 const QUEUE_PATH = path.join(STATE_DIR, 'queue.json')
 const LOCK_DIR = path.join(STATE_DIR, 'locks')
 const REPORT_DIR = path.join(STATE_DIR, 'reports')
+const QUEUE_LOCK = path.join(STATE_DIR, 'queue.lock')
+const BATCH_DIR = path.join(STATE_DIR, 'batch')
 
 // ─── small helpers ──────────────────────────────────────────────────────────
 
@@ -41,6 +43,7 @@ const yellow = s => `[33m${s}[0m`
 
 function die (msg, code = 1) {
   console.error(red(`local-merge-queue: ${msg}`))
+  releaseQueueLock()                    // process.exit skips every `finally`
   process.exit(code)
 }
 
@@ -131,8 +134,30 @@ function loadConfig () {
     repo.checkout = real(expand(repo.checkout))
     repo.mainBranch ||= 'main'
     repo.lanes = loadLanes(key, repo)
+    checkBatch(key, repo)
   }
   return cfg
+}
+
+// `batch` is opt-in per repository: {"max": 5}. Absent, the repository lands one
+// entry at a time, as it always has. A repo-level key, never a lane's.
+const BATCH_DEFAULT_MAX = 5
+function checkBatch (key, repo) {
+  if (repo.batch === undefined) return
+  const b = repo.batch
+  if (!b || typeof b !== 'object' || Array.isArray(b) || !Number.isInteger(b.max) || b.max < 2) {
+    die(`repo "${key}": "batch" must look like { "max": 5 }, an integer of at least 2 (a batch of one is a landing run of one)`)
+  }
+}
+
+// Is this landing run batched, and how many entries at most? `--no-batch` and
+// `--batch` override the config in either direction; `--batch` on a repo with no
+// `batch` key uses the default maximum.
+function batchFor (repo, args) {
+  if (args['--batch'] && args['--no-batch']) die('pass --batch or --no-batch, not both')
+  if (args['--no-batch']) return null
+  if (args['--batch']) return { max: repo.batch?.max ?? BATCH_DEFAULT_MAX }
+  return repo.batch ? { max: repo.batch.max } : null
 }
 
 // A LANE IS A SET OF PATHS WITH ITS OWN SETUP AND GATE. Every repo has lanes
@@ -214,11 +239,19 @@ function multiLane (repo) { return Object.keys(repo.lanes).length > 1 }
 // no lane claims belongs to the lane that takes "*". A repo with no such lane
 // refuses the path by name. An empty diff (a cleanup-only entry) has no lanes.
 // The result is an array of lane names in config order, without duplicates.
-function lanesOf (repo, cwd, branch, out = {}) {
-  const base = gitTry(['merge-base', repo.mainBranch, branch], cwd)
-  if (!base.ok) die(`cannot find where "${branch}" left ${repo.mainBranch} to work out its lanes: ${base.err}`)
-  const diff = gitTry(['diff', '--name-only', base.out, branch], cwd)
-  if (!diff.ok) die(`cannot list the files "${branch}" changes to work out its lanes: ${diff.err}`)
+//
+// A batch candidate is not a branch cut from `main`, so it names its own base
+// (`base`: the candidate tip the entry was put on) and asks to be told of a
+// failure by an exception (`fail`) rather than by the process ending.
+function lanesOf (repo, cwd, branch, out = {}, { base: given = null, fail = die } = {}) {
+  let from = given
+  if (!from) {
+    const base = gitTry(['merge-base', repo.mainBranch, branch], cwd)
+    if (!base.ok) fail(`cannot find where "${branch}" left ${repo.mainBranch} to work out its lanes: ${base.err}`)
+    from = base.out
+  }
+  const diff = gitTry(['diff', '--name-only', from, branch], cwd)
+  if (!diff.ok) fail(`cannot list the files "${branch}" changes to work out its lanes: ${diff.err}`)
   const names = Object.keys(repo.lanes)
   const hit = new Set()
   const changed = diff.out.split('\n').filter(Boolean)
@@ -227,7 +260,7 @@ function lanesOf (repo, cwd, branch, out = {}) {
     const owners = names.filter(n => Array.isArray(repo.lanes[n].paths) && repo.lanes[n].paths.some(s => p.startsWith(s)))
     if (owners.length) { owners.forEach(n => hit.add(n)); continue }
     const catchAll = names.find(n => repo.lanes[n].paths === '*')
-    if (!catchAll) die(`"${branch}" changes ${p}, which no lane of ${repo.key} claims and no lane takes "*"`)
+    if (!catchAll) fail(`"${branch}" changes ${p}, which no lane of ${repo.key} claims and no lane takes "*"`)
     hit.add(catchAll)
   }
   // REACH: a lane the paths above did not put in the entry can still be broken
@@ -386,12 +419,143 @@ function laneUndeployed (repo, name) {
   return msg.ok && msg.out.includes(marker)
 }
 
-function loadQueue () {
-  return readJSON(QUEUE_PATH, { entries: [] })
+// ─── the queue file: one writer at a time, and every write is its own change ───
+//
+// THE QUEUE FILE IS SHARED BY EVERY SESSION ON THE MACHINE, AND A LANDING RUN
+// TAKES MINUTES. A command that reads the queue, works, and writes its copy back
+// erases whatever any other process wrote in between: on 2026-11-21 two entries
+// were enqueued and approved while `land` ran in another process, and the run's
+// write at the end took both out of the queue.
+//
+// So no command holds a copy of the queue across any work. Every write goes
+// through `mutateQueue`: take the queue lock, READ THE FILE AGAIN, apply that
+// command's own change to what is there now, write, release. The critical
+// section holds no git call and no gate, so the lock is held for milliseconds.
+//
+// The lock is a directory made with `mkdir`, which is atomic on POSIX. A holder
+// that dies cannot keep it: a lock whose owner process is gone is debris, and so
+// is one held for more than a minute by a process that is somehow still alive
+// (a critical section is milliseconds; a pid can also be reused). A lock with
+// no owner file is one whose holder died between `mkdir` and writing it. Debris
+// is broken by renaming the directory away, which only one breaker can win.
+const QUEUE_LOCK_WAIT_MS = Number(process.env.LOCAL_MERGE_QUEUE_LOCK_WAIT_MS) || 30000
+const QUEUE_LOCK_STALE_MS = 60000
+let queueLockHeld = false
+
+function sleepMs (ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) }
+
+function queueLockStale () {
+  const owner = readJSON(path.join(QUEUE_LOCK, 'owner.json'), null)
+  if (owner && Number.isInteger(owner.pid)) {
+    if (!pidAlive(owner.pid)) return `its holder, pid ${owner.pid}, is gone`
+    const age = Date.now() - Date.parse(owner.since)
+    if (Number.isFinite(age) && age > QUEUE_LOCK_STALE_MS) return `pid ${owner.pid} has held it for ${Math.round(age / 1000)}s`
+    return null
+  }
+  try {
+    if (Date.now() - fs.statSync(QUEUE_LOCK).mtimeMs > 5000) return 'it has no owner'
+  } catch { return null }                                  // released while we looked
+  return null
 }
 
+function breakQueueLock (why) {
+  const seen = readJSON(path.join(QUEUE_LOCK, 'owner.json'), null)
+  const away = `${QUEUE_LOCK}.stale-${process.pid}-${Math.random().toString(36).slice(2)}`
+  try { fs.renameSync(QUEUE_LOCK, away) } catch { return }  // somebody else broke it first
+  // The rename took whatever sat at the path. If that was a lock somebody else had
+  // just taken after breaking the stale one, put it back rather than strand it.
+  const took = readJSON(path.join(away, 'owner.json'), null)
+  if (took && seen && took.pid !== seen.pid && pidAlive(took.pid)) {
+    try { fs.renameSync(away, QUEUE_LOCK); return } catch { /* recreated meanwhile: fall through */ }
+  }
+  fs.rmSync(away, { recursive: true, force: true })
+  console.error(yellow(`local-merge-queue: broke a stale queue lock (${why})`))
+}
+
+function acquireQueueLock () {
+  fs.mkdirSync(STATE_DIR, { recursive: true })
+  const deadline = Date.now() + QUEUE_LOCK_WAIT_MS
+  while (true) {
+    try { fs.mkdirSync(QUEUE_LOCK); break } catch (e) {
+      if (e.code !== 'EEXIST') throw e
+      const stale = queueLockStale()
+      if (stale) { breakQueueLock(stale); continue }
+      if (Date.now() > deadline) {
+        const owner = readJSON(path.join(QUEUE_LOCK, 'owner.json'), null)
+        die(`the queue file is locked by pid ${owner?.pid ?? '?'} and stayed locked for ${QUEUE_LOCK_WAIT_MS / 1000}s`)
+      }
+      sleepMs(20 + Math.floor(Math.random() * 40))
+    }
+  }
+  queueLockHeld = true
+  try { fs.writeFileSync(path.join(QUEUE_LOCK, 'owner.json'), JSON.stringify({ pid: process.pid, since: nowISO() })) } catch { /* the directory is the lock */ }
+}
+
+function releaseQueueLock () {
+  if (!queueLockHeld) return
+  queueLockHeld = false
+  fs.rmSync(QUEUE_LOCK, { recursive: true, force: true })
+}
+
+// A queue file that exists and cannot be read is a defect to stop on, never an
+// empty queue: the next write would replace every entry with one.
+function loadQueue () {
+  if (!fs.existsSync(QUEUE_PATH)) return { entries: [] }
+  let q
+  try { q = JSON.parse(fs.readFileSync(QUEUE_PATH, 'utf8')) } catch (e) {
+    die(`the queue file ${QUEUE_PATH} cannot be read (${e.message}) — restore it before any command writes to it`)
+  }
+  if (!q || !Array.isArray(q.entries)) die(`the queue file ${QUEUE_PATH} has no "entries" array — restore it before any command writes to it`)
+  return q
+}
+
+// Written to a temporary file and renamed, so a reader without the lock never
+// meets a half-written queue.
 function saveQueue (q) {
-  writeJSON(QUEUE_PATH, q)
+  fs.mkdirSync(path.dirname(QUEUE_PATH), { recursive: true })
+  const tmp = `${QUEUE_PATH}.tmp-${process.pid}`
+  fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n')
+  fs.renameSync(tmp, QUEUE_PATH)
+}
+
+// Read the queue afresh under the lock, let `fn` change it, write it back if it
+// changed, and return what `fn` returned. `fn` must not run git, a gate, or
+// anything else slow, and must not call `die` for a reason it could check first.
+function mutateQueue (fn) {
+  acquireQueueLock()
+  try {
+    const q = loadQueue()
+    const before = JSON.stringify(q, null, 2) + '\n'
+    const result = fn(q)
+    if (JSON.stringify(q, null, 2) + '\n' !== before || !fs.existsSync(QUEUE_PATH)) saveQueue(q)
+    return result
+  } finally {
+    releaseQueueLock()
+  }
+}
+
+const sameEntry = (e, entry) => e.repo === entry.repo && e.branch === entry.branch
+
+// Change one entry of the queue as it stands NOW. Returns false when the entry
+// is gone (dequeued during the run), in which case nothing is written: a run
+// never brings back an entry somebody removed.
+function patchEntry (entry, fields, drop = []) {
+  return mutateQueue(q => {
+    const e = q.entries.find(x => sameEntry(x, entry))
+    if (!e) return false
+    Object.assign(e, fields)
+    for (const k of drop) delete e[k]
+    return true
+  })
+}
+
+function removeEntry (entry) {
+  mutateQueue(q => { q.entries = q.entries.filter(x => !sameEntry(x, entry)) })
+}
+
+// The entry as the queue holds it now, or null.
+function freshEntry (entry) {
+  return loadQueue().entries.find(x => sameEntry(x, entry)) || null
 }
 
 function repoOf (cfg, key) {
@@ -932,10 +1096,185 @@ ${behind} If this branch should leave the queue instead, \`local-merge-queue deq
   return file
 }
 
+// ─── batched landing: a merge train, opt-in ─────────────────────────────────────
+//
+// ONE GATE FOR SEVERAL ENTRIES. Landing one at a time costs one gate per entry,
+// and a gate that takes minutes (or an hour, on a loaded machine) makes N entries
+// cost N of them. In the pattern of GitLab merge trains, GitHub's merge queue and
+// bors, a batch builds the candidate main the one-at-a-time process WOULD have
+// built, gates its tip once, and only then lands.
+//
+//   1. Form the batch: the next approved entries of the repo in queue order, up to
+//      `max`, stopping at the first entry that is not eligible, is --no-rebase, is
+//      already contained in main, carries merge commits a rebase would flatten, or
+//      does not carry the same lanes (and reached lanes) as the first.
+//   2. Build the candidate in a worktree of its own, on a detached HEAD: each entry
+//      is rebased onto the previous result (or left as it is when it already
+//      contains it, as `land` always does), its scaffolding removed, and merged
+//      --no-ff. No branch moves, and nothing is pushed.
+//   3. Gate the candidate's tip once: each of the batch's lanes' setup and gate,
+//      each gate once. Because every entry carries the same lanes, no entry waits
+//      on a gate of a lane it does not carry.
+//   4. Green: the entries land through the ordinary path, one after another, with
+//      their gate skipped, each checked against the tree the batch gated.
+//      Red, a conflict, or any error: nothing was pushed, the candidate is
+//      dropped, and the entries land one at a time, so the entry that fails is
+//      the one that stalls.
+class BatchFailure extends Error {}
+
+// The label a batch groups by: the lanes an entry carries, `~` marking one it only
+// reached. A one-lane repo has one label for everything.
+function batchKeyOf (repo, names, reached) {
+  const run = laneNamesFor(repo, { lanes: names, reached })
+  return { run, reached, key: laneLabels({ lanes: run, reached }).join(',') }
+}
+
+// Why this entry cannot join a batch, or null. `tip` is what the entry would be
+// rebased onto.
+function batchBlocker (repo, e, tip) {
+  if (e.noRebase) return 'it is --no-rebase'
+  if (!e.worktree || !fs.existsSync(e.worktree)) return 'its worktree is gone'
+  if (!gitTry(['rev-parse', '--verify', '-q', `refs/heads/${e.branch}`], repo.checkout).ok) return 'its branch is gone'
+  if (gitTry(['merge-base', '--is-ancestor', e.branch, repo.mainBranch], repo.checkout).ok) return 'it is already in main (cleanup only)'
+  const merges = gitTry(['rev-list', '--merges', '--count', `${tip}..${e.branch}`], repo.checkout)
+  if (!merges.ok || merges.out !== '0') return 'it carries merge commits (a branch that merged main into itself is not rebased, and a batch rebases)'
+  return null
+}
+
+// The entries a batch starting at `first` would hold, in queue order, or null.
+// Reads the queue and the branches, and writes nothing, so a dry run can ask.
+function formBatch (cfg, repo, key, first, q, { simulated, held, noBatch, preGated, max }) {
+  if (first.status !== 'approved' || noBatch.has(first.branch) || preGated.has(first.branch)) return null
+  const queued = new Map(q.entries.map(e => [`${e.repo}:${e.branch}`, e]))
+  const sim = new Set(simulated)
+  const members = []
+  let groupKey = null
+  for (let i = q.entries.indexOf(first); i < q.entries.length && members.length < max; i++) {
+    const e = q.entries[i]
+    if (e.repo !== key) continue
+    if (e !== first) {
+      if (noBatch.has(e.branch) || preGated.has(e.branch)) break
+      if (!eligible(cfg, e, key, { queued, simulated: sim, resuming: false, held, quiet: true })) break
+    }
+    if (batchBlocker(repo, e, repo.mainBranch)) break
+    let k = ''
+    if (multiLane(repo)) {
+      try {
+        const found = {}
+        const names = lanesOf(repo, repo.checkout, e.branch, found, { fail: m => { throw new Error(m) } })
+        k = batchKeyOf(repo, names, found.reached).key
+      } catch { break }
+    }
+    if (members.length && k !== groupKey) break
+    groupKey = k
+    members.push(e)
+    sim.add(e.branch)
+  }
+  return members.length >= 2 ? members : null
+}
+
+// The gate steps of a batch, lane by lane, for the dry run and the announcement.
+function batchGatePlan (repo, members) {
+  const found = {}
+  const names = multiLane(repo) ? lanesOf(repo, repo.checkout, members[0].branch, found, { fail: m => { throw new Error(m) } }) : Object.keys(repo.lanes)
+  return batchKeyOf(repo, names, found.reached || [])
+}
+
+function prepareBatchWorktree (repo, base) {
+  const bw = path.join(BATCH_DIR, repo.key)
+  fs.mkdirSync(BATCH_DIR, { recursive: true })
+  if (fs.existsSync(path.join(bw, '.git'))) {
+    gitTry(['rebase', '--abort'], bw)
+    gitTry(['merge', '--abort'], bw)
+    const co = gitTry(['checkout', '-f', '--detach', base], bw)
+    if (!co.ok) throw new BatchFailure(`the batch worktree ${bw} would not check out ${base}: ${co.err}`)
+    gitTry(['reset', '--hard', '-q'], bw)
+    return bw
+  }
+  gitTry(['worktree', 'prune'], repo.checkout)
+  if (fs.existsSync(bw)) {
+    try { fs.rmdirSync(bw) } catch { throw new BatchFailure(`${bw} exists, holds files, and is not a worktree`) }
+  }
+  const add = gitTry(['worktree', 'add', '--detach', bw, base], repo.checkout)
+  if (!add.ok) throw new BatchFailure(`could not create the batch worktree ${bw}: ${add.err}`)
+  return bw
+}
+
+// Build the candidate and gate it. Returns { members, trees } on green; throws
+// (BatchFailure or any error) on anything else. Pushes nothing and moves no branch.
+function buildAndGateBatch (repo, key, members, onBuilt = () => {}) {
+  // The candidate is built on the main the entries will land on.
+  if (!run('git fetch origin --prune', repo.checkout)) throw new BatchFailure('git fetch failed')
+  const ff = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
+  if (!ff.ok) throw new BatchFailure(`${repo.mainBranch} could not fast-forward to origin: ${ff.err}`)
+  const base = git(['rev-parse', repo.mainBranch], repo.checkout)
+  const bw = prepareBatchWorktree(repo, base)
+  const nohooks = ['-c', 'core.hooksPath=/dev/null']
+  const must = (args, what) => { const r = gitTry([...nohooks, ...args], bw); if (!r.ok) throw new BatchFailure(`${what}: ${r.err || r.out}`); return r }
+  const built = []
+  const trees = []
+  let first = null
+  for (const e of members) {
+    const tip = git(['rev-parse', 'HEAD'], bw)
+    const branchSha = git(['rev-parse', `refs/heads/${e.branch}`], repo.checkout)
+    must(['checkout', '--detach', branchSha], `could not check out ${e.branch}`)
+    // As in `land`: a branch that already contains the main it lands on is not rebased.
+    if (!gitTry(['merge-base', '--is-ancestor', tip, 'HEAD'], bw).ok) {
+      const rb = gitTry([...nohooks, 'rebase', tip], bw)
+      if (!rb.ok) {
+        const where = gitTry(['diff', '--name-only', '--diff-filter=U'], bw).out.split('\n').filter(Boolean)
+        gitTry(['rebase', '--abort'], bw)
+        const ownerCall = where.some(p => protectedOf(repo).some(pp => p.startsWith(pp)))
+        throw new BatchFailure(`${e.branch} conflicts with the entries before it${where.length ? ` in ${where.join(', ')}` : ''}${ownerCall ? ' (a protected path: the owner\'s call)' : ''}`)
+      }
+    }
+    // The scaffolding goes before the gate sees it, here as in `land`.
+    if (fs.existsSync(path.join(bw, 'BRANCH.md'))) {
+      must(['rm', '-q', 'BRANCH.md'], 'could not remove BRANCH.md')
+      must(['commit', '-q', '-m', 'BRANCH.md goes, as scaffolding does before a merge'], 'could not commit the BRANCH.md removal')
+    }
+    const rebased = git(['rev-parse', 'HEAD'], bw)
+    let k = { run: Object.keys(repo.lanes), reached: [], key: '' }
+    if (multiLane(repo)) {
+      const found = {}
+      const names = lanesOf(repo, bw, rebased, found, { base: tip, fail: m => { throw new BatchFailure(m) } })
+      k = batchKeyOf(repo, names, found.reached)
+    }
+    if (first && k.key !== first.key) {
+      must(['checkout', '--detach', tip], 'could not return to the candidate tip')
+      console.log(dim(`  batch: ${e.branch} carries other lanes than ${members[0].branch}, so the batch ends before it`))
+      break
+    }
+    first ||= k
+    must(['checkout', '--detach', tip], 'could not return to the candidate tip')
+    const mg = gitTry([...nohooks, 'merge', '--no-ff', '-m', `Merge ${e.branch}`, rebased], bw)
+    if (!mg.ok) { gitTry(['merge', '--abort'], bw); throw new BatchFailure(`${e.branch} does not merge onto the entries before it: ${mg.err || mg.out}`) }
+    trees.push(git(['rev-parse', 'HEAD^{tree}'], bw))
+    built.push(e)
+  }
+  if (built.length < 2) return null
+  console.log(dim(`  batch candidate built on ${base.slice(0, 9)}: ${built.map(e => e.branch).join(', ')}`))
+  onBuilt(built)                       // `status` shows the batch for as long as the gate runs
+
+  // ONE GATE, on the tip, for the lanes the entries share.
+  const setup = ensureWorktreeSetup(repo, bw, first.run)
+  if (!setup.ok) throw new BatchFailure(`worktree setup failed${multiLane(repo) ? ` in lane ${setup.lane}` : ''}: ${setup.failed}`)
+  for (const name of first.run) {
+    for (const step of gateStepsFor(repo, { reached: first.reached }, name)) {
+      console.log(dim(`  gate: ${step}`))
+      if (!run(step, bw, repo.lanes[name].gateEnv || {})) throw new BatchFailure(`the gate${multiLane(repo) ? ` of lane ${name}` : ''} failed on the candidate: ${step}`)
+    }
+  }
+  // The gate ran on a main that must still be the main the entries land on.
+  gitTry(['fetch', 'origin', repo.mainBranch], repo.checkout)
+  const now = gitTry(['rev-parse', `origin/${repo.mainBranch}`], repo.checkout)
+  if (!now.ok || now.out !== base) throw new BatchFailure(`origin/${repo.mainBranch} moved while the candidate was gated, so the gate result is stale`)
+  return { members: built, trees: new Map(built.map((e, i) => [e.branch, trees[i]])) }
+}
+
 // ─── commands ───────────────────────────────────────────────────────────────
 
 function cmdEnqueue (cfg, args) {
-  const q = loadQueue()
   const here = detectHere(cfg)
   const repoKey = args['--repo'] || here?.repo.key
   const branch = args['--branch'] || here?.branch
@@ -978,32 +1317,38 @@ function cmdEnqueue (cfg, args) {
 
   const found = {}
   const lanes = lanesOf(repo, worktree, branch, found)
-  const existing = q.entries.find(e => e.repo === repo.key && e.branch === branch)
-  if (existing) {
-    existing.worktree = worktree
-    existing.lanes = lanes
-    existing.reached = found.reached
-    if (args['--note']) existing.note = args['--note']
-    if (args['--after']) existing.after = args['--after']
-    if (args['--no-rebase']) existing.noRebase = true
-    saveQueue(q)
-    console.log(`${bold('updated')} ${repo.key}/${branch} (status: ${existing.status})`)
+  // Everything above ran against the disk and the forge, and took as long as it
+  // took. The queue is read only now, under its lock, and this one entry is the
+  // only thing written to it.
+  const result = mutateQueue(q => {
+    const existing = q.entries.find(e => e.repo === repo.key && e.branch === branch)
+    if (existing) {
+      existing.worktree = worktree
+      existing.lanes = lanes
+      existing.reached = found.reached
+      if (args['--note']) existing.note = args['--note']
+      if (args['--after']) existing.after = args['--after']
+      if (args['--no-rebase']) existing.noRebase = true
+      return { updated: true, status: existing.status }
+    }
+    q.entries.push({
+      repo: repo.key,
+      branch,
+      worktree,
+      note: args['--note'] || '',
+      after: args['--after'] || null,
+      lanes,
+      reached: found.reached,
+      ...(args['--no-rebase'] ? { noRebase: true } : {}),
+      status: 'enqueued',                 // enqueued → approved (the owner's word) → landed
+      enqueued: nowISO()
+    })
+    return { updated: false }
+  })
+  if (result.updated) {
+    console.log(`${bold('updated')} ${repo.key}/${branch} (status: ${result.status})`)
     return
   }
-
-  q.entries.push({
-    repo: repo.key,
-    branch,
-    worktree,
-    note: args['--note'] || '',
-    after: args['--after'] || null,
-    lanes,
-    reached: found.reached,
-    ...(args['--no-rebase'] ? { noRebase: true } : {}),
-    status: 'enqueued',                 // enqueued → approved (the owner's word) → landed
-    enqueued: nowISO()
-  })
-  saveQueue(q)
   console.log(`${green('enqueued')} ${repo.key}/${branch}`)
   console.log(dim('  Waiting for the owner\'s word. Nothing merges until it is approved.'))
 }
@@ -1040,6 +1385,7 @@ function cmdStatus (cfg, args) {
       console.log(`  ${String(i + 1).padStart(2)}. ${name.padEnd(28)} ${mark.padEnd(18)} ${delta}`)
       if (e.after) console.log(dim(`      after: ${e.after}`))
       if (e.noRebase) console.log(dim('      no-rebase'))
+      if (e.batch) console.log(dim(`      gated together with: ${e.batch.with.filter(b => b !== e.branch).join(', ')} (one batched gate run)`))
       if (e.note) console.log(dim(`      ${e.note}`))
       if (e.stallReason) console.log(red(`      ${e.stallReason}`))
     })
@@ -1149,18 +1495,19 @@ function refuseAmbiguous (q, names, args) {
 }
 
 function cmdApprove (cfg, args) {
-  const q = loadQueue()
   const all = args['--all']
   const names = args._
   if (!all && !names.length) die('name the branches to approve, or pass --all')
-  refuseAmbiguous(q, names, args)
-  let n = 0
-  for (const e of q.entries) {
-    if (e.status !== 'enqueued') continue
-    if (args['--repo'] && e.repo !== args['--repo']) continue
-    if (all || names.includes(e.branch)) { e.status = 'approved'; e.approved = nowISO(); n++ }
-  }
-  saveQueue(q)
+  refuseAmbiguous(loadQueue(), names, args)
+  const n = mutateQueue(q => {
+    let n = 0
+    for (const e of q.entries) {
+      if (e.status !== 'enqueued') continue
+      if (args['--repo'] && e.repo !== args['--repo']) continue
+      if (all || names.includes(e.branch)) { e.status = 'approved'; e.approved = nowISO(); n++ }
+    }
+    return n
+  })
   console.log(`${green('approved')} ${n} branch(es). Land them with: local-merge-queue land <repo>`)
 }
 
@@ -1170,30 +1517,32 @@ function cmdApprove (cfg, args) {
 // only as far as the landing run: once a branch is landing, `dequeue` and `resume` are
 // what govern it.
 function cmdUnapprove (cfg, args) {
-  const q = loadQueue()
   const all = args['--all']
   const names = args._
   if (!all && !names.length) die('name the branches to unapprove, or pass --all')
-  refuseAmbiguous(q, names, args)
+  refuseAmbiguous(loadQueue(), names, args)
   const wanted = e => (all || names.includes(e.branch)) &&
     (!args['--repo'] || e.repo === args['--repo'])
   // A stalled entry is mid-landing: its worktree holds a rebase in progress, so
   // moving it back to enqueued would leave the queue describing a state the disk
   // does not. Say so rather than half-doing it.
-  const stalled = q.entries.filter(e => e.status === 'stalled' && wanted(e))
+  const { stalled, n } = mutateQueue(q => {
+    const stalled = q.entries.filter(e => e.status === 'stalled' && wanted(e)).map(e => ({ repo: e.repo, branch: e.branch }))
+    let n = 0
+    for (const e of q.entries) {
+      if (e.status !== 'approved') continue
+      if (!wanted(e)) continue
+      e.status = 'enqueued'
+      delete e.approved
+      delete e.batch
+      n++
+    }
+    return { stalled, n }
+  })
   for (const e of stalled) {
     console.log(yellow(`${e.repo}/${e.branch} is STALLED mid-landing — unapprove will not touch it.`))
     console.log(dim(`  Resolve it and ${bold('local-merge-queue resume')} ${e.repo}, or ${bold('local-merge-queue dequeue')} ${e.branch}.`))
   }
-  let n = 0
-  for (const e of q.entries) {
-    if (e.status !== 'approved') continue
-    if (!wanted(e)) continue
-    e.status = 'enqueued'
-    delete e.approved
-    n++
-  }
-  saveQueue(q)
   if (!n) {
     console.log(dim('nothing to unapprove — no matching entry was approved'))
     return
@@ -1203,33 +1552,37 @@ function cmdUnapprove (cfg, args) {
 }
 
 function cmdDequeue (cfg, args) {
-  const q = loadQueue()
   const name = args._[0]
   if (!name) die('name the branch to dequeue')
-  const e = entryNamed(cfg, q, name, args)
+  entryNamed(cfg, loadQueue(), name, args)            // refuse a missing or ambiguous name before taking the lock
+  const e = mutateQueue(q => {
+    const e = entryNamed(cfg, q, name, args)
+    q.entries = q.entries.filter(x => x !== e)
+    return e
+  })
   // If it stalled mid-rebase, put the worktree back as it was.
   if (e.status === 'stalled' && e.worktree && fs.existsSync(path.join(e.worktree, '.git'))) {
     gitTry(['rebase', '--abort'], e.worktree)
   }
-  q.entries = q.entries.filter(x => x !== e)
-  saveQueue(q)
   console.log(`${yellow('dequeued')} ${e.repo}/${e.branch} — the branch and its worktree are untouched`)
 }
 
 function cmdOrder (cfg, args) {
-  const q = loadQueue()
   const name = args._[0]
   if (!name) die('name the branch to move')
-  const idx = q.entries.indexOf(entryNamed(cfg, q, name, args))
-  const [e] = q.entries.splice(idx, 1)
-  if (args['--first']) q.entries.unshift(e)
-  else if (args['--last']) q.entries.push(e)
-  else {
+  if (!args['--first'] && !args['--last']) {
     const pos = Number(args._[1])
     if (!Number.isInteger(pos) || pos < 1) die('pass --first, --last, or a 1-based position')
-    q.entries.splice(pos - 1, 0, e)
   }
-  saveQueue(q)
+  entryNamed(cfg, loadQueue(), name, args)            // refuse a missing or ambiguous name before taking the lock
+  const e = mutateQueue(q => {
+    const idx = q.entries.indexOf(entryNamed(cfg, q, name, args))
+    const [e] = q.entries.splice(idx, 1)
+    if (args['--first']) q.entries.unshift(e)
+    else if (args['--last']) q.entries.push(e)
+    else q.entries.splice(Number(args._[1]) - 1, 0, e)
+    return e
+  })
   console.log(`${green('reordered')} — land refactors early; every branch behind one rebases over it anyway`)
   cmdStatus(cfg, { _: [e.repo] })
 }
@@ -1240,6 +1593,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
   if (!key) die('name the repo to land (or run from inside one of its worktrees)')
   const repo = repoOf(cfg, key)
   const dryRun = !!args['--dry-run']
+  const batchOpt = batchFor(repo, args)
 
   // A STALL HOLDS ONLY ITS OWN LANES, so `land` refuses only when every lane
   // of the repo is held. A one-lane repo's every stalled entry holds its one
@@ -1274,6 +1628,16 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     }
   }
 
+  // A DEAD RUN CAN LEAVE A BATCH MARK ON ENTRIES THAT NEVER LANDED; this run starts clean.
+  if (!dryRun) {
+    mutateQueue(q => { for (const e of q.entries) if (e.repo === key) delete e.batch })
+  }
+  // The entries this run starts with. Anything it lands that is not among them was
+  // approved while it ran, and the output says so.
+  const startedWith = new Set(loadQueue().entries
+    .filter(e => e.repo === key && (e.status === 'approved' || (resuming && e.status === 'stalled'))).map(e => e.branch))
+  const pickedUp = new Set()
+
   const landed = []
   const landedLanes = []              // lanes of every entry landed this run, for the final check
   const simulated = new Set()          // dry-run only; the real queue is never written
@@ -1283,6 +1647,32 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
   // every entry behind a stall there shares its one lane.
   const held = new Set()
   let refused = false                  // `resume` found a stalled entry unready
+  // Batched landing (see `formBatch`): the entries gated together on one candidate
+  // (branch -> the tree the batch gated), the entries a failed batch sent back to
+  // one-at-a-time landing, and the batches this run gated.
+  const preGated = new Map()
+  const noBatch = new Set()
+  const batchesRun = []
+  // Record a stall in the queue as it stands now. False when the entry was
+  // dequeued during the run: nothing is written, and nothing is left to hold the line.
+  const recordStall = (entry, fields) => {
+    Object.assign(entry, fields)
+    preGated.clear()
+    if (patchEntry(entry, fields)) return true
+    console.error(yellow(`  ${entry.branch} was dequeued during this run — no stall recorded`))
+    held.add(entry.branch)
+    return false
+  }
+  // Was the entry taken back during the run, by `unapprove` or `dequeue`? Then it
+  // does not land, whatever the run read when it picked the entry.
+  const withdrawn = entry => {
+    const now = freshEntry(entry)
+    if (now && now.status === 'approved') return false
+    console.log(yellow(`  ${entry.branch} was ${now ? 'unapproved' : 'dequeued'} during this run — not landing it`))
+    held.add(entry.branch)
+    preGated.clear()
+    return true
+  }
   // The line a multi-lane stall adds to its console report. At each stall a
   // one-lane repo returns at once; a multi-lane repo holds the entry and the
   // loop moves on to the entries in other lanes.
@@ -1296,11 +1686,56 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
       const entry = q2.entries.find(e => eligible(cfg, e, key, { queued, simulated, resuming, held }))
       if (!entry) break
 
+      if (!dryRun && !startedWith.has(entry.branch) && !pickedUp.has(entry.branch)) {
+        pickedUp.add(entry.branch)
+        console.log(yellow(`\n  ${entry.branch} was approved during this run — picking it up`))
+      }
+
+      // BATCHED LANDING, WHEN ASKED FOR: gate several entries once.
+      if (batchOpt && !preGated.has(entry.branch) && !noBatch.has(entry.branch)) {
+        const members = formBatch(cfg, repo, key, entry, q2, { simulated, held, noBatch, preGated, max: batchOpt.max })
+        if (members) {
+          const names = members.map(e => e.branch)
+          if (dryRun) {
+            console.log(`\n${bold('batch')} ${names.length} entries gated together, one gate run: ${names.join(', ')}`)
+            const plan = batchGatePlan(repo, members)
+            for (const n of plan.run) {
+              const steps = gateStepsFor(repo, { reached: plan.reached }, n)
+              console.log(dim(`  gate [${n}]: ${steps.length ? steps.join(' && ') : '(no steps)'}`))
+            }
+            for (const e of members) preGated.set(e.branch, { names })
+          } else {
+            console.log(`\n${bold('batch')} ${names.length} entries: ${names.join(', ')} — building the candidate and gating it once; nothing is pushed until the gate passes`)
+            try {
+              const markBatch = built => { const got = built.map(e => e.branch); for (const e of built) patchEntry(e, { batch: { with: got } }) }
+              const res = buildAndGateBatch(repo, key, members, markBatch)
+              if (res) {
+                const got = res.members.map(e => e.branch)
+                console.log(green(`  batch gated once: ${got.join(', ')}`))
+                batchesRun.push(got)
+                for (const e of res.members) preGated.set(e.branch, { names: got, tree: res.trees.get(e.branch) })
+              } else {
+                for (const e of members) noBatch.add(e.branch)
+                console.log(dim('  batch: fewer than two entries share lanes, so they land one at a time'))
+              }
+            } catch (err) {
+              for (const e of members) noBatch.add(e.branch)
+              mutateQueue(q => { for (const e of q.entries) if (e.repo === key) delete e.batch })
+              console.log(red(`  BATCH FAILED: ${err instanceof BatchFailure ? err.message : `unexpected error: ${err.message}`}`))
+              console.log(red(`  Nothing was pushed and no branch moved. Falling back to landing ${names.join(', ')} one at a time.`))
+            }
+          }
+        }
+      }
+
       console.log(`\n${bold('──')} ${bold(entry.branch)} ${dim(entry.worktree)}${entry.noRebase ? ' ' + dim('no-rebase') : ''}`)
       if (dryRun) {
+        const together = preGated.get(entry.branch)
         console.log(dim(entry.noRebase
           ? `  (dry run — no-rebase: would stall if origin/${repo.mainBranch} is not in the branch; otherwise gate, merge --no-ff, push, clean up)`
-          : '  (dry run — would rebase, gate, merge --no-ff, push, clean up)'))
+          : together
+            ? `  (dry run — would rebase, merge --no-ff, push, clean up; its gate is the batch's: ${together.names.join(', ')})`
+            : '  (dry run — would rebase, gate, merge --no-ff, push, clean up)'))
         let dryLanes = Object.keys(repo.lanes)
         if (multiLane(repo)) {
           // Computed live and never stored: a dry run writes nothing.
@@ -1393,7 +1828,11 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           }
           entry.status = 'approved'
           delete entry.stallReason
-          saveQueue(q2)
+          if (!patchEntry(entry, { status: 'approved' }, ['stallReason'])) {
+            console.log(yellow(`  ${entry.branch} was dequeued during this run — skipping it`))
+            held.add(entry.branch)
+            continue
+          }
         }
 
         // 1. Bring main and the branch up to date.
@@ -1425,10 +1864,8 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           current = gitTry(['merge-base', '--is-ancestor', `origin/${repo.mainBranch}`, entry.branch], wt).ok
           if (!current && entry.noRebase) {
             // The branch is never rebased: it lands as it is or not at all.
-            entry.status = 'stalled'
-            entry.ownerCall = false
-            entry.stallReason = `main moved under a --no-rebase branch — merge origin/${repo.mainBranch} into it and resume`
-            saveQueue(q2)
+            if (!recordStall(entry, { status: 'stalled', ownerCall: false,
+              stallReason: `main moved under a --no-rebase branch — merge origin/${repo.mainBranch} into it and resume` })) continue
             const file = writeStallReport(repo, entry, 'behind main (--no-rebase)',
               `origin/${repo.mainBranch} is not an ancestor of ${entry.branch}, and the entry is --no-rebase.`, [], false, [],
               { behindMain: true })
@@ -1453,10 +1890,8 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           if (!rb.ok) {
             const conflicted = git(['diff', '--name-only', '--diff-filter=U'], wt).split('\n').filter(Boolean)
             const ownerCall = conflicted.some(p => protectedOf(repo).some(pp => p.startsWith(pp)))
-            entry.status = 'stalled'
-            entry.ownerCall = ownerCall
-            entry.stallReason = `rebase conflict in ${conflicted.length} file(s)${ownerCall ? ' — OWNER DECISION REQUIRED' : ''}`
-            saveQueue(q2)
+            if (!recordStall(entry, { status: 'stalled', ownerCall,
+              stallReason: `rebase conflict in ${conflicted.length} file(s)${ownerCall ? ' — OWNER DECISION REQUIRED' : ''}` })) continue
             const file = writeStallReport(repo, entry, 'rebase conflict', rb.err || rb.out, conflicted, ownerCall)
             console.error(red(`\n  STALLED — rebase conflict on ${entry.branch}`))
             console.error(`  ${conflicted.length} conflicted file(s); the rebase is left in progress for you to resolve.`)
@@ -1478,7 +1913,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         const found = {}
         entry.lanes = lanesOf(repo, wt, entry.branch, found)
         entry.reached = found.reached
-        saveQueue(q2)
+        patchEntry(entry, { lanes: entry.lanes, reached: entry.reached })
         runLanes = laneNamesFor(repo, entry)
         if (entry.reached.length) console.log(dim(`  lanes: ${runLanes.map(n => entry.reached.includes(n) ? `${n} (reached)` : n).join(', ')}`))
 
@@ -1516,13 +1951,30 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         // Which means a setup failure has NO rebase behind it to resolve, and
         // the report says so rather than sending the fixer looking for a
         // conflict that does not exist.
-        const setup = ensureWorktreeSetup(repo, wt, runLanes)
+        //
+        // AN ENTRY THAT A BATCH GATED SKIPS ITS OWN SETUP AND GATE, provided the tree
+        // this entry would land is the tree the batch gated. The comparison is
+        // exact; any difference (main moved, an earlier entry did not land the way
+        // the candidate assumed) sends this entry, and the batch's remaining
+        // entries, back to a gate of their own.
+        let skipGate = false
+        const gatedTogether = preGated.get(entry.branch)
+        if (gatedTogether) {
+          const mt = gitTry(['merge-tree', '--write-tree', repo.mainBranch, entry.branch], repo.checkout)
+          if (mt.ok && gatedTogether.tree && mt.out.split('\n')[0] === gatedTogether.tree) {
+            skipGate = true
+            console.log(dim(`  gated in a batch with ${gatedTogether.names.filter(n => n !== entry.branch).join(', ')}: the candidate's gate passed on exactly this tree`))
+          } else {
+            preGated.clear()
+            console.log(red('  The tree this entry would land is not the tree the batch gated — gating it on its own.'))
+          }
+        }
+        const gateLanes = skipGate ? [] : runLanes
+        const setup = ensureWorktreeSetup(repo, wt, gateLanes)
         if (!setup.ok) {
           // A multi-lane repo names the lane whose setup failed.
           const inLane = multiLane(repo) ? ` in lane ${setup.lane}` : ''
-          entry.status = 'stalled'
-          entry.stallReason = `worktree setup failed${inLane}: ${setup.failed}`
-          saveQueue(q2)
+          if (!recordStall(entry, { status: 'stalled', stallReason: `worktree setup failed${inLane}: ${setup.failed}` })) continue
           const file = writeStallReport(repo, entry, `worktree setup failed${inLane}`,
             `This worktree lacked its generated environment — \`${setup.probe || '(no probe configured)'}\` said so —\n` +
             `and the setup step that fills it in exited non-zero:\n\n` +
@@ -1545,7 +1997,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         let gateOK = true
         let gateFailed = null
         let gateLane = null
-        gate: for (const name of runLanes) {
+        gate: for (const name of gateLanes) {
           for (const step of gateStepsFor(repo, entry, name)) {
             console.log(dim(`  gate: ${step}`))
             if (!run(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; gateLane = name; break gate }
@@ -1554,9 +2006,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
         if (!gateOK) {
           // A multi-lane repo names the lane whose gate failed.
           const inLane = multiLane(repo) ? ` in lane ${gateLane}` : ''
-          entry.status = 'stalled'
-          entry.stallReason = `gate failed after rebase${inLane}`
-          saveQueue(q2)
+          if (!recordStall(entry, { status: 'stalled', stallReason: `gate failed after rebase${inLane}` })) continue
           const file = writeStallReport(repo, entry, `gate failed after rebase${inLane}`,
             `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
             [], false, [gateFailed])
@@ -1568,6 +2018,10 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
           held.add(entry.branch)
           continue
         }
+
+        // 3a. THE QUEUE MAY HAVE CHANGED DURING THE GATE, which takes minutes. An
+        //     entry unapproved or dequeued in that time is not landed.
+        if (withdrawn(entry)) continue
 
         // 3b. PUBLISH THE REBASED TIP BEFORE THE MERGE. Not optional bookkeeping:
         //     the pull request is the roster now, and this is the one step that
@@ -1617,6 +2071,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
             : `  unmarked${here} — the last of this run, so the host builds it`))
           if (more && !markers.includes(marker)) markers.push(marker)
         }
+        if (withdrawn(entry)) continue
         const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${markers.map(m => ` ${m}`).join('')}`
         const mg = gitTry(['merge', '--no-ff', '-m', msg, entry.branch], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
@@ -1766,9 +2221,8 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
 
       entry.status = 'landed'
       entry.landedAt = nowISO()
-      const q3 = loadQueue()
-      q3.entries = q3.entries.filter(x => !(x.repo === entry.repo && x.branch === entry.branch))
-      saveQueue(q3)
+      removeEntry(entry)
+      preGated.delete(entry.branch)
       landed.push(entry.branch)
     }
 
@@ -1785,7 +2239,10 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
     // repo with a stall holds its one lane, so it settles nothing.
     settleDeploy(repo, dryRun, blockedLanes(repo, loadQueue().entries))
   } finally {
-    if (!dryRun) releaseLock(key)
+    if (!dryRun) {
+      mutateQueue(q => { for (const e of q.entries) if (e.repo === key) delete e.batch })
+      releaseLock(key)
+    }
   }
 
   // The entries of this repo still stalled when the run ends: the ones that
@@ -1820,6 +2277,7 @@ function cmdLand (cfg, args, { resuming = false } = {}) {
   if (landed.length) {
     console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
     landed.forEach(b => console.log(`  · ${b}`))
+    for (const names of batchesRun) console.log(dim(`  gated together in one batch: ${names.join(', ')}`))
   }
   if (!stalledAtEnd.length) return { landed, refused }
 
@@ -1859,10 +2317,13 @@ ${bold('local-merge-queue')} — a local merge queue for git repositories
       nothing about the branch or its worktree moves. Refuses a stalled entry.
   ${bold('local-merge-queue order')} <branch> --first | --last | <position>
       Reorder. Land refactors early — everything behind one rebases over it anyway.
-  ${bold('local-merge-queue land')} [repo] [--dry-run]
+  ${bold('local-merge-queue land')} [repo] [--dry-run] [--batch | --no-batch]
       Land every approved entry, one at a time: rebase → gate → merge --no-ff →
       push → remove worktree → delete branch → delete roster row. Stalls on the
       first conflict; nothing that shares a lane with it lands out of order.
+      ${bold('--batch')}: gate several approved entries that share lanes once, on a
+      candidate main, then land them one by one (the repo's "batch": {"max": N}
+      turns it on by default; ${bold('--no-batch')} turns it off for a run).
   ${bold('local-merge-queue resume')} [repo] [--owner-approved]
       Continue after a stall has been resolved in the worktree. Retries every
       stalled entry in queue order.
