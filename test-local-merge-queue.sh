@@ -1372,11 +1372,12 @@ cat > "$ROOT/hold-gate.sh" <<SH
 #!/bin/bash
 echo "gate-run \$(basename "\$PWD")" >> "$BLOG"
 if [[ -n "\${HOLD_MATCH:-}" && "\$PWD" == *"\$HOLD_MATCH" ]]; then
+  echo \$\$ > "$ROOT/gate-pid"
   touch "$ROOT/gate-started"
   for i in \$(seq 1 300); do [[ -e "$ROOT/gate-release" ]] && break; sleep 0.2; done
   [[ -e "$ROOT/gate-fail" ]] && exit 1
 fi
-test -f base.txt && test ! -e bad.txt
+test -f base.txt && test ! -e bad.txt && test ! -e stale.txt
 SH
 write_b_config () {  # extra top-level keys, e.g. '"batch": {"max": 5},'
   cat > "$ROOT/b-repos.json" <<JSON
@@ -1391,6 +1392,19 @@ write_b_config () {  # extra top-level keys, e.g. '"batch": {"max": 5},'
 JSON
 }
 write_b_config ''
+# The remote counts every push to main, and can be told to reject the next one (or every one).
+cat > "$ROOT/borigin.git/hooks/pre-receive" <<SH
+#!/bin/bash
+while read old new ref; do
+  if [ "\$ref" = refs/heads/main ]; then
+    echo "\$new" >> "$ROOT/main-pushes.log"
+    if [ -e "$ROOT/reject-all" ]; then echo "REJECTED BY TEST HOOK" >&2; exit 1; fi
+    if [ -e "$ROOT/reject-next" ]; then rm -f "$ROOT/reject-next"; echo "REJECTED BY TEST HOOK" >&2; exit 1; fi
+  fi
+done
+SH
+chmod +x "$ROOT/borigin.git/hooks/pre-receive"
+main_pushes () { local n; n=$(grep -c . "$ROOT/main-pushes.log" 2>/dev/null); echo "${n:-0}"; }
 wait_for () {  # a file, for up to 40 s
   local i; for i in $(seq 1 200); do [[ -e "$1" ]] && return 0; sleep 0.2; done; return 1
 }
@@ -1516,9 +1530,9 @@ check "a lock with no owner file, long untouched, is broken"     '[[ $rc == 0 &&
 $LOCAL_MERGE_QUEUE unapprove lock-a --repo b >/dev/null 2>&1
 mkdir "$LOCAL_MERGE_QUEUE_STATE/queue.lock"
 echo "{\"pid\":$$,\"since\":\"2020-01-01T00:00:00.000Z\"}" > "$LOCAL_MERGE_QUEUE_STATE/queue.lock/owner.json"
-out=$($LOCAL_MERGE_QUEUE approve lock-a --repo b 2>&1); rc=$?
-check "a lock a live process has held for over a minute is broken" '[[ $rc == 0 && "$(qinfo)" == lock-a:approved ]]'
-$LOCAL_MERGE_QUEUE unapprove lock-a --repo b >/dev/null 2>&1
+out=$(LOCAL_MERGE_QUEUE_LOCK_WAIT_MS=700 $LOCAL_MERGE_QUEUE approve lock-a --repo b 2>&1); rc=$?
+check "a lock a LIVE process has held for hours is never broken; the message names its pid and age" '[[ $rc != 0 && "$out" == *"stayed locked"*"pid $$, alive and holding it for"* && -d "$LOCAL_MERGE_QUEUE_STATE/queue.lock" && "$(qinfo)" == lock-a:enqueued ]]'
+rm -r "$LOCAL_MERGE_QUEUE_STATE/queue.lock"
 mkdir "$LOCAL_MERGE_QUEUE_STATE/queue.lock"
 echo "{\"pid\":$$,\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LOCAL_MERGE_QUEUE_STATE/queue.lock/owner.json"
 out=$(LOCAL_MERGE_QUEUE_LOCK_WAIT_MS=700 $LOCAL_MERGE_QUEUE approve lock-a --repo b 2>&1); rc=$?
@@ -1555,7 +1569,7 @@ bb fl-1 fl-1.txt=1; bb fl-2 fl-2.txt=2
 bq fl-1; bq fl-2; bapprove fl-1 fl-2
 : > "$BLOG"
 out=$($LOCAL_MERGE_QUEUE land b --batch 2>&1)
-check "--batch turns it on where the config has no batch key"    '[[ "$(gates)" == 1 && "$out" == *"batch gated once: fl-1, fl-2"* ]]'
+check "--batch turns it on where the config has no batch key"    '[[ "$(gates)" == 1 && "$out" == *"gated together in one batch, landed in one push: fl-1, fl-2"* ]]'
 out=$($LOCAL_MERGE_QUEUE land b --batch --no-batch 2>&1); rc=$?
 check "--batch with --no-batch is refused"                       '[[ $rc != 0 && "$out" == *"not both"* ]]'
 write_b_config '"batch": {"max": 1},'
@@ -1583,7 +1597,8 @@ check "…in queue order"                                          '[[ "$(merge_
 check "…each carrying its own note, as when landed singly"       '[[ "$(git log main --merges -3 --format=%s)" == *"Merge g-1 — note of g-1"* ]]'
 check "…with all three files on main, and origin matching"       '[[ -f g-1.txt && -f g-2.txt && -f g-3.txt && "$(git rev-parse main)" == "$(git -C "$ROOT/borigin.git" rev-parse main)" ]]'
 check "…and every worktree and branch cleaned up"                '[[ ! -d "$ROOT/brepo-g-1" && ! -d "$ROOT/brepo-g-3" ]] && ! git rev-parse --verify -q refs/heads/g-2 >/dev/null && ! git -C "$ROOT/borigin.git" rev-parse --verify -q refs/heads/g-3 >/dev/null'
-check "…the output says which entries were gated together"       '[[ "$out" == *"gated together in one batch: g-1, g-2, g-3"* && "$out" == *"gated in a batch with"* ]]'
+check "…the output says which entries were gated together, and that they landed in one push" '[[ "$out" == *"gated together in one batch, landed in one push: g-1, g-2, g-3"* && "$out" == *"landed 3 entries on main in one push"* ]]'
+check "…and says the intermediate merges were not gated on their own" '[[ "$out" == *"final tree was gated once"*"not gated on their own"* ]]'
 check "…and the final check ran once"                            '[[ "$(grep -c "final check passed" <<<"$out")" == 1 ]]'
 check "…and the queue is empty"                                  '[[ "$(qinfo)" == "" ]]'
 check "the batch changed exactly the three files, and nothing else" '[[ "$(git -C "$ROOT/brepo" diff --name-only "$o_before" main | tr "\n" " ")" == "g-1.txt g-2.txt g-3.txt " ]]'
@@ -1634,7 +1649,7 @@ bb m-1 m-1.txt=1; bb m-2 m-2.txt=2; bb m-3 m-3.txt=3
 for b in m-1 m-2 m-3; do bq $b; done; bapprove m-1 m-2 m-3
 : > "$BLOG"
 out=$($LOCAL_MERGE_QUEUE land b 2>&1)
-check "max caps a batch: three entries with max 2 run two gates" '[[ "$(gates)" == 2 && "$out" == *"gated together in one batch: m-1, m-2"* && -f "$ROOT/brepo/m-3.txt" ]]'
+check "max caps a batch: three entries with max 2 run two gates" '[[ "$(gates)" == 2 && "$out" == *"gated together in one batch, landed in one push: m-1, m-2"* && -f "$ROOT/brepo/m-3.txt" ]]'
 write_b_config '"batch": {"max": 5},'
 bb s-1 s-1.txt=1; bb s-2 s-2.txt=2; bb s-3 s-3.txt=3
 for b in s-1 s-2 s-3; do bq $b; done; bapprove s-1 s-3
@@ -1671,8 +1686,9 @@ touch "$ROOT/gate-release"
 wait $BG
 out=$(cat "$ROOT/b-land.out")
 unset HOLD_MATCH; clear_hold
-check "the unapproved entry of a batch is not landed"            '[[ ! -f "$ROOT/brepo/u-2.txt" && "$(qinfo)" == u-2:enqueued && -f "$ROOT/brepo/u-1.txt" ]]'
-check "the entry behind it is gated on its own, and lands"       '[[ "$out" == *"not the tree the batch gated"* && -f "$ROOT/brepo/u-3.txt" && "$(gates)" == 2 ]]'
+check "an entry unapproved while its batch is gated fails the batch (nothing landed)" '[[ "$out" == *"BATCH FAILED: u-2 was unapproved while the batch was gated"* ]]'
+check "…and is not landed, and stays enqueued"                   '[[ ! -f "$ROOT/brepo/u-2.txt" && "$(qinfo)" == u-2:enqueued ]]'
+check "…while the other two are gated one at a time and land"    '[[ -f "$ROOT/brepo/u-1.txt" && -f "$ROOT/brepo/u-3.txt" && "$(gates)" == 3 ]]'
 $LOCAL_MERGE_QUEUE dequeue u-2 --repo b >/dev/null 2>&1
 
 # The deploy marker still follows the batch: all merges but the last carry it.
@@ -1711,7 +1727,307 @@ out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
 check "the run lands all five"                                   '[[ $rc == 0 && "$(qinfo)" == "" && -f "$ROOT/brepo/a/la-3.txt" && -f "$ROOT/brepo/b/lb-2.txt" ]]'
 check "the a-lane batch ran lane a's gate once; b entries ran only lane b's" '[[ "$(sed -n 1p "$BLOG")" == gate-a && "$(grep -c gate-a "$BLOG")" == 2 && "$(grep -c gate-b "$BLOG")" == 2 && "$(grep -c gate-rest "$BLOG")" == 0 ]]'
 check "…five entries cost four gates, none of them a lane the entry lacks" '[[ "$(grep -c . "$BLOG")" == 4 ]]'
-check "…and la-1 and la-2 were gated together"                   '[[ "$out" == *"gated together in one batch: la-1, la-2"* ]]'
+check "…and la-1 and la-2 were gated together"                   '[[ "$out" == *"gated together in one batch, landed in one push: la-1, la-2"* ]]'
+
+echo
+echo "── the locks: owned by a token, created whole, never broken under a live holder ──"
+# THE DEFECT (reviewer, 2026-11-21): two processes judge a dead holder's lock stale;
+# one breaks it and takes a new lock; the other then renames the NEW lock away and
+# deletes it, and a release deleted whichever lock was there. 7 of 60 trials of 16
+# concurrent approvals lost writes. A lock now carries a token: a release removes
+# only its own, a breaker removes only the lock it judged stale, and a live holder
+# is never broken.
+LR_STATE="$ROOT/lr-state"
+lr_queue () {  # N entries, all enqueued
+  node -e 'const n=+process.argv[1];const e=[];for(let i=0;i<n;i++)e.push({repo:"b",branch:"lr"+i,worktree:"/x",status:"enqueued",lanes:[],reached:[]});require("fs").writeFileSync(process.argv[2],JSON.stringify({entries:e},null,2))' "$1" "$LR_STATE/queue.json"
+}
+lr_approved () { node -e 'const q=require(process.argv[1]);console.log(q.entries.filter(e=>e.status==="approved").length+"/"+q.entries.length)' "$LR_STATE/queue.json"; }
+lost=0; trials=100
+for t in $(seq 1 $trials); do
+  rm -rf "$LR_STATE"; mkdir -p "$LR_STATE"; lr_queue 16
+  dead=$(sh -c 'echo $$')
+  mkdir "$LR_STATE/queue.lock"
+  if (( t % 2 )); then tok=''; else tok=',"token":"dead-holder-token"'; fi
+  echo "{\"pid\":$dead$tok,\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LR_STATE/queue.lock/owner.json"
+  for i in $(seq 0 15); do LOCAL_MERGE_QUEUE_STATE="$LR_STATE" $LOCAL_MERGE_QUEUE approve lr$i --repo b >/dev/null 2>&1 & done
+  wait
+  [[ "$(lr_approved)" == 16/16 && ! -e "$LR_STATE/queue.lock" ]] || { lost=$((lost + 1)); echo "    trial $t: $(lr_approved), lock: $(ls "$LR_STATE" | tr '\n' ' ')"; }
+done
+check "a planted dead-holder lock and 16 concurrent approvals, 100 trials: no write lost, no lock left" '[[ $lost == 0 ]]'
+
+# A release never deletes a lock that is not its own.
+rm -rf "$LR_STATE"; mkdir -p "$LR_STATE"; lr_queue 1
+rm -f "$ROOT/pause-release"
+LOCAL_MERGE_QUEUE_STATE="$LR_STATE" LOCAL_MERGE_QUEUE_TEST_PAUSE_IN_LOCK="$ROOT/pause-release" $LOCAL_MERGE_QUEUE approve lr0 --repo b >/dev/null 2>&1 &
+BG=$!
+for i in $(seq 1 100); do [[ -f "$LR_STATE/queue.lock/owner.json" ]] && break; sleep 0.1; done
+check "a held queue lock records its holder's token" 'grep -q "\"token\":\"$BG-" "$LR_STATE/queue.lock/owner.json"'
+# …somebody else now holds the lock (its holder was judged gone and broken, and another took over).
+echo "{\"pid\":$$,\"token\":\"someone-elses-token\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LR_STATE/queue.lock/owner.json"
+touch "$ROOT/pause-release"; wait $BG
+check "a release does not delete the lock another process took over" '[[ -d "$LR_STATE/queue.lock" ]] && grep -q someone-elses-token "$LR_STATE/queue.lock/owner.json"'
+rm -rf "$LR_STATE/queue.lock" "$ROOT/pause-release"
+
+# The repository's landing lock is the same lock: whole, token-owned, and left alone when it is not ours.
+write_b_config ''
+bb tk-a tk-a.txt=a; bq tk-a; bapprove tk-a
+HOLD_MATCH=brepo-tk-a; export HOLD_MATCH; clear_hold
+$LOCAL_MERGE_QUEUE land b > "$ROOT/b-land.out" 2>&1 &
+BG=$!
+wait_for "$ROOT/gate-started"
+check "the landing lock records pid and token"                    'grep -q "\"pid\":$BG" "$LOCAL_MERGE_QUEUE_STATE/locks/b/owner.json" && grep -q "\"token\":\"$BG-" "$LOCAL_MERGE_QUEUE_STATE/locks/b/owner.json"'
+out=$($LOCAL_MERGE_QUEUE status b 2>&1)
+check "status shows LOCKED for a live holder, with its pid and age" '[[ "$out" == *"LOCKED by pid $BG"* ]]'
+out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
+check "a second land is refused while the holder is alive"        '[[ $rc != 0 && "$out" == *"being landed already (pid $BG"* ]]'
+echo "{\"pid\":$$,\"token\":\"someone-elses-token\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LOCAL_MERGE_QUEUE_STATE/locks/b/owner.json"
+touch "$ROOT/gate-release"; wait $BG
+unset HOLD_MATCH; clear_hold
+check "the landing run does not delete a landing lock it no longer owns" '[[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/b" ]] && grep -q someone-elses-token "$LOCAL_MERGE_QUEUE_STATE/locks/b/owner.json"'
+rm -rf "$LOCAL_MERGE_QUEUE_STATE/locks/b"
+# A landing lock whose holder is dead is debris: status does not call it LOCKED, and the next land clears it.
+dead=$(sh -c 'echo $$')
+mkdir -p "$LOCAL_MERGE_QUEUE_STATE/locks/b"
+echo "{\"pid\":$dead,\"since\":\"2026-01-01T00:00:00.000Z\"}" > "$LOCAL_MERGE_QUEUE_STATE/locks/b/owner.json"
+bb tk-b tk-b.txt=b; bq tk-b; bapprove tk-b
+out=$($LOCAL_MERGE_QUEUE status b 2>&1)
+check "status does not show LOCKED for a lock whose holder is dead" '[[ "$out" != *LOCKED* && "$out" == *"died holding the lock"* ]]'
+out=$($LOCAL_MERGE_QUEUE land b 2>&1)
+check "the next land breaks it and lands"                         '[[ "$out" == *"breaking a stale lock left by pid $dead"* && -f "$ROOT/brepo/tk-b.txt" && ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/b" ]]'
+# dequeue and order resolve the name before taking the lock: a name that is not there answers at once, with the lock held.
+mkdir "$LOCAL_MERGE_QUEUE_STATE/queue.lock"
+echo "{\"pid\":$$,\"token\":\"held-for-the-test\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LOCAL_MERGE_QUEUE_STATE/queue.lock/owner.json"
+out=$(LOCAL_MERGE_QUEUE_LOCK_WAIT_MS=700 $LOCAL_MERGE_QUEUE dequeue no-such-branch --repo b 2>&1)
+check "dequeue resolves the name without the queue lock"         '[[ "$out" == *"is not in the queue"* && "$out" != *"stayed locked"* ]]'
+out=$(LOCAL_MERGE_QUEUE_LOCK_WAIT_MS=700 $LOCAL_MERGE_QUEUE order no-such-branch --first --repo b 2>&1)
+check "order resolves the name without the queue lock"           '[[ "$out" == *"is not in the queue"* && "$out" != *"stayed locked"* ]]'
+rm -rf "$LOCAL_MERGE_QUEUE_STATE/queue.lock"
+
+echo
+echo "── the queue file: a previous copy, a flushed write, no stale temporaries ──"
+bb pv-a pv-a.txt=a; bq pv-a
+check "a write keeps the copy it replaced as queue.json.prev"    '[[ -f "$LOCAL_MERGE_QUEUE_STATE/queue.json.prev" ]] && node -e "JSON.parse(require(\"fs\").readFileSync(\"$LOCAL_MERGE_QUEUE_STATE/queue.json.prev\"))"'
+bapprove pv-a
+check "…and it is the copy before the last write"                '[[ "$(node -e "console.log(JSON.parse(require(\"fs\").readFileSync(\"$LOCAL_MERGE_QUEUE_STATE/queue.json.prev\")).entries.map(e=>e.status).join())")" == enqueued ]]'
+cp "$LOCAL_MERGE_QUEUE_STATE/queue.json" "$ROOT/b-queue.good"
+echo '{ broken' > "$LOCAL_MERGE_QUEUE_STATE/queue.json"
+out=$($LOCAL_MERGE_QUEUE approve pv-a --repo b 2>&1); rc=$?
+check "an unreadable queue names the previous copy and the exact command to restore it, and restores nothing" '[[ $rc != 0 && "$out" == *"previous good copy is $LOCAL_MERGE_QUEUE_STATE/queue.json.prev"* && "$out" == *"cp \"$LOCAL_MERGE_QUEUE_STATE/queue.json.prev\" \"$LOCAL_MERGE_QUEUE_STATE/queue.json\""* && "$(cat "$LOCAL_MERGE_QUEUE_STATE/queue.json")" == "{ broken" ]]'
+cp "$ROOT/b-queue.good" "$LOCAL_MERGE_QUEUE_STATE/queue.json"
+echo x > "$LOCAL_MERGE_QUEUE_STATE/queue.json.tmp-99999"; touch -t 202001010000 "$LOCAL_MERGE_QUEUE_STATE/queue.json.tmp-99999"
+echo x > "$LOCAL_MERGE_QUEUE_STATE/queue.json.tmp-99998"
+mkdir "$LOCAL_MERGE_QUEUE_STATE/queue.lock.new-1-ab"; touch -t 202001010000 "$LOCAL_MERGE_QUEUE_STATE/queue.lock.new-1-ab"
+echo x > "$LOCAL_MERGE_QUEUE_STATE/unrelated.tmp-99997"; touch -t 202001010000 "$LOCAL_MERGE_QUEUE_STATE/unrelated.tmp-99997"
+$LOCAL_MERGE_QUEUE unapprove pv-a --repo b >/dev/null 2>&1
+check "a temporary file older than an hour is removed, by exact pattern" '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/queue.json.tmp-99999" && ! -e "$LOCAL_MERGE_QUEUE_STATE/queue.lock.new-1-ab" ]]'
+check "…a recent one and a file of another name are left alone"  '[[ -e "$LOCAL_MERGE_QUEUE_STATE/queue.json.tmp-99998" && -e "$LOCAL_MERGE_QUEUE_STATE/unrelated.tmp-99997" ]]'
+rm -f "$LOCAL_MERGE_QUEUE_STATE/queue.json.tmp-99998" "$LOCAL_MERGE_QUEUE_STATE/unrelated.tmp-99997"
+$LOCAL_MERGE_QUEUE dequeue pv-a --repo b >/dev/null 2>&1
+
+echo
+echo "── a batch lands atomically: one gate, one push, and the failures that leave nothing ──"
+write_b_config '"batch": {"max": 5},'
+# THE PAIR: the gate is red for a without b (they depend on each other). Landed
+# one at a time the first would fail. In a batch the gate sees both, and the remote
+# never sees a state with a and not b, because main is pushed once.
+cat > "$ROOT/pair-gate.sh" <<SH
+#!/bin/bash
+echo "gate-run \$(basename "\$PWD")" >> "$BLOG"
+if [ -f pair-a.txt ] && [ ! -f pair-b.txt ]; then echo "GATE RED: a without b"; exit 1; fi
+test -f base.txt
+SH
+cat > "$ROOT/b-repos.json" <<JSON
+{ "repos": { "b": { "checkout": "$ROOT/brepo", "batch": {"max": 5}, "gate": ["bash $ROOT/pair-gate.sh"], "finalCheck": "true" } } }
+JSON
+bb pair-a pair-a.txt=a; bb pair-b pair-b.txt=b
+bq pair-a; bq pair-b; bapprove pair-a pair-b
+: > "$BLOG"; : > "$ROOT/main-pushes.log"
+before=$(git -C "$ROOT/borigin.git" rev-parse main)
+out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
+check "a pair that is red alone and green together lands as a batch" '[[ $rc == 0 && -f "$ROOT/brepo/pair-a.txt" && -f "$ROOT/brepo/pair-b.txt" && "$out" != *"GATE RED"* ]]'
+check "…the gate ran once, on both"                              '[[ "$(gates)" == 1 ]]'
+check "…and main was pushed to origin exactly once"              '[[ "$(main_pushes)" == 1 ]]'
+check "…so every state origin ever held as main has both a and b"  'while read c; do git -C "$ROOT/borigin.git" ls-tree -r --name-only $c | grep -q pair-a && git -C "$ROOT/borigin.git" ls-tree -r --name-only $c | grep -q pair-b || exit 1; done < "$ROOT/main-pushes.log"'
+check "…the pushed commit is the one the gate ran on"            '[[ "$(git -C "$ROOT/borigin.git" rev-parse main)" == "$(git -C "$ROOT/brepo" rev-parse main)" && "$(tail -1 "$ROOT/main-pushes.log")" == "$(git -C "$ROOT/borigin.git" rev-parse main)" ]]'
+
+# The origin rejects the batch's push: nothing has landed, and the run falls back.
+cat > "$ROOT/b-repos.json" <<JSON
+{ "repos": { "b": { "checkout": "$ROOT/brepo", "batch": {"max": 5}, "gate": ["bash $ROOT/hold-gate.sh"], "finalCheck": "true" } } }
+JSON
+bb rj-1 rj-1.txt=1; bb rj-2 rj-2.txt=2; bb rj-3 rj-3.txt=3
+for b in rj-1 rj-2 rj-3; do bq $b; done; bapprove rj-1 rj-2 rj-3
+: > "$BLOG"; : > "$ROOT/main-pushes.log"; touch "$ROOT/reject-next"
+out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
+check "a rejected push of main fails the batch with nothing landed, and says so" '[[ "$out" == *"BATCH FAILED: origin rejected the push of main, so nothing has landed"* && "$out" == *"Falling back to landing rj-1, rj-2, rj-3 one at a time"* ]]'
+check "…the entries then land one at a time (the rejected push, then one push each)" '[[ $rc == 0 && -f "$ROOT/brepo/rj-1.txt" && -f "$ROOT/brepo/rj-3.txt" && "$(main_pushes)" == 4 && "$(gates)" == 4 ]]'
+check "…leaving no batch mark and no lock"                       '! grep -q "\"batch\"" "$LOCAL_MERGE_QUEUE_STATE/queue.json" && [[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/b" && ! -e "$LOCAL_MERGE_QUEUE_STATE/queue.lock" ]]'
+
+# THE EXIT PATH (reviewer, ruling 3): the origin rejects EVERY push, so the
+# fallback's own push fails and the run dies. Marks and the landing lock must not survive it.
+bb px-1 px-1.txt=1; bb px-2 px-2.txt=2; bb px-3 px-3.txt=3
+for b in px-1 px-2 px-3; do bq $b; done; bapprove px-1 px-2 px-3
+touch "$ROOT/reject-all"
+out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
+rm -f "$ROOT/reject-all"
+check "when every push is rejected the run dies, and says the merge was rolled back" '[[ $rc != 0 && "$out" == *"BATCH FAILED: origin rejected the push"* && "$out" == *"push to origin/main failed, so the merge was rolled back locally"* ]]'
+st=$($LOCAL_MERGE_QUEUE status b 2>&1)
+check "…the landing lock is released"                            '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/b" && "$st" != *LOCKED* ]]'
+check "…no entry keeps a batch mark, in the file or in status"   '! grep -q "\"batch\"" "$LOCAL_MERGE_QUEUE_STATE/queue.json" && [[ "$st" != *"gated together"* ]]'
+check "…the entries are still approved and nothing landed"       '[[ "$(qinfo)" == px-1:approved,px-2:approved,px-3:approved && ! -f "$ROOT/brepo/px-1.txt" ]]'
+check "…and the rolled-back main matches origin"                 '[[ "$(git -C "$ROOT/brepo" rev-parse main)" == "$(git -C "$ROOT/borigin.git" rev-parse main)" ]]'
+for b in px-1 px-2 px-3; do $LOCAL_MERGE_QUEUE dequeue $b --repo b >/dev/null 2>&1; done
+
+# A branch that is pushed to while the batch is gated is not landed ungated.
+bb mv-1 mv-1.txt=1; bb mv-2 mv-2.txt=2; bb mv-3 mv-3.txt=3
+for b in mv-1 mv-2 mv-3; do bq $b; done; bapprove mv-1 mv-2 mv-3
+HOLD_MATCH=/batch/b; export HOLD_MATCH; clear_hold; : > "$BLOG"
+$LOCAL_MERGE_QUEUE land b > "$ROOT/b-land.out" 2>&1 &
+BG=$!
+wait_for "$ROOT/gate-started"
+( cd "$ROOT/brepo-mv-2" && echo late > mv-late.txt && git add -A && git commit -qm "late commit on mv-2" && git push -q origin mv-2 )
+touch "$ROOT/gate-release"; wait $BG
+out=$(cat "$ROOT/b-land.out"); unset HOLD_MATCH; clear_hold
+check "a branch pushed to during the gate fails the batch: the gate did not see what would land" '[[ "$out" == *"BATCH FAILED: mv-2 changed while the batch was gated"* ]]'
+check "…every entry is then gated on its own (one batch gate, three single gates)" '[[ "$(gates)" == 4 && -f "$ROOT/brepo/mv-1.txt" && -f "$ROOT/brepo/mv-2.txt" && -f "$ROOT/brepo/mv-late.txt" && -f "$ROOT/brepo/mv-3.txt" ]]'
+
+# A gate that moves the batch worktree off the candidate (it commits) has not vouched for the candidate.
+cat > "$ROOT/commit-gate.sh" <<SH
+#!/bin/bash
+if [[ "\$PWD" == */batch/b && -e "$ROOT/gate-commit" ]]; then git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m "a gate that commits"; fi
+exit 0
+SH
+cat > "$ROOT/b-repos.json" <<JSON
+{ "repos": { "b": { "checkout": "$ROOT/brepo", "batch": {"max": 5}, "gate": ["bash $ROOT/hold-gate.sh", "bash $ROOT/commit-gate.sh"], "finalCheck": "true" } } }
+JSON
+bb gm-1 gm-1.txt=1; bb gm-2 gm-2.txt=2; bq gm-1; bq gm-2; bapprove gm-1 gm-2
+touch "$ROOT/gate-commit"; : > "$BLOG"
+out=$($LOCAL_MERGE_QUEUE land b 2>&1)
+rm -f "$ROOT/gate-commit"
+check "a gate that moves the batch worktree off the candidate fails the batch before the push" '[[ "$out" == *"BATCH FAILED: the gate moved the batch worktree off the candidate"* && "$(gates)" == 3 && -f "$ROOT/brepo/gm-1.txt" && -f "$ROOT/brepo/gm-2.txt" ]]'
+
+# A batch's lanes are worked out as `land` works them out for one entry: before BRANCH.md is removed.
+cat > "$ROOT/b-repos.json" <<JSON
+{ "repos": { "b": {
+  "checkout": "$ROOT/brepo",
+  "batch": { "max": 5 },
+  "lanes": {
+    "a":    { "paths": ["a/"], "gate": ["echo gate-a >> $BLOG"] },
+    "rest": { "paths": "*",    "gate": ["echo gate-rest >> $BLOG"] }
+  }
+} } }
+JSON
+bb sc-1 a/sc-1.txt=1 BRANCH.md=notes; bb sc-2 a/sc-2.txt=2 BRANCH.md=notes2
+bq sc-1; bq sc-2; bapprove sc-1 sc-2
+: > "$BLOG"
+out=$($LOCAL_MERGE_QUEUE land b 2>&1)
+check "two entries that add a BRANCH.md batch, carrying the lanes land computes (a and rest)" '[[ "$out" == *"gated together in one batch, landed in one push: sc-1, sc-2"* && "$(grep -c gate-a "$BLOG")" == 1 && "$(grep -c gate-rest "$BLOG")" == 1 ]]'
+check "…and the scaffolding did not land"                        '[[ ! -f "$ROOT/brepo/BRANCH.md" ]]'
+
+# git older than 2.38 is refused for batching.
+mkdir -p "$ROOT/oldgit"
+cat > "$ROOT/oldgit/git" <<SH
+#!/bin/bash
+[[ "\$1" == "--version" ]] && { echo "git version 2.30.0"; exit 0; }
+exec $(command -v git) "\$@"
+SH
+chmod +x "$ROOT/oldgit/git"
+write_b_config '"batch": {"max": 5},'
+out=$(PATH="$ROOT/oldgit:$PATH" $LOCAL_MERGE_QUEUE land b --batch --dry-run 2>&1); rc=$?
+check "--batch is refused below git 2.38 with a clear message"   '[[ $rc != 0 && "$out" == *"batched landing needs git 2.38 or newer, and this is git 2.30"* ]]'
+out=$(PATH="$ROOT/oldgit:$PATH" $LOCAL_MERGE_QUEUE land b --no-batch --dry-run 2>&1); rc=$?
+check "…and a run without batching is not affected"              '[[ $rc == 0 ]]'
+
+echo
+echo "── interruption: SIGTERM stops the gate and releases everything; SIGKILL leaves a dead lock ──"
+write_b_config '"batch": {"max": 5},'
+bb sg-1 sg-1.txt=1; bb sg-2 sg-2.txt=2
+bq sg-1; bq sg-2; bapprove sg-1 sg-2
+HOLD_MATCH=/batch/b; export HOLD_MATCH; clear_hold; rm -f "$ROOT/gate-pid"
+$LOCAL_MERGE_QUEUE land b > "$ROOT/b-land.out" 2>&1 &
+BG=$!
+wait_for "$ROOT/gate-started"
+gpid=$(cat "$ROOT/gate-pid")
+check "the gate is running, in the batch worktree"               'kill -0 $gpid 2>/dev/null && grep -q "gated together with" <<<"$($LOCAL_MERGE_QUEUE status b 2>&1)"'
+kill -TERM $BG
+wait $BG; rc=$?
+sleep 0.5
+check "SIGTERM ends the run with exit status 143"                '[[ $rc == 143 ]]'
+check "…and the gate's whole process group is gone"              '! kill -0 $gpid 2>/dev/null'
+check "…the landing lock is released"                            '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/b" && ! -e "$LOCAL_MERGE_QUEUE_STATE/queue.lock" ]]'
+check "…no batch mark is left"                                   '! grep -q "\"batch\"" "$LOCAL_MERGE_QUEUE_STATE/queue.json"'
+check "…the entries are still approved, nothing landed, nothing pushed" '[[ "$(qinfo)" == sg-1:approved,sg-2:approved && ! -f "$ROOT/brepo/sg-1.txt" ]]'
+check "…and the next command works at once"                      '[[ "$($LOCAL_MERGE_QUEUE status b 2>&1)" != *LOCKED* ]]'
+# SIGHUP as well (a closed terminal).
+clear_hold; rm -f "$ROOT/gate-pid"
+$LOCAL_MERGE_QUEUE land b > "$ROOT/b-land.out" 2>&1 &
+BG=$!
+wait_for "$ROOT/gate-started"; gpid=$(cat "$ROOT/gate-pid")
+kill -HUP $BG; wait $BG; rc=$?; sleep 0.5
+check "SIGHUP stops the gate and the run as well (exit status 129)" '[[ $rc == 129 ]] && ! kill -0 $gpid 2>/dev/null && [[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/b" ]]'
+# SIGKILL runs nothing: the lock is left, its holder is dead, and the next command clears it.
+clear_hold; rm -f "$ROOT/gate-pid"
+$LOCAL_MERGE_QUEUE land b > "$ROOT/b-land.out" 2>&1 &
+BG=$!
+wait_for "$ROOT/gate-started"; gpid=$(cat "$ROOT/gate-pid")
+kill -KILL $BG; wait $BG 2>/dev/null; sleep 0.3
+st=$($LOCAL_MERGE_QUEUE status b 2>&1)
+check "after SIGKILL the lock is left, and status says its holder died instead of LOCKED" '[[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/b" && "$st" == *"died holding the lock"* && "$st" != *LOCKED* && "$st" != *"gated together"* ]]'
+touch "$ROOT/gate-release"; sleep 0.5; unset HOLD_MATCH; clear_hold   # the orphaned gate of a SIGKILLed run ends on its own
+: > "$BLOG"
+out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
+check "…and the next land breaks the dead lock and clears the marks" '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/brepo/sg-1.txt" && -f "$ROOT/brepo/sg-2.txt" ]]'
+
+echo
+echo "── the batch worktree is made fresh before every batch ──────────────────────"
+# Dependencies survive between batches (node_modules is named in `batch.keep`) as long
+# as the lockfile is unchanged; everything else a gate or an earlier batch left behind goes.
+echo '{}' > "$ROOT/brepo/package-lock.json"
+( cd "$ROOT/brepo" && git add package-lock.json && git commit -qm "lockfile" && git push -q origin main )
+rm -f "$ROOT/setup.log"
+write_b_config '"batch": {"max": 5, "keep": ["node_modules"]}, "setupWhen": "test -f node_modules/marker", "setup": ["echo run >> '"$ROOT"'/setup.log", "mkdir -p node_modules", "echo built > node_modules/marker"],'
+BW="$LOCAL_MERGE_QUEUE_STATE/batch/b"
+bw_batch () {  # two fresh entries, one batch; prints nothing, leaves $out
+  local n="$1"; bb hy-$n-1 hy-$n-1.txt=1; bb hy-$n-2 hy-$n-2.txt=2; bq hy-$n-1; bq hy-$n-2; bapprove hy-$n-1 hy-$n-2
+  out=$($LOCAL_MERGE_QUEUE land b 2>&1)
+}
+bw_batch 1
+check "the first batch builds the worktree, sets it up once, and locks it" '[[ "$out" == *"gated together in one batch, landed in one push: hy-1-1, hy-1-2"* && "$(grep -c run "$ROOT/setup.log")" == 1 && -f "$BW/node_modules/marker" ]] && git -C "$ROOT/brepo" worktree list --porcelain | grep -A3 "batch/b" | grep -q locked'
+# An untracked file an earlier gate left behind is not there for the next batch.
+echo "left by an earlier gate" > "$BW/stale.txt"; echo kept > "$BW/node_modules/survivor.txt"
+bw_batch 2
+check "stale untracked files are removed: a gate that refuses stale.txt passes" '[[ "$out" == *"gated together in one batch, landed in one push: hy-2-1, hy-2-2"* && ! -e "$BW/stale.txt" ]]'
+check "…the named dependency directory survives, and setup does not run again" '[[ -f "$BW/node_modules/survivor.txt" && "$(grep -c run "$ROOT/setup.log")" == 1 ]]'
+# A changed lockfile: the kept directory is removed and setup runs again, even though its probe would pass.
+( cd "$ROOT/brepo" && echo '{"changed": true}' > package-lock.json && git commit -qam "lockfile changes" && git push -q origin main )
+bw_batch 3
+check "a changed lockfile removes the kept dependencies and runs setup again" '[[ "$out" == *"lockfiles differ from the last setup"* && ! -e "$BW/node_modules/survivor.txt" && -f "$BW/node_modules/marker" && "$(grep -c run "$ROOT/setup.log")" == 2 ]]'
+# A rebase left in progress (a killed run) is aborted: without that the next rebase refuses to start.
+bb cx-1 shared.txt=$'one\nX1\nthree\n'; bb cx-2 shared.txt=$'one\nX2\nthree\n'
+git -C "$BW" checkout -q --detach "$(git -C "$ROOT/brepo" rev-parse refs/heads/cx-1)"
+git -C "$BW" -c core.hooksPath=/dev/null rebase "$(git -C "$ROOT/brepo" rev-parse refs/heads/cx-2)" >/dev/null 2>&1
+check "(setup of the test) the batch worktree is stuck mid-rebase"  '[[ -d "$(git -C "$BW" rev-parse --absolute-git-dir)/rebase-merge" || -d "$(git -C "$BW" rev-parse --absolute-git-dir)/rebase-apply" ]]'
+( cd "$ROOT/brepo" && echo main-moves >> base.txt && git commit -qam "main moves" && git push -q origin main )
+bw_batch 4
+check "a rebase left in progress is aborted before the next batch (and the batch needs a rebase)" '[[ "$out" == *"gated together in one batch, landed in one push: hy-4-1, hy-4-2"* && "$out" != *"BATCH FAILED"* ]]'
+# A merge left in progress, with a conflicted tree, is aborted and reset.
+git -C "$BW" checkout -q --detach "$(git -C "$ROOT/brepo" rev-parse refs/heads/cx-1)"
+git -C "$BW" -c core.hooksPath=/dev/null merge --no-ff --no-commit "$(git -C "$ROOT/brepo" rev-parse refs/heads/cx-2)" >/dev/null 2>&1
+check "(setup of the test) the batch worktree is stuck mid-merge, conflicted" '[[ -f "$(git -C "$BW" rev-parse --absolute-git-dir)/MERGE_HEAD" ]]'
+( cd "$ROOT/brepo" && echo main-moves-again >> base.txt && git commit -qam "main moves again" && git push -q origin main )
+bw_batch 5
+check "a merge left in progress is aborted before the next batch"  '[[ "$out" == *"gated together in one batch, landed in one push: hy-5-1, hy-5-2"* && "$out" != *"BATCH FAILED"* ]]'
+# A worktree that cannot be used (a stale index.lock) is rebuilt once, and the run says so.
+touch "$(git -C "$BW" rev-parse --absolute-git-dir)/index.lock"
+( cd "$ROOT/brepo" && echo main-moves-3 >> base.txt && git commit -qam "main moves 3" && git push -q origin main )
+bw_batch 6
+check "a stale index.lock makes the run rebuild the batch worktree once, and say so" '[[ "$out" == *"is unusable — rebuilding it from scratch"* && "$out" == *"gated together in one batch, landed in one push: hy-6-1, hy-6-2"* && -f "$BW/node_modules/marker" ]]'
+check "…and the rebuilt worktree is locked again"                  'git -C "$ROOT/brepo" worktree list --porcelain | grep -A3 "batch/b" | grep -q locked'
+# A broken registration (the .git file gone) is rebuilt the same way.
+rm -f "$BW/.git"
+( cd "$ROOT/brepo" && echo main-moves-4 >> base.txt && git commit -qam "main moves 4" && git push -q origin main )
+bw_batch 7
+check "a worktree with no .git is rebuilt, not silently abandoned"  '[[ "$out" == *"is unusable — rebuilding it from scratch"* && "$out" == *"gated together in one batch, landed in one push: hy-7-1, hy-7-2"* ]]'
+git -C "$ROOT/brepo" branch -q -D cx-1 cx-2 2>/dev/null; git -C "$ROOT/borigin.git" branch -q -D cx-1 cx-2 2>/dev/null
 
 export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
 cd "$ROOT/repo"
