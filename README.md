@@ -5,7 +5,8 @@ against a `main` that moves under them. Coding agents finish a branch and enqueu
 queue instead of merging it. The owner approves the entries that should land. Then
 `local-merge-queue land <repo>` lands each approved branch one at a time, putting it on top of the
 `main` it will actually live on, running a gate you configure, merging `--no-ff`, pushing,
-and removing the worktree and deleting the branch both locally and on the remote.
+and removing the worktree and deleting the branch both locally and on the remote. Where the
+gate takes minutes, an opt-in [batched mode](#batched-landing) gates several entries once.
 
 ## Why
 
@@ -99,12 +100,23 @@ local-merge-queue land myapp
 standing rule that branches land only on the owner's word survives intact. Approval is
 that word. Enqueue freely the moment a branch is genuinely ready.
 
-**Approval is reversible right up to the landing run.** `local-merge-queue unapprove` puts an approved
+**Approval is reversible right up to the merge.** `local-merge-queue unapprove` puts an approved
 entry back to `enqueued`, for a change of mind or one more look before it lands, and it is
 the command to reach for rather than `dequeue`, which takes the entry out of the queue
-altogether and loses the order the branches were meant to land in. Once a branch is
-actually landing, unapprove stops applying. A stalled entry is refused, and `resume` or
+altogether and loses the order the branches were meant to land in. A landing run reads the
+queue again before it publishes and again before it merges, so an entry unapproved or
+dequeued while its gate runs is not landed (the output says so), and nothing the run
+writes brings it back. A stalled entry is refused by `unapprove`, and `resume` or
 `dequeue` govern that one instead.
+
+**The queue is written one change at a time.** Every command that writes the queue file
+(`enqueue`, `approve`, `unapprove`, `order`, `dequeue`, `land`, `resume`) takes a lock, reads
+the file afresh, applies only its own change, and writes it back, so what another process
+wrote meanwhile is never overwritten. A landing run takes minutes, and it is the process most
+likely to meet an `enqueue` or an `approve` from a second session while it works: an entry
+enqueued, approved or reordered during a run is there when the run ends, with its state and
+position. A landing run also picks up an entry approved during the run, and says so. See
+[Safety properties](#safety-properties-and-the-one-thing-it-will-not-protect-you-from).
 
 ## What a branch agent does
 
@@ -410,6 +422,42 @@ tripwire. A failure there is a new task rather than a rollback, since `main` is 
 pushed by design, so that a stall never leaves landed work sitting unbacked-up on the
 machine.
 
+## Batched landing
+
+**Opt-in.** Landing one entry at a time costs one gate per entry, and a gate that takes minutes (or an hour, on a loaded machine) makes N reviewed entries cost N gates. In the pattern of [GitLab merge trains](https://docs.gitlab.com/ee/ci/pipelines/merge_trains.html), GitHub's merge queue and [bors](https://bors.tech), a batch builds the candidate `main` that landing the entries one by one would have built, gates its tip once, and only then lands.
+
+```json
+"batch": { "max": 5 }
+```
+
+- **Per repository**: the `batch` key on the repo's entry (a repo-level key, never a lane's). Absent means off, and a repo without it behaves exactly as it did before this existed. `max` is an integer of at least 2.
+- **Per run**: `local-merge-queue land <repo> --batch` turns it on (a maximum of 5 where the repo has no `batch` key), and `--no-batch` turns it off for one run. Both flags together are refused. `resume` accepts them too.
+- Batching needs `git` 2.38 or newer (it compares trees with `git merge-tree --write-tree`).
+
+**How a batch forms.** At the entry the run is on, the batch is that entry plus the entries that follow it in queue order, up to `max`, stopping before the first entry that:
+
+- is not eligible to land now (not approved, held behind a stall, or waiting on an `after` that has not landed);
+- is enqueued with `--no-rebase`;
+- is already contained in `main` (a cleanup-only entry);
+- carries merge commits that are not in `main`, which is how a branch that merged `main` into itself looks. Such a branch is not rebased when it is current, and a batch rebases, so it is landed on its own as it always was;
+- carries different lanes from the first entry (below).
+
+**What the queue builds.** In a worktree of its own, `<state>/batch/<repo>` (created on first use, kept between runs so its generated environment is set up once), on a detached `HEAD`: each entry is rebased onto the previous result, or left as it is when it already contains it, exactly as `land` decides for a single entry; its `BRANCH.md` is removed; and it is merged `--no-ff`. No entry's own branch moves and nothing is pushed.
+
+**One gate, on the candidate's tip.** The batch runs the setup and the gate of its lanes, each gate once, in the batch worktree. With the gate green, and `origin/<main>` still the commit the candidate was built on (a moved `main` makes the gate result stale), the entries land.
+
+**Landing is the ordinary path.** Each entry is landed exactly as if it had been landed alone, in order: rebased onto the real `main`, its tip published, merged `--no-ff` with its own message and its deploy marker, pushed, its worktree removed, its branch deleted, its pull request retired. Only its own setup and gate are skipped, and only if the tree it would land (`git merge-tree --write-tree main <branch>`) is exactly the tree the batch gated. Any difference (an entry in front of it was unapproved, `main` moved) sends that entry, and the rest of the batch, back to a gate of their own. The final check runs once at the end of the run, as it always did.
+
+**Red, a conflict, or any error: fall back.** If building the candidate conflicts, the gate fails, a setup fails, `main` moves, or anything else goes wrong, nothing has been pushed and no branch has moved. The queue drops the candidate, prints `BATCH FAILED: <why>` and `Falling back to landing <entries> one at a time`, and lands those entries one at a time, so the entry that actually fails is the one that stalls, with its own report, and the entries before it land. A conflict in a protected path is named as the owner's call in that line, and the entry's stall report says so as it always did. The batch is not retried for those entries in the same run.
+
+**Lanes.** A batch holds only entries that carry the same lanes, a lane that an entry only reached through its imports counting separately from one it changed. That keeps the per-lane rules as they are: an entry in a docs-only lane never waits for the gate of an app lane it does not carry, because it is never gated together with an entry that does. In a repo with one lane every entry shares it. A run over a queue of `a`, `a`, `b`, `a` entries batches the first two and lands the others alone.
+
+**The known-red allow-list, protected paths, `--owner-approved`, the deploy marker and the report files work as before.** The candidate's gate sees the allow-list through `$LOCAL_MERGE_QUEUE_KNOWN_RED` like any gate. The deploy marker is decided at each entry's real merge, so the first entries of a batch carry it and the last does not; the end-of-run settle is unchanged. A stall in an entry of the batch is recorded and reported as for any entry.
+
+**What it shows.** `land --dry-run` prints each batch it would form, its entries and the gate steps it would run once, without building anything (the rebase results are not known until the run). A live run prints `batch gated once: <entries>`, and `status` shows `gated together with: <entries>` on each entry of a batch from the moment the candidate is built until the entry lands or the run ends. The final summary lists the batches.
+
+**What a batch trades away.** One gate verdict covers several entries, so a red candidate costs the batch's gate and then each entry's own gate (a failed batch is slower than not batching). Batching pays where entries mostly pass, which is when the gate is slow and the entries have been reviewed already. An entry that fails is found by the fallback, never skipped.
+
 ## The already-merged backlog
 
 A branch that is **already contained in `main`**, merged by hand before the merge queue
@@ -530,6 +578,14 @@ A repo with no `lanes` key behaves exactly as before. `loadConfig` gives it one 
 
 - One land per repo at a time, enforced by an atomic `mkdir` lock. A lock whose holder
   died is broken automatically, and the merge queue says so when it breaks one.
+- The queue file has a lock of its own, held for milliseconds around each write (a
+  read-modify-write: the file is read under the lock, one command's change is applied, and
+  the file is replaced by a rename, so a reader never meets half a queue). It is a directory
+  made with `mkdir`, like the repo lock, and a dead holder cannot keep it: it is broken when
+  its process is gone, when a live process has held it for over a minute (a critical section
+  runs no git command and no gate), or when it has no owner and has sat untouched for five
+  seconds. A command waits up to 30 seconds for it. A queue file that exists and cannot be
+  parsed stops the command with the path, and is never read as an empty queue.
 - It refuses to land a repo whose primary checkout is dirty or off `main`, naming what is
   dirty, so that another session's in-flight edit is never swept into a landing.
 - A push failure rolls the local merge back rather than leaving `main` ahead of `origin`.
@@ -638,6 +694,15 @@ already merged `main`, and the enqueue-then-approve lifecycle with a reversible 
 Whether you need any of those is the question worth asking, because if you do not, several
 of the tools below are better maintained than this one.
 
+Merge trains are not among them. GitLab's merge trains, GitHub's merge queue (which groups up
+to a configured number of pull requests per check run) and bors batch several changes behind
+one run of the checks, and [batched landing](#batched-landing) here is the same idea: build the
+candidate `main` the changes would make one after another, run the gate on its tip once, land
+them in order on green, and bisect by falling back on red. This tool falls back to one at a time
+rather than bisecting, because a stall in a named entry's worktree, with a report for its author,
+is the thing it exists to give. Where the others batch across everything the checks cover, this
+one batches only entries that carry the same lanes.
+
 The field splits three ways:
 
 - **Hosted queues gate on CI check runs and require a GitHub App.** [Graphite](https://graphite.dev)
@@ -704,7 +769,7 @@ dequeued after a stall, where the next landing run republishes the tip with an e
 carrying no marker. Then the stacked-PR retarget, against a `gh` stubbed on `PATH` so that
 nothing here reaches GitHub: the PR moved onto `main` by a real `gh pr edit --base` argv,
 that call landing *before* the branch deletion rather than after it, and a `gh` that refuses
-the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. Then the deploy marker lane by lane, on a fourth fixture repo where lane `a` carries `deploy` and lane `b` does not: three entries in the order `a1`, `b1`, `a2` landing as marked, unmarked, unmarked, with `--dry-run` naming the lane; a run of `b` entries alone writing no marker and no republish; an `a` entry stalling behind a marked `a` merge while a `b` merge lands over it, `status` reporting the undeployed lane, and the next `land` after the dequeue republishing with one empty commit that carries no marker; a second `land` and a later `b` merge adding no further republish; a marker shared by two lanes written once; and an entry in two lanes with their own markers carrying both, with one empty commit settling both lanes. Then `--no-rebase` on the first fixture repo: the flag recorded and shown by `status` and `--dry-run`; a branch that merged current `main` landing with its own merge commit and the `--no-ff` landing merge; `main` moving under a second branch stalling the run with the reason, no rebase started and the branch unmoved, and a report that says to merge; `resume` stalling it again until the fixer runs `git merge origin/main`, then landing it. Then lane reach on a fifth fixture (a site file a test of the app bundles putting the app lane in the entry as reached, `status` marking it, the reach gate and not the full gate running for it, a reach command that cannot answer counting the lane as reached, a reach with no `when` refused) and the known-red allow-list on a sixth (the print, the file handed to the gate steps, and the expired, refused, invalid, missing-refuse-file and over-limit states). 254 assertions.
+the query leaving the branch landed and the worktree cleaned up regardless. Then lanes, on a second fixture repo with two lanes and a `shared` prefix: an entry in one lane, in both, in all of them through `shared`, in the `"*"` lane through an unclaimed path, and with none when it is cleanup-only; `status` and `--dry-run` showing them; `land` computing them again after the rebase; the gate of each touched lane running and no other; and the config errors, a repo-level gate key beside `lanes`, two `"*"` lanes, and an unclaimed path in a repo with no `"*"` lane. Then stalls on a third fixture repo with lanes `a` and `b`: an `a`-lane entry stalling on a rebase conflict while the `b`-lane entries queued behind it land in the same run and exit 2; the `a`-lane, both-lane and `shared` entries behind it held, and a cleanup-only entry landing past it; each lane's setup and final check running only for a lane that landed; a gate failure naming its lane; `land` refusing once every lane is held; `resume` reporting an entry still mid-rebase, leaving it stalled and landing the fixed stall in the other lane; and, once the fixer resolves, `resume` rebasing the entry again onto the `main` that moved under it and landing the held entries in queue order, with both gates of a two-lane or `shared` entry running in config order. Then the deploy marker lane by lane, on a fourth fixture repo where lane `a` carries `deploy` and lane `b` does not: three entries in the order `a1`, `b1`, `a2` landing as marked, unmarked, unmarked, with `--dry-run` naming the lane; a run of `b` entries alone writing no marker and no republish; an `a` entry stalling behind a marked `a` merge while a `b` merge lands over it, `status` reporting the undeployed lane, and the next `land` after the dequeue republishing with one empty commit that carries no marker; a second `land` and a later `b` merge adding no further republish; a marker shared by two lanes written once; and an entry in two lanes with their own markers carrying both, with one empty commit settling both lanes. Then `--no-rebase` on the first fixture repo: the flag recorded and shown by `status` and `--dry-run`; a branch that merged current `main` landing with its own merge commit and the `--no-ff` landing merge; `main` moving under a second branch stalling the run with the reason, no rebase started and the branch unmoved, and a report that says to merge; `resume` stalling it again until the fixer runs `git merge origin/main`, then landing it. Then lane reach on a fifth fixture (a site file a test of the app bundles putting the app lane in the entry as reached, `status` marking it, the reach gate and not the full gate running for it, a reach command that cannot answer counting the lane as reached, a reach with no `when` refused) and the known-red allow-list on a sixth (the print, the file handed to the gate steps, and the expired, refused, invalid, missing-refuse-file and over-limit states). Then the queue file, on a seventh fixture with a gate the test holds open: an entry enqueued, approved and reordered from a second process while a run is gated is still there with its state and position when the run stalls, and when it lands (where the entry approved behind it is picked up and the output says so); an entry unapproved or dequeued while the run is on it, or while it is in a batch, is not landed and not revived; six enqueues and six approvals racing leave all six; a lock held by a dead process, one with no owner, and one a live process has held over a minute are each broken, a fresh live lock is respected, and an unreadable queue file stops the command instead of being replaced. Then batched landing on the same fixture: off by default, `--no-batch` over the config, `--batch` where the config has no key, both flags refused, a `max` below 2 refused; a green batch of three landing three merge commits in order with one gate run and a `--dry-run` that shows it and runs nothing; a batch whose second entry fails the gate falling back, landing the first, stalling the second and leaving the third approved, with nothing of it pushed first; a conflict between two entries, and in a protected path; `max`, a non-approved entry, a `--no-rebase` entry and a branch carrying merge commits each ending a batch; an entry unapproved while the batch is gated, with the entry behind it gated on its own; the deploy marker on a batch; and, on a lanes config, entries in different lanes batching only with their own kind. 329 assertions.
 Run it before changing anything.
 
 ```sh
