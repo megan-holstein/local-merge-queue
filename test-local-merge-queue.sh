@@ -2232,6 +2232,21 @@ r3_unhold c3
 check "(setup of the test) the orphaned gate has ended"                                   '! kill -0 -- -$pgid 2>/dev/null'
 out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
 check "once the gate has ended the next land breaks the stale lock and lands the entry"  '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/c3/held.txt" ]] && r3_main_eq c3'
+
+echo
+echo "── round 3 · a branch name with a slash does not crash the stall report ────"
+# THE DEFECT (reviewer, finding 4): the report path was built from the branch name without creating
+# the folder the slash implies, so a stall threw ENOENT, exited 1 and left no report.
+r3_init c4
+r3_config c4 '"gate": ["false"], "finalCheck": "true"'
+r3_branch c4 feat/x x.txt=1
+r3_queue c4 feat/x
+out=$($LOCAL_MERGE_QUEUE land c4 2>&1); rc=$?
+check "a stall on a branch named feat/x exits 2, not with an uncaught exception"         '[[ $rc == 2 && "$out" != *ENOENT* && "$out" == *STALLED* ]]'
+check "…the report exists, under a file name with no slash in it"                        '[[ -f "$LOCAL_MERGE_QUEUE_STATE/reports/c4-feat%2Fx.md" && "$out" == *"c4-feat%2Fx.md"* ]]'
+check "…and the entry is recorded as stalled"                                            '[[ "$(r3_qinfo)" == "feat/x:stalled" ]]'
+out=$($LOCAL_MERGE_QUEUE land c4 2>&1)
+check "a second land names the same report"                                              '[[ "$out" == *"c4-feat%2Fx.md"* ]]'
 # ROUND3-END
 
 echo

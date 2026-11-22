@@ -31,6 +31,9 @@ const STATE_DIR = process.env.LOCAL_MERGE_QUEUE_STATE || path.join(XDG_STATE, 'l
 const QUEUE_PATH = path.join(STATE_DIR, 'queue.json')
 const LOCK_DIR = path.join(STATE_DIR, 'locks')
 const REPORT_DIR = path.join(STATE_DIR, 'reports')
+// A branch name may contain `/` (feat/x), which a file name cannot, so the report's name
+// carries it as %2F: one flat file per entry, whatever the branch is called.
+const reportFile = (key, branch) => path.join(REPORT_DIR, `${key}-${branch.replaceAll('/', '%2F')}.md`)
 const QUEUE_LOCK = path.join(STATE_DIR, 'queue.lock')
 const BATCH_DIR = path.join(STATE_DIR, 'batch')
 
@@ -1306,7 +1309,7 @@ function settleDeploy (repo, dryRun, blocked = new Set()) {
  */
 function writeStallReport (repo, entry, kind, detail, conflicted, ownerCall, fixSteps = [], { behindMain = false } = {}) {
   fs.mkdirSync(REPORT_DIR, { recursive: true })
-  const file = path.join(REPORT_DIR, `${repo.key}-${entry.branch}.md`)
+  const file = reportFile(repo.key, entry.branch)
   const midRebase = rebaseInProgress(entry.worktree)
   const clearIt = behindMain
     ? `**This branch was enqueued with \`--no-rebase\`, so the queue started no rebase.**
@@ -2156,8 +2159,8 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   if (stalledNow.length && !resuming && Object.keys(repo.lanes).every(n => blocked.has(n))) {
     const stalled = stalledNow[0]
     die(`${key} is stalled on "${stalled.branch}" — resolve it, then: local-merge-queue resume ${key}\n` +
-        `  report: ${path.join(REPORT_DIR, `${key}-${stalled.branch}.md`)}` +
-        stalledNow.slice(1).map(e => `\n  also stalled on "${e.branch}" — report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`).join(''))
+        `  report: ${reportFile(key, stalled.branch)}` +
+        stalledNow.slice(1).map(e => `\n  also stalled on "${e.branch}" — report: ${reportFile(key, e.branch)}`).join(''))
   }
 
   const problems = preflight(repo)
@@ -2745,7 +2748,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   console.error(red(`\n${bold('stalled')} ${stalledAtEnd.length} branch(es) in ${key}:`))
   for (const e of stalledAtEnd) {
     console.error(red(`  · ${e.branch} [${queueLanesOf(repo, e).join(', ')}] — ${e.stallReason || 'stalled'}`))
-    console.error(dim(`    report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`))
+    console.error(dim(`    report: ${reportFile(key, e.branch)}`))
   }
   const waiting = Object.keys(repo.lanes).filter(n => blockedLanes(repo, stalledAtEnd).has(n))
   console.error(dim(`  Entries in ${lanePhrase(waiting)} wait behind ${stalledAtEnd.length === 1 ? 'this stall' : 'these stalls'}; entries in other lanes keep landing.`))

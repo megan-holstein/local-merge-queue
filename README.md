@@ -253,7 +253,7 @@ conflicts. Being behind is the case the merge queue was built for, and it is unt
 
 **It stalls; it does not evict.** On a rebase conflict or a gate failure the merge queue
 stops where it stands, leaves the rebase in progress in that worktree, writes a report to
-`<state>/reports/<repo>-<branch>.md`, and exits 2. Nothing behind it lands out of order — which is
+`<state>/reports/<repo>-<branch>.md` (a `/` in the branch name is written as `%2F`, so `feat/x` reports to `<repo>-feat%2Fx.md`), and exits 2. Nothing behind it lands out of order — which is
 deliberate. Branches that are in flight together usually overlap, so landing one of them
 out of order relocates a conflict rather than avoiding it.
 
