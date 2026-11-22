@@ -414,6 +414,8 @@ exactly the content that will land. Make it cheap and make it narrow. The right 
 is what would reach a user as a broken payment, a broken sign-in, or a missing feature —
 and minutes added to a gate are paid on every single landing.
 
+**The merge is bound to the commit the gate ran on.** After the setup, the run records the branch's commit and the worktree's status. After the gate, and again right before the merge, it checks both: an entry whose branch moved, whose worktree's HEAD moved, or whose tracked files differ from the record (an edit, a staged change, a deletion) stalls with `changed during the gate: …` and a report, and nothing is published or merged. The publish and the merge name the recorded commit and never the branch ref, so a commit made in the worktree while the gate ran cannot land ungated. An untracked file is not a change to what lands, since only commits land; cleanup is what keeps such a file safe (see [Cleanup](#cleanup-and-what-happens-when-it-fails)). `resume` gates the entry again.
+
 The **final check** runs once, in the primary checkout, after the whole batch has landed.
 It reports rather than gates, because each entry already passed the gate on its own
 content. A repo whose full test sweep takes minutes puts the sweep in the gate, where a red

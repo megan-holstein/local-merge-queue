@@ -950,6 +950,50 @@ function preflight (repo) {
   return problems
 }
 
+// ─── what the gate vouched for ──────────────────────────────────────────────
+
+/**
+ * THE GATE'S CLAIM IS THAT IT RAN ON EXACTLY WHAT WILL LAND, so the merge is bound
+ * to the commit the gate ran on and not to whatever the branch ref holds later.
+ *
+ * Found by the independent re-check of 2026-11-21: a commit made in the entry's
+ * worktree during the gate (which takes minutes, and on a loaded machine an hour)
+ * moved the branch, and the merge, which named the branch, landed a tree the gate
+ * had never seen. So after the setup, and before the gate runs, the run records
+ * the branch's commit and the worktree's status; after the gate and again right
+ * before the merge it asks whether either changed, and stalls the entry if so; and
+ * the publish and the merge name the recorded commit, never the branch.
+ *
+ * What counts as a change in the worktree is a tracked file that differs from the
+ * record (an edit, a staged change, a deletion). An untracked file is not a change
+ * to what lands, since only commits land, and it does not stall the entry; cleanup
+ * is what keeps such a file safe (`cleanupLanded`).
+ */
+const statusLines = wt => gitTry(['status', '--porcelain'], wt).out.split('\n').filter(Boolean)
+const trackedOnly = lines => lines.filter(l => !l.startsWith('??'))
+
+function recordBinding (repo, entry, wt) {
+  const head = gitTry(['rev-parse', 'HEAD'], wt)
+  const ref = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
+  if (!head.ok || !ref.ok || head.out !== ref.out) return { error: `the worktree is not on the tip of ${entry.branch}` }
+  return { sha: head.out, status: statusLines(wt) }
+}
+
+// Why the gate no longer vouches for what would land, or null.
+function bindingBroken (repo, entry, wt, rec) {
+  const short = s => s.slice(0, 9)
+  const ref = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
+  if (!ref.ok) return `the branch ${entry.branch} is gone`
+  if (ref.out !== rec.sha) return `${entry.branch} moved from ${short(rec.sha)}, the commit the gate ran on, to ${short(ref.out)}`
+  const head = gitTry(['rev-parse', 'HEAD'], wt)
+  if (!head.ok || head.out !== rec.sha) return `the worktree's HEAD moved from ${short(rec.sha)}, the commit the gate ran on, to ${head.ok ? short(head.out) : '(unreadable)'}`
+  const was = trackedOnly(rec.status)
+  const now = trackedOnly(statusLines(wt))
+  const differ = [...now.filter(l => !was.includes(l)), ...was.filter(l => !now.includes(l))]
+  if (differ.length) return `tracked files in the worktree changed (${differ.map(l => l.trim()).join('; ')})`
+  return null
+}
+
 // ─── the worktree's generated environment ───────────────────────────────────
 
 /**
@@ -2125,6 +2169,19 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   const stallLine = e => multiLane(repo)
     ? `Entries in ${lanePhrase(queueLanesOf(repo, e))} wait behind it; entries in other lanes keep landing.`
     : null
+  // A stall found after the gate has passed (the gate's claim no longer holds). Records it,
+  // writes the report and says so; returns 'end' when the run ends here (a one-lane repo)
+  // and 'next' when the loop goes on to the entries in other lanes.
+  const stallAfterGate = (entry, reason, kind, detail, fixSteps, headline) => {
+    if (!recordStall(entry, { status: 'stalled', ownerCall: false, stallReason: reason })) return 'next'
+    const file = writeStallReport(repo, entry, kind, detail, [], false, fixSteps)
+    console.error(red(`\n  STALLED — ${headline}`))
+    console.error(`  report: ${file}`)
+    if (!multiLane(repo)) return 'end'
+    console.error(dim(`  ${stallLine(entry)}`))
+    held.add(entry.branch)
+    return 'next'
+  }
   try {
     while (true) {
       const q2 = loadQueue()
@@ -2222,6 +2279,9 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
       // Lanes of the entry being landed, set at step 2a; the final check reads
       // them once the merge is pushed.
       let runLanes = []
+      // What the gate ran on: the branch's commit and the worktree's status, recorded
+      // after the setup (see `recordBinding`).
+      let binding = null
 
       if (alreadyIn) {
         console.log(dim(`  already contained in ${repo.mainBranch} — cleanup only, no merge`))
@@ -2417,6 +2477,18 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           continue
         }
 
+        // 2d. WHAT THE GATE WILL RUN ON IS RECORDED HERE: the branch's commit and the
+        //     worktree's status. The publish and the merge name this commit, and the
+        //     entry stalls if the branch or the worktree has changed by then.
+        binding = recordBinding(repo, entry, wt)
+        if (binding.error) {
+          const s = stallAfterGate(entry, binding.error, 'the worktree is not on its branch',
+            `${binding.error}, so the gate would not run on the commit that would land.`,
+            ['git status', `git checkout ${entry.branch}`], `${binding.error} (${entry.branch})`)
+          if (s === 'end') return { landed, stalledOn: entry.branch }
+          continue
+        }
+
         // 3. The gate: what would break a writer, run on exactly what will land.
         let gateOK = true
         let gateFailed = null
@@ -2447,6 +2519,21 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         //     entry unapproved or dequeued in that time is not landed.
         if (withdrawn(entry)) continue
 
+        // 3a'. THE BRANCH AND THE WORKTREE ARE WHAT THE GATE RAN ON, or the gate's
+        //      verdict is about something that will not land.
+        const bound = () => {
+          const broke = bindingBroken(repo, entry, wt, binding)
+          if (!broke) return 'ok'
+          return stallAfterGate(entry, `changed during the gate: ${broke}`, 'the branch or its worktree changed during the gate',
+            `${broke}.\n\nThe gate ran on ${binding.sha}, so the gate did not see what would land. Nothing was published or merged.`,
+            ['git status', `git log --oneline origin/${repo.mainBranch}..${entry.branch}`,
+             '# take out or commit what changed (the gate runs again on resume), then resume'],
+            `${entry.branch} changed during the gate — ${broke}`)
+        }
+        let b = bound()
+        if (b === 'end') return { landed, stalledOn: entry.branch }
+        if (b === 'next') continue
+
         // 3b. PUBLISH THE REBASED TIP BEFORE THE MERGE. Not optional bookkeeping:
         //     the pull request is the roster now, and this is the one step that
         //     lets it retire itself honestly.
@@ -2462,7 +2549,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         //     --force-with-lease and not --force: the fetch at step 1 made the
         //     remote-tracking ref current, so the lease refuses exactly when it
         //     should — somebody pushed to the branch after the landing run began.
-        const pub = gitTry(['push', '--force-with-lease', 'origin', `${entry.branch}:${entry.branch}`], wt)
+        const pub = gitTry(['push', '--force-with-lease', 'origin', `${binding.sha}:refs/heads/${entry.branch}`], wt)
         if (pub.ok) {
           console.log(dim(current
             ? '  tip published (its PR will close as merged)'
@@ -2496,8 +2583,12 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           if (more && !markers.includes(marker)) markers.push(marker)
         }
         if (withdrawn(entry)) continue
+        b = bound()
+        if (b === 'end') return { landed, stalledOn: entry.branch }
+        if (b === 'next') continue
         const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${markers.map(m => ` ${m}`).join('')}`
-        const mg = gitTry(['merge', '--no-ff', '-m', msg, entry.branch], repo.checkout)
+        // THE GATED COMMIT IS WHAT MERGES, not whatever the branch ref holds now.
+        const mg = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
 
         const push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)

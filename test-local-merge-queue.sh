@@ -3,7 +3,7 @@
 # Nothing here touches a real repo.
 set -u
 
-ROOT="$(mktemp -d /tmp/local-merge-queue-test.XXXXXX)"
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/local-merge-queue-test.XXXXXX")"
 export LOCAL_MERGE_QUEUE_STATE="$ROOT/state"
 export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/repos.json"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2032,8 +2032,128 @@ git -C "$ROOT/brepo" branch -q -D cx-1 cx-2 2>/dev/null; git -C "$ROOT/borigin.g
 export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
 cd "$ROOT/repo"
 
+# ROUND3-BEGIN
+echo
+echo "════ round 3: the fixes after the independent re-check ════════════════"
+# Each block below builds a repository of its own (a bare origin, a primary checkout and a
+# second clone that stands for a bot or another session) and points the tool at a state
+# directory and a config of its own, so no block depends on another's leftovers.
+export ROOT
+r3_wait () { local i; for i in $(seq 1 300); do [[ -e "$1" ]] && return 0; sleep 0.2; done; return 1; }
+r3_env () { export LOCAL_MERGE_QUEUE_STATE="$ROOT/$1-state" LOCAL_MERGE_QUEUE_CONFIG="$ROOT/$1-repos.json"; }
+r3_init () {  # name: origin, primary checkout (lanes' folders a/, b/, other/), a second clone
+  local n="$1"
+  git init -q --bare "$ROOT/$n-origin.git"
+  git init -q -b main "$ROOT/$n"
+  ( cd "$ROOT/$n" && git config user.email t@t.t && git config user.name T && git remote add origin "$ROOT/$n-origin.git" \
+    && mkdir -p a b other && echo base > base.txt && echo a > a/f.txt && echo b > b/f.txt && echo o > other/f.txt \
+    && git add -A && git commit -qm base && git push -qu origin main )
+  git clone -q "$ROOT/$n-origin.git" "$ROOT/$n-other" 2>/dev/null
+  git -C "$ROOT/$n-other" config user.email t@t.t; git -C "$ROOT/$n-other" config user.name T
+  r3_env "$n"
+}
+r3_config () {  # name, then the rest of the repo entry as JSON members (no braces)
+  local n="$1"; shift
+  printf '{ "repos": { "%s": { "checkout": "%s", %s } } }\n' "$n" "$ROOT/$n" "$1" > "$ROOT/$n-repos.json"
+}
+r3_wt () { echo "$ROOT/$1-${2//\//-}"; }
+r3_branch () {  # repo, branch, file=content ...  (the worktree is $ROOT/<repo>-<branch, with / as ->)
+  local n="$1" b="$2"; shift 2
+  local wt; wt="$(r3_wt "$n" "$b")"
+  git -C "$ROOT/$n" worktree add -q "$wt" -b "$b" >/dev/null 2>&1
+  local pair; for pair in "$@"; do mkdir -p "$(dirname "$wt/${pair%%=*}")"; printf '%s' "${pair#*=}" > "$wt/${pair%%=*}"; done
+  ( cd "$wt" && git add -A && git commit -qm "$b" && git push -qu origin "$b" 2>/dev/null )
+}
+r3_queue () {  # repo, branch...: enqueue each from its worktree, then approve them
+  local n="$1"; shift; local b
+  for b in "$@"; do ( cd "$(r3_wt "$n" "$b")" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1 ); done
+  $LOCAL_MERGE_QUEUE approve "$@" --repo "$n" >/dev/null 2>&1
+}
+r3_qinfo () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));console.log(q.entries.map(e=>e.branch+":"+e.status).join(","))'; }
+r3_gates () { local n; n=$(grep -c '^gate-run' "$ROOT/$1-gate.log" 2>/dev/null); echo "${n:-0}"; }
+r3_main_eq () { [[ "$(git -C "$ROOT/$1" rev-parse main)" == "$(git -C "$ROOT/$1-origin.git" rev-parse main)" ]]; }
+# A gate that records its runs. While <repo>-hold exists it announces itself (<repo>-gate-started,
+# <repo>-gate-pid) and waits for <repo>-release; it fails while <repo>-fail exists.
+cat > "$ROOT/r3-gate.sh" <<'SH'
+#!/bin/bash
+n="$1"
+echo "gate-run $(basename "$PWD")" >> "$ROOT/$n-gate.log"
+if [ -e "$ROOT/$n-hold" ]; then
+  echo $$ > "$ROOT/$n-gate-pid"; touch "$ROOT/$n-gate-started"
+  for i in $(seq 1 600); do [ -e "$ROOT/$n-release" ] && break; sleep 0.2; done
+fi
+[ ! -e "$ROOT/$n-fail" ]
+SH
+r3_hold () { rm -f "$ROOT/$1-release" "$ROOT/$1-gate-started" "$ROOT/$1-gate-pid" "$ROOT/$1-fail"; touch "$ROOT/$1-hold"; }
+r3_unhold () { rm -f "$ROOT/$1-hold" "$ROOT/$1-release" "$ROOT/$1-gate-started" "$ROOT/$1-fail"; }
+r3_gate_step () { echo "bash $ROOT/r3-gate.sh $1"; }
+# The origin's pre-receive hook: it logs every ref pushed (<repo>-refs.log) and, when
+# <repo>-hook.sh exists, runs it with the ref and the new value, so a test can act at a chosen push.
+r3_hook () {  # repo
+  cat > "$ROOT/$1-origin.git/hooks/pre-receive" <<SH
+#!/bin/bash
+while read old new ref; do
+  echo "\$ref \$new" >> "$ROOT/$1-refs.log"
+  [ -e "$ROOT/$1-hook.sh" ] && . "$ROOT/$1-hook.sh"
+done
+exit 0
+SH
+  chmod +x "$ROOT/$1-origin.git/hooks/pre-receive"
+}
+
+echo
+echo "── round 3 · the merge is bound to the commit the gate ran on ──────────────"
+# THE DEFECT (reviewer, finding 1): the merge took whatever the branch ref held when it ran, so
+# a commit made in the worktree during the gate landed without the gate having seen it.
+r3_init c1
+r3_config c1 "\"gate\": [\"$(r3_gate_step c1)\"], \"finalCheck\": \"true\""
+r3_branch c1 sneak sneak.txt=gated
+r3_queue c1 sneak
+before=$(git -C "$ROOT/c1-origin.git" rev-parse main)
+r3_hold c1; : > "$ROOT/c1-gate.log"
+$LOCAL_MERGE_QUEUE land c1 > "$ROOT/c1-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c1-gate-started"
+( cd "$(r3_wt c1 sneak)" && echo ungated > sneaky.txt && git add -A && git commit -qm "made while the gate ran" )
+touch "$ROOT/c1-release"; wait $BG; rc=$?
+out=$(cat "$ROOT/c1-land.out"); r3_unhold c1
+check "a commit made in the worktree during the gate stalls the entry (exit 2)"       '[[ $rc == 2 && "$out" == *"changed during the gate"* && "$(r3_qinfo)" == sneak:stalled ]]'
+check "…and neither the gated work nor the ungated commit reached main or origin"     '[[ "$(git -C "$ROOT/c1" rev-parse main)" == "$before" && "$(git -C "$ROOT/c1-origin.git" rev-parse main)" == "$before" && ! -e "$ROOT/c1/sneaky.txt" && ! -e "$ROOT/c1/sneak.txt" ]]'
+check "…and the worktree, with the commit, is left for its author"                    '[[ -f "$(r3_wt c1 sneak)/sneaky.txt" ]] && git -C "$ROOT/c1" rev-parse --verify -q refs/heads/sneak >/dev/null'
+check "…and the stall report says the gate did not see what would land"               'grep -q "did not see what would land" "$LOCAL_MERGE_QUEUE_STATE/reports/c1-sneak.md"'
+# The author takes the commit out, the entry resumes, is gated again, and lands the gated content.
+( cd "$(r3_wt c1 sneak)" && git reset -q --hard HEAD~1 )
+: > "$ROOT/c1-gate.log"
+$LOCAL_MERGE_QUEUE resume c1 >/dev/null 2>&1; rc=$?
+check "resume gates the entry again and lands it"                                      '[[ $rc == 0 && "$(r3_gates c1)" == 1 && -f "$ROOT/c1/sneak.txt" && ! -e "$ROOT/c1/sneaky.txt" ]]'
+# An uncommitted edit of a tracked file made during the gate is a change too.
+r3_branch c1 edited edited.txt=gated
+r3_queue c1 edited
+r3_hold c1; : > "$ROOT/c1-gate.log"
+$LOCAL_MERGE_QUEUE land c1 > "$ROOT/c1-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c1-gate-started"
+echo "edited while the gate ran" >> "$(r3_wt c1 edited)/edited.txt"
+touch "$ROOT/c1-release"; wait $BG; rc=$?
+out=$(cat "$ROOT/c1-land.out"); r3_unhold c1
+check "an uncommitted edit of a tracked file during the gate stalls the entry too"    '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c1/edited.txt" ]]'
+# What merges is the gated commit itself: the second parent of the merge is the tip that was published.
+$LOCAL_MERGE_QUEUE dequeue edited --repo c1 >/dev/null 2>&1
+r3_hook c1; : > "$ROOT/c1-refs.log"
+r3_branch c1 plain plain.txt=gated
+r3_queue c1 plain
+$LOCAL_MERGE_QUEUE land c1 >/dev/null 2>&1
+check "the merge's second parent is the tip the run published, which is the commit the gate ran on" '[[ -n "$(grep "^refs/heads/plain " "$ROOT/c1-refs.log")" && "$(git -C "$ROOT/c1" rev-parse main^2)" == "$(grep "^refs/heads/plain " "$ROOT/c1-refs.log" | grep -v " 0000000" | tail -1 | cut -d" " -f2)" ]]'
+# ROUND3-END
+
 echo
 echo "════════════════════════════════════════════════════════════════"
 echo "  passed $PASS   failed $FAIL"
-echo "  sandbox left at $ROOT"
+# The sandbox is removed by its exact path when everything passed (it is a directory this script
+# created with mktemp, and nothing else); after a failure it is left for inspection.
+if [[ $FAIL == 0 && -n "$ROOT" && "$(basename "$ROOT")" == local-merge-queue-test.* && -d "$ROOT" ]]; then
+  cd /; rm -rf -- "$ROOT"; echo "  sandbox removed"
+else
+  echo "  sandbox left at $ROOT"
+fi
 [[ $FAIL == 0 ]]
