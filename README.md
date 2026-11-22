@@ -472,6 +472,15 @@ What this means for what reaches `origin`: the batch's **final tree was gated**;
 
 **What a batch trades away.** One gate verdict covers several entries, so a red candidate costs the batch's gate and then each entry's own gate (a failed batch is slower than not batching), and the intermediate merges are not gated alone. Batching pays where entries mostly pass, which is when the gate is slow and the entries have been reviewed already. An entry that fails is found by the fallback, never skipped.
 
+## When origin's `main` moves during the gate
+
+A gate takes minutes, and on a loaded machine most of an hour, and `main` on origin can move meanwhile through a push from outside the queue (a scheduled bot, a person). The push of `main` is then rejected as a non-fast-forward, and the gate's verdict would have to be paid for again. On 2026-11-22 a 54-minute gate passed and was lost this way, to one bot commit that changed one data file outside every lane the gate covered. The rule is conservative:
+
+- When the push is rejected, the run fetches. If `origin/<main>` is where the run left it, the push failed for another reason: the merge is rolled back and the run stops, as before.
+- If it moved, local `main` goes back to `origin/<main>`, and each new commit is read by its own changes (against each parent, for a merge). **If every new commit changes only paths that belong to no lane this entry gated, the merge is redone on the new `main` without a new gate and pushed**, at most twice. The merge is still of the gated commit, and the binding checks (above) still hold before each redo. A path belongs to a lane by the lanes' own rules (`paths`, `shared` and the `"*"` lane; a path no lane claims belongs to none, so counts as outside), and a gated lane with a `reach` rule is also asked about the commit's paths, since a path outside the lane can be one its tests read.
+- In every other case the entry stalls: a commit touches a lane the entry gated or reaches it, `origin/<main>` was rewritten, it moved again after two redos, the merge could not be redone, or the binding no longer holds. The stall reason is `main moved under a passing gate: <sha subject>, … — <why a redo was not allowed>`, the report lists each new commit with its files, and `resume` rebases the entry onto the new `main` and gates it again. Nothing of the entry reached `main`.
+- A one-lane repo has one lane that takes every path, so any commit on `origin/<main>` during the gate stalls the entry there.
+
 ## The already-merged backlog
 
 A branch that is **already contained in `main`**, merged by hand before the merge queue
