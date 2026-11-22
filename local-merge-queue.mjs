@@ -139,8 +139,14 @@ for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) 
 
 // A gate step, setup step or final check with live output, in a process group of
 // its own. Asynchronous, so that a signal is handled while it runs.
-function runGate (cmd, cwd, env = {}) {
+// `timeoutMs` (from the repository's or lane's `gateTimeoutMinutes`) ends a step that runs
+// longer: its process group gets SIGTERM, then SIGKILL five seconds later, and the step
+// counts as failed, with `gateTimedOut` set for the caller to say so. A gate that hangs
+// would otherwise hold the landing lock for ever, since a live holder is never broken.
+let gateTimedOut = false
+function runGate (cmd, cwd, env = {}, { timeoutMs = 0 } = {}) {
   return new Promise(resolve => {
+    gateTimedOut = false
     // Once a signal has come in, nothing more is started and nothing downstream of a
     // killed gate runs (a fallback, a stall report): the promise never settles and the
     // signal handler ends the process.
@@ -148,10 +154,34 @@ function runGate (cmd, cwd, env = {}) {
     const child = spawn('bash', ['-lc', cmd], { cwd, stdio: 'inherit', env: { ...process.env, ...env }, detached: true })
     gateGroups.add(child.pid)
     noteGateGroup(child.pid)
-    child.on('error', () => { gateGroups.delete(child.pid); noteGateGroup(null); if (!signalled) resolve(false) })
-    child.on('close', code => { gateGroups.delete(child.pid); noteGateGroup(null); if (!signalled) resolve(code === 0) })
+    let timedOut = false
+    let timer = null
+    const finish = ok => { clearTimeout(timer); gateGroups.delete(child.pid); noteGateGroup(null); if (!signalled) resolve(ok) }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true
+        gateTimedOut = true
+        console.error(yellow(`\n  local-merge-queue: the step ran past its limit of ${fmtMinutes(timeoutMs / 60000)} — ending it`))
+        try { process.kill(-child.pid, 'SIGTERM') } catch { /* gone */ }
+        setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL') } catch { /* gone */ } }, 5000).unref()
+      }, timeoutMs)
+    }
+    child.on('error', () => finish(false))
+    child.on('close', code => {
+      if (!timedOut) return finish(code === 0)
+      // The shell is gone; wait (bounded) until its whole group is, so that nothing the
+      // gate started is still running when the entry is stalled and the lock released.
+      const started = Date.now()
+      const poll = setInterval(() => {
+        if (groupAlive(child.pid) && Date.now() - started < 8000) return
+        clearInterval(poll)
+        finish(false)
+      }, 100)
+    })
   })
 }
+
+const fmtMinutes = m => `${m} minute${m === 1 ? '' : 's'}`
 
 // THE GATE'S PROCESS GROUP IS RECORDED IN THE LANDING LOCK. A gate runs in a group of
 // its own, so a run killed with SIGKILL leaves the gate running; the stale lock then
@@ -217,8 +247,24 @@ function loadConfig () {
     repo.mainBranch ||= 'main'
     repo.lanes = loadLanes(key, repo)
     checkBatch(key, repo)
+    checkTimeout(key, repo)
   }
   return cfg
+}
+
+// `gateTimeoutMinutes`: how long one setup step, gate step or final check may run, at repo
+// level or (overriding it) inside a lane. A positive number; fractions are allowed.
+function checkTimeout (key, repo) {
+  const bad = (where, v) => die(`repo "${key}": ${where}gateTimeoutMinutes must be a positive number of minutes, not ${JSON.stringify(v)}`)
+  if (repo.gateTimeoutMinutes !== undefined && !(typeof repo.gateTimeoutMinutes === 'number' && repo.gateTimeoutMinutes > 0 && Number.isFinite(repo.gateTimeoutMinutes))) bad('', repo.gateTimeoutMinutes)
+  for (const [name, lane] of Object.entries(repo.lanes)) {
+    const v = lane.gateTimeoutMinutes
+    if (v !== undefined && !(typeof v === 'number' && v > 0 && Number.isFinite(v))) bad(`lane "${name}": `, v)
+  }
+}
+function gateTimeoutMs (repo, laneName) {
+  const m = repo.lanes[laneName]?.gateTimeoutMinutes ?? repo.gateTimeoutMinutes
+  return m ? m * 60000 : 0
 }
 
 // `batch` is opt-in per repository: {"max": 5}. Absent, the repository lands one
@@ -1095,12 +1141,13 @@ async function ensureWorktreeSetup (repo, wt, laneNames, { force = false } = {})
   for (const name of laneNames) {
     const lane = repo.lanes[name]
     if (!lane.setup.length) continue
-    if (!force && lane.setupWhen && await runGate(lane.setupWhen, wt, env)) continue
+    const timeoutMs = gateTimeoutMs(repo, name)
+    if (!force && lane.setupWhen && await runGate(lane.setupWhen, wt, env, { timeoutMs })) continue
     const label = multiLane(repo) ? `${repo.key}/${name}` : repo.key
     console.log(yellow(`  this worktree has no generated environment — running ${label}'s setup`))
     for (const step of lane.setup) {
       console.log(dim(`  setup: ${step}`))
-      if (!await runGate(step, wt, env)) return { ok: false, ran: true, failed: step, probe: lane.setupWhen, lane: name }
+      if (!await runGate(step, wt, env, { timeoutMs })) return { ok: false, ran: true, failed: step, probe: lane.setupWhen, lane: name, timedOut: gateTimedOut, timeoutMs }
     }
     console.log(dim('  setup complete — the gate has an environment to run in'))
     ran = true
@@ -1624,12 +1671,14 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
   }
   // ONE GATE, on the tip, for the lanes the entries share.
   const setup = await ensureWorktreeSetup(repo, bw, first.run, { force: changed })
-  if (!setup.ok) throw new BatchFailure(`worktree setup failed${multiLane(repo) ? ` in lane ${setup.lane}` : ''}: ${setup.failed}`)
+  if (!setup.ok) throw new BatchFailure(`worktree setup ${setup.timedOut ? `timed out after ${fmtMinutes(setup.timeoutMs / 60000)}` : 'failed'}${multiLane(repo) ? ` in lane ${setup.lane}` : ''}: ${setup.failed}`)
   writeJSON(batchMetaPath(repo), { lockfiles: hash })
   for (const name of first.run) {
     for (const step of gateStepsFor(repo, { reached: first.reached }, name)) {
       console.log(dim(`  gate: ${step}`))
-      if (!await runGate(step, bw, repo.lanes[name].gateEnv || {})) throw new BatchFailure(`the gate${multiLane(repo) ? ` of lane ${name}` : ''} failed on the candidate: ${step}`)
+      if (!await runGate(step, bw, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) {
+        throw new BatchFailure(`the gate${multiLane(repo) ? ` of lane ${name}` : ''} ${gateTimedOut ? `timed out after ${fmtMinutes(gateTimeoutMs(repo, name) / 60000)}` : 'failed'} on the candidate: ${step}`)
+      }
     }
   }
 
@@ -2536,15 +2585,16 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         if (!setup.ok) {
           // A multi-lane repo names the lane whose setup failed.
           const inLane = multiLane(repo) ? ` in lane ${setup.lane}` : ''
-          if (!recordStall(entry, { status: 'stalled', stallReason: `worktree setup failed${inLane}: ${setup.failed}` })) continue
-          const file = writeStallReport(repo, entry, `worktree setup failed${inLane}`,
+          const verb = setup.timedOut ? `worktree setup timed out after ${fmtMinutes(setup.timeoutMs / 60000)}` : 'worktree setup failed'
+          if (!recordStall(entry, { status: 'stalled', stallReason: `${verb}${inLane}: ${setup.failed}` })) continue
+          const file = writeStallReport(repo, entry, `${verb}${inLane}`,
             `This worktree lacked its generated environment — \`${setup.probe || '(no probe configured)'}\` said so —\n` +
-            `and the setup step that fills it in exited non-zero:\n\n` +
+            (setup.timedOut ? `and the setup step that fills it in ran past its limit and was ended:\n\n` : `and the setup step that fills it in exited non-zero:\n\n`) +
             `    ${setup.failed}\n\n` +
             `Its output is above, in the landing run log. The gate never ran; nothing here is a\n` +
             `verdict on the branch.`,
             [], false, [setup.failed])
-          console.error(red(`\n  STALLED — worktree setup failed${inLane} on ${entry.branch}`))
+          console.error(red(`\n  STALLED — ${verb}${inLane} on ${entry.branch}`))
           console.error(`  the step that failed: ${setup.failed}`)
           console.error(dim('  The rebase is complete — there is no conflict to resolve, and the gate'))
           console.error(dim('  has not run. Fix the environment in that worktree, then: local-merge-queue resume ' + key))
@@ -2571,21 +2621,29 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         let gateOK = true
         let gateFailed = null
         let gateLane = null
+        let gateHung = false
         gate: for (const name of runLanes) {
           for (const step of gateStepsFor(repo, entry, name)) {
             console.log(dim(`  gate: ${step}`))
-            if (!await runGate(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; gateLane = name; break gate }
+            if (!await runGate(step, wt, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) { gateOK = false; gateHung = gateTimedOut; gateFailed = step; gateLane = name; break gate }
           }
         }
         if (!gateOK) {
           // A multi-lane repo names the lane whose gate failed.
           const inLane = multiLane(repo) ? ` in lane ${gateLane}` : ''
-          if (!recordStall(entry, { status: 'stalled', stallReason: `gate failed after rebase${inLane}` })) continue
-          const file = writeStallReport(repo, entry, `gate failed after rebase${inLane}`,
-            `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
+          const hung = `gate timed out after ${fmtMinutes(gateTimeoutMs(repo, gateLane) / 60000)}${inLane}`
+          if (!recordStall(entry, { status: 'stalled', stallReason: gateHung ? hung : `gate failed after rebase${inLane}` })) continue
+          const file = writeStallReport(repo, entry, gateHung ? hung : `gate failed after rebase${inLane}`,
+            gateHung
+              ? `The gate step \`${gateFailed}\` ran past its limit (gateTimeoutMinutes) and was ended, with its whole process group. Its output so far is above, in the landing run log.`
+              : `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
             [], false, [gateFailed])
-          console.error(red(`\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} failed on ${entry.branch} after rebasing.`))
-          console.error(dim('  This is the queue working: it passed on the old main and fails on the new one.'))
+          console.error(red(gateHung
+            ? `\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} timed out after ${fmtMinutes(gateTimeoutMs(repo, gateLane) / 60000)} on ${entry.branch}: ${gateFailed}`
+            : `\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} failed on ${entry.branch} after rebasing.`))
+          console.error(dim(gateHung
+            ? '  The hung gate was ended and the landing lock is released when the run ends.'
+            : '  This is the queue working: it passed on the old main and fails on the new one.'))
           console.error(`  report: ${file}`)
           if (!multiLane(repo)) return { landed, stalledOn: entry.branch }
           console.error(dim(`  ${stallLine(entry)}`))
@@ -2729,8 +2787,10 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
     const lane = repo.lanes[name]
     if (!lane.finalCheck || dryRun) continue
     console.log(`\n${bold('final check')} ${dim(lane.finalCheck)}`)
-    const ok = await runGate(lane.finalCheck, repo.checkout, lane.gateEnv || {})
-    console.log(ok ? green('  final check passed') : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
+    const ok = await runGate(lane.finalCheck, repo.checkout, lane.gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })
+    console.log(ok ? green('  final check passed')
+      : gateTimedOut ? red(`  FINAL CHECK TIMED OUT after ${fmtMinutes(gateTimeoutMs(repo, name) / 60000)} and was ended — main is landed and pushed; this is a new task, not a rollback`)
+      : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
   }
 
   // The allow-list again, after the gate output that buries its first print.

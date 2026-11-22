@@ -409,6 +409,8 @@ confirmation.
 
 ## The gate, and the final check
 
+**A gate has a timeout, which the config sets.** `gateTimeoutMinutes` (a positive number, per repository, or inside a lane where it overrides the repository's) bounds each setup step, gate step and final check. A step that runs longer is ended (its process group gets `SIGTERM`, and `SIGKILL` five seconds later), the entry stalls with `gate timed out after N minutes` (or `worktree setup timed out`) and a report, and the landing lock is released when the run ends; a final check that times out is reported as `FINAL CHECK TIMED OUT`, since it never gates. Without the key a step has no limit, and a hung gate holds the lock until its holder is ended, since a live holder is never broken. The limit bounds one step, not the entry, so set it above the longest healthy step.
+
 Each entry's **gate** runs in its own worktree, after the rebase and before the merge, on
 exactly the content that will land. Make it cheap and make it narrow. The right question
 is what would reach a user as a broken payment, a broken sign-in, or a missing feature —

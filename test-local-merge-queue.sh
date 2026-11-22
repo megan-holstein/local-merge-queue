@@ -2247,6 +2247,58 @@ check "…the report exists, under a file name with no slash in it"             
 check "…and the entry is recorded as stalled"                                            '[[ "$(r3_qinfo)" == "feat/x:stalled" ]]'
 out=$($LOCAL_MERGE_QUEUE land c4 2>&1)
 check "a second land names the same report"                                              '[[ "$out" == *"c4-feat%2Fx.md"* ]]'
+
+echo
+echo "── round 3 · a gate has a timeout the config sets, and a hung gate stalls its entry ──"
+# THE GAP (reviewer, finding 5): a hung gate held the landing lock forever, since a live holder is
+# never broken. gateTimeoutMinutes (per repository, or per lane) ends a step that runs longer:
+# its process group gets SIGTERM, and SIGKILL after five seconds.
+r3_init c5
+cat > "$ROOT/c5-hung.sh" <<'SH'
+#!/bin/bash
+# ignores SIGTERM, so only the escalation to SIGKILL ends it
+trap '' TERM
+echo $$ > "$ROOT/c5-hung-pid"
+while true; do sleep 1; done
+SH
+r3_config c5 "\"gateTimeoutMinutes\": 0.03, \"gate\": [\"bash $ROOT/c5-hung.sh\"], \"finalCheck\": \"true\""
+r3_branch c5 hangs hangs.txt=1
+r3_queue c5 hangs
+start=$SECONDS
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+hpid=$(cat "$ROOT/c5-hung-pid")
+check "a gate that runs past gateTimeoutMinutes stalls its entry (exit 2) with a timeout message"  '[[ $rc == 2 && "$out" == *"timed out after"* && "$(r3_qinfo)" == hangs:stalled ]]'
+check "…the hung gate, which ignores SIGTERM, was ended (SIGKILL after five seconds) in bounded time" '! kill -0 $hpid 2>/dev/null && (( SECONDS - start < 60 ))'
+check "…the landing lock was released, and nothing landed"                               '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" && ! -e "$ROOT/c5/hangs.txt" ]]'
+check "…and the stall report says the gate timed out"                                    'grep -q "timed out" "$LOCAL_MERGE_QUEUE_STATE/reports/c5-hangs.md"'
+$LOCAL_MERGE_QUEUE dequeue hangs --repo c5 >/dev/null 2>&1
+# A lane's own gateTimeoutMinutes wins over the repository's.
+cat > "$ROOT/c5-repos.json" <<JSON
+{ "repos": { "c5": { "checkout": "$ROOT/c5", "gateTimeoutMinutes": 100,
+  "lanes": { "a": { "paths": ["a/"], "gateTimeoutMinutes": 0.03, "gate": ["sleep 60"] }, "rest": { "paths": "*", "gate": ["true"] } } } } }
+JSON
+r3_branch c5 lane-a a/new.txt=1
+r3_queue c5 lane-a
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+check "a lane's gateTimeoutMinutes overrides the repository's, and the message names the lane" '[[ $rc == 2 && "$out" == *"timed out after"* && "$out" == *"lane a"* ]]'
+$LOCAL_MERGE_QUEUE dequeue lane-a --repo c5 >/dev/null 2>&1
+# A hung setup step stalls the entry the same way, and says it was the setup.
+r3_config c5 '"gateTimeoutMinutes": 0.03, "setupWhen": "false", "setup": ["sleep 60"], "gate": ["true"], "finalCheck": "true"'
+r3_branch c5 sets sets.txt=1
+r3_queue c5 sets
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+check "a hung setup step is ended and stalls the entry, saying it was the setup"          '[[ $rc == 2 && "$out" == *"worktree setup timed out"* && ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" ]]'
+$LOCAL_MERGE_QUEUE dequeue sets --repo c5 >/dev/null 2>&1
+# A hung final check is ended and reported; the run still ends.
+r3_config c5 '"gateTimeoutMinutes": 0.03, "gate": ["true"], "finalCheck": "sleep 60"'
+r3_branch c5 fin fin.txt=1
+r3_queue c5 fin
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+check "a hung final check is ended and reported as timed out, after the entry landed"     '[[ $rc == 0 && "$out" == *"FINAL CHECK TIMED OUT"* && -f "$ROOT/c5/fin.txt" && ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" ]]'
+# The key is validated.
+r3_config c5 '"gateTimeoutMinutes": -3, "gate": ["true"]'
+out=$($LOCAL_MERGE_QUEUE status c5 2>&1); rc=$?
+check "a gateTimeoutMinutes that is not a positive number is refused"                     '[[ $rc != 0 && "$out" == *gateTimeoutMinutes* ]]'
 # ROUND3-END
 
 echo
