@@ -674,6 +674,8 @@ branch goes, which is the act that would have closed it. **A retarget that fails
 stops a landing** — it is said in red, and the merge, the worktree removal and both branch
 deletions carry on, a missed retarget being a defect in the roster rather than in the code.
 
+**Cleanup destroys only what it can show is landed** (the independent re-check, 2026-11-21). The worktree is removed only if its HEAD is the landed commit and its status shows nothing the gate had not already found there (the status recorded after the setup, or a clean worktree for an entry the run did not gate in its own worktree): uncommitted or untracked files made after that point, or a commit made after the merge, keep the worktree and the local branch, say `WORKTREE KEPT` in red with the files named, and leave a residue line with the two commands that finish the job. Since `git worktree remove --force` deletes files, a gate that leaves non-ignored files in the worktree makes this refuse every time; ignore its output in `.gitignore`. The remote branch is deleted only if its tip on origin is the landed tip, so a commit somebody pushed to it after the publish is not deleted with it (`REMOTE BRANCH KEPT`).
+
 **The merge is done either way.** Cleanup residue is untidiness rather than a reason to
 stall the line, and the branch is on `main` and pushed before any of this runs.
 

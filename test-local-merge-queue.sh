@@ -2327,6 +2327,66 @@ check "a refused second land does not delete or rewrite the file the holder's ga
 touch "$ROOT/c6-release"; wait $BG; r3_unhold c6
 check "the final check runs while the landing lock is still held"                        '[[ -f "$ROOT/c6-final-under-lock" ]]'
 check "…and the lock is released when the run ends"                                      '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c6" ]]'
+
+echo
+echo "── round 3 · cleanup keeps what the gate did not see, and deletes only the landed tip ──"
+# THE NIT (reviewer, finding 8): cleanup ran `git worktree remove --force` and deleted the remote
+# branch whatever it held, so files made in the worktree after the gate were destroyed, and a commit
+# pushed to the remote branch after the publish was deleted with it. The origin's hook holds the
+# push of main until the test says go, which is the window those things happen in.
+r3_init c7
+r3_hook c7
+r3_config c7 "\"gate\": [\"$(r3_gate_step c7)\"], \"finalCheck\": \"true\""
+cat > "$ROOT/c7-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c7-hold-main" ]; then
+  touch "$ROOT/c7-push-started"
+  for i in $(seq 1 150); do [ -e "$ROOT/c7-go" ] && break; sleep 0.2; done
+fi
+SH
+c7_window () {  # runs a landing run whose push of main is held; the caller acts in the window, then it is released
+  rm -f "$ROOT/c7-push-started" "$ROOT/c7-go"; touch "$ROOT/c7-hold-main"
+  $LOCAL_MERGE_QUEUE land c7 > "$ROOT/c7-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c7-push-started"
+}
+c7_release () { touch "$ROOT/c7-go"; wait $BG; rc=$?; rm -f "$ROOT/c7-hold-main"; out=$(cat "$ROOT/c7-land.out"); }
+
+# 1. Work made in the worktree after the gate survives the cleanup.
+r3_branch c7 late late.txt=gated
+r3_queue c7 late
+c7_window
+echo "work in progress" > "$(r3_wt c7 late)/notes.txt"
+echo "an edit made after the gate" >> "$(r3_wt c7 late)/late.txt"
+c7_release
+check "an entry is landed, whatever was made in its worktree meanwhile"                 '[[ $rc == 0 && "$(r3_qinfo)" == "" && "$(git -C "$ROOT/c7" show main:late.txt)" == gated ]]'
+check "…the untracked file and the uncommitted edit made after the gate survive: the worktree is kept" '[[ -f "$(r3_wt c7 late)/notes.txt" && "$(cat "$(r3_wt c7 late)/late.txt")" == *"an edit made after the gate"* ]]'
+check "…the branch stays with its worktree, and the run says why, in red, as residue"    'git -C "$ROOT/c7" rev-parse --verify -q refs/heads/late >/dev/null && [[ "$out" == *"WORKTREE KEPT"* && "$out" == *notes.txt* ]]'
+rm -rf "$(r3_wt c7 late)"; git -C "$ROOT/c7" worktree prune; git -C "$ROOT/c7" branch -q -D late; git -C "$ROOT/c7-origin.git" branch -q -D late 2>/dev/null
+
+# 2. A commit pushed to the remote branch after the publish is not deleted with it.
+r3_branch c7 foreign foreign.txt=gated
+r3_queue c7 foreign
+c7_window
+( cd "$ROOT/c7-other" && git fetch -q origin foreign && git checkout -q -B foreign origin/foreign && echo theirs > theirs.txt && git add -A && git commit -qm "pushed by somebody else after the publish" && git push -q origin foreign && git checkout -q main )
+theirs=$(git -C "$ROOT/c7-other" rev-parse foreign)
+c7_release
+check "an entry whose remote branch gained a commit after the publish still lands"       '[[ $rc == 0 && "$(git -C "$ROOT/c7" show main:foreign.txt)" == gated ]]'
+check "…and the remote branch is kept, with the commit somebody else pushed"             '[[ "$(git -C "$ROOT/c7-origin.git" rev-parse refs/heads/foreign)" == "$theirs" && "$out" == *"REMOTE BRANCH KEPT"* && "$out" == *"is not the landed tip"* ]]'
+check "…while the clean worktree and the local branch are removed as before"              '[[ ! -d "$(r3_wt c7 foreign)" ]] && ! git -C "$ROOT/c7" rev-parse --verify -q refs/heads/foreign >/dev/null'
+
+# 3. A branch merged by hand, whose worktree holds a file made after the enqueue, is cleaned up without that file.
+r3_branch c7 byhand byhand.txt=1
+r3_queue c7 byhand
+git -C "$ROOT/c7" merge -q --no-ff -m "merged by hand" byhand && git -C "$ROOT/c7" push -q origin main
+echo "scratch" > "$(r3_wt c7 byhand)/scratch.txt"
+out=$($LOCAL_MERGE_QUEUE land c7 2>&1)
+check "a cleanup-only entry keeps a worktree that holds an untracked file, and says so"   '[[ "$out" == *"cleanup only"* && -f "$(r3_wt c7 byhand)/scratch.txt" && "$out" == *"WORKTREE KEPT"* ]]'
+# …and a clean one is removed, local and remote branches included, as it always was (tests 10 and 12 above pin the rest).
+r3_branch c7 byhand2 byhand2.txt=1
+r3_queue c7 byhand2
+git -C "$ROOT/c7" merge -q --no-ff -m "merged by hand again" byhand2 && git -C "$ROOT/c7" push -q origin main
+out=$($LOCAL_MERGE_QUEUE land c7 2>&1)
+check "a clean cleanup-only entry is removed entirely: worktree, local and remote branch" '[[ ! -d "$(r3_wt c7 byhand2)" ]] && ! git -C "$ROOT/c7" rev-parse --verify -q refs/heads/byhand2 >/dev/null && ! git -C "$ROOT/c7-origin.git" rev-parse --verify -q refs/heads/byhand2 >/dev/null'
 # ROUND3-END
 
 echo

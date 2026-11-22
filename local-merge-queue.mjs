@@ -1720,7 +1720,7 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
     // The branch moves to the tip that was published, so that cleanup can prove it contained.
     const rs = gitTry(['reset', '--hard', '-q', was.rebasedTip], e.worktree)
     if (!rs.ok) console.log(red(`  COULD NOT MOVE ${e.branch} TO ITS PUBLISHED TIP: ${rs.err}`))
-    try { cleanupLanded(repo, e, e.worktree) } catch (err) { console.log(red(`  cleanup of ${e.branch} failed: ${err.message}`)) }
+    try { cleanupLanded(repo, e, e.worktree, { landedTip: was.rebasedTip }) } catch (err) { console.log(red(`  cleanup of ${e.branch} failed: ${err.message}`)) }
     e.status = 'landed'
     removeEntry(e)
   }
@@ -2056,7 +2056,23 @@ function cmdOrder (cfg, args) {
 
 // CLEANUP, the same for an entry landed alone and for each entry of a batch.
 // `wt` is the entry's worktree; the branch is already on `main` and pushed.
-function cleanupLanded (repo, entry, wt) {
+//
+// CLEANUP DESTROYS ONLY WHAT IT CAN SHOW IS LANDED. `landedTip` is the commit that was
+// merged (the gated commit, or the published tip of a batched entry, or an already-merged
+// branch's tip). The worktree is removed only if its HEAD is that commit and its status
+// shows nothing the gate had not already found there (`baseline`: the status recorded
+// after the setup; an empty list for an entry that was not gated in its own worktree),
+// because `worktree remove --force` deletes uncommitted and untracked files, and work
+// made in the worktree after the gate is the author's and was never landed. The remote
+// branch is deleted only if its tip on origin IS the landed tip: a commit somebody
+// pushed to it after the publish would be deleted with it. Either refusal is said in red
+// as residue, and the merge is done regardless.
+function cleanupLanded (repo, entry, wt, { landedTip = null, baseline = [] } = {}) {
+  const short = x => String(x).slice(0, 9)
+  if (!landedTip) {
+    const tip = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
+    landedTip = tip.ok ? tip.out : null
+  }
   // 5. Cleanup — the lifecycle the roster rule asks for, done by the thing
   //    that did the merge rather than by whoever remembers.
   //
@@ -2079,8 +2095,21 @@ function cleanupLanded (repo, entry, wt) {
     return false
   }
 
-  const rm = gitTry(['worktree', 'remove', '--force', wt], repo.checkout)
-  step('worktree removed', rm, `worktree still registered at ${wt}`)
+  const keepWorktree = []
+  if (fs.existsSync(wt)) {
+    const extra = statusLines(wt).filter(l => !baseline.includes(l))
+    if (extra.length) keepWorktree.push(`it holds uncommitted or untracked files made since the gate: ${extra.map(l => l.trim()).join('; ')}`)
+    const head = gitTry(['rev-parse', 'HEAD'], wt)
+    if (landedTip && (!head.ok || head.out !== landedTip)) keepWorktree.push(`its HEAD is ${head.ok ? short(head.out) : '(unreadable)'}, not the landed tip ${short(landedTip)}`)
+    if (!landedTip) keepWorktree.push('the landed tip could not be read')
+  }
+  const rm = keepWorktree.length ? null : gitTry(['worktree', 'remove', '--force', wt], repo.checkout)
+  if (rm) step('worktree removed', rm, `worktree still registered at ${wt}`)
+  else {
+    console.log(red(`  WORKTREE KEPT: ${keepWorktree.join('; ')}.`))
+    console.log(red(`  Removing it would delete that work, so the worktree and the local branch stay; the merge is done.`))
+    residue.push(`worktree kept at ${wt} (${keepWorktree.join('; ')}); once it is safe: git worktree remove ${wt}, then git branch -d ${entry.branch}`)
+  }
   // PRUNE BETWEEN THE TWO, ALWAYS. `git branch -d` refuses a branch git
   // still believes is checked out in a worktree, and a worktree whose
   // directory has gone without `worktree remove` leaves exactly that belief
@@ -2089,7 +2118,7 @@ function cleanupLanded (repo, entry, wt) {
   // idempotent, and touches only admin files for worktrees that are already
   // gone — it can never remove a live one.
   gitTry(['worktree', 'prune'], repo.checkout)
-  let del = gitTry(['branch', '-d', entry.branch], repo.checkout)   // -d refuses if unmerged
+  let del = keepWorktree.length ? { ok: true, kept: true } : gitTry(['branch', '-d', entry.branch], repo.checkout)   // -d refuses if unmerged
   if (!del.ok) {
     // One retry, after a fetch. One way `-d` refuses is by reading the
     // branch as unmerged, and the merge that landed it is a commit `origin`
@@ -2125,7 +2154,7 @@ function cleanupLanded (repo, entry, wt) {
       del = forced
     }
   }
-  step('local branch deleted', del, `local branch \`${entry.branch}\` still exists`)
+  if (!del.kept) step('local branch deleted', del, `local branch \`${entry.branch}\` still exists`)
   // MOVE ANY PULL REQUEST STACKED ON THIS BRANCH ONTO main BEFORE THE
   // REMOTE BRANCH GOES — deleting a PR's base branch closes it permanently.
   // See retargetStackedPrs for the whole argument. It never fails a landing.
@@ -2153,7 +2182,17 @@ function cleanupLanded (repo, entry, wt) {
   // to wait for, and must not pay for this.
   let rdel = { ok: true }
   let prState = 'no github repo configured'
-  if (!repo.githubRepo) {
+  // The remote branch goes only if its tip on origin is the landed tip.
+  const lsr = gitTry(['ls-remote', 'origin', `refs/heads/${entry.branch}`], repo.checkout)
+  const remoteTip = lsr.ok ? (lsr.out.split(/\s+/)[0] || '') : null
+  if (remoteTip === null || (remoteTip && remoteTip !== landedTip)) {
+    console.log(red(remoteTip === null
+      ? `  REMOTE BRANCH KEPT: origin could not be asked what its tip is (${lsr.err || 'no stderr'}).`
+      : `  REMOTE BRANCH KEPT: its tip on origin is ${short(remoteTip)}, which is not the landed tip ${short(landedTip)} — somebody pushed to it after the publish, and deleting it would delete that work.`))
+    residue.push(`remote branch \`${entry.branch}\` kept on purpose — ${remoteTip === null ? 'origin could not be read' : `its tip ${short(remoteTip)} is not the landed tip ${short(landedTip)}`}; look at it, then: git -C ${repo.checkout} push origin --delete ${entry.branch}`)
+  } else if (!remoteTip) {
+    console.log(dim('  remote branch already gone'))
+  } else if (!repo.githubRepo) {
     rdel = gitTry(['push', 'origin', '--delete', entry.branch], repo.checkout)
     step('remote branch deleted', rdel, `remote branch \`${entry.branch}\` still exists`)
   } else {
@@ -2740,7 +2779,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         landedLanes.push(...runLanes.filter(n => !(entry.reached || []).includes(n)))
       }
 
-      cleanupLanded(repo, entry, wt)
+      cleanupLanded(repo, entry, wt, alreadyIn ? {} : { landedTip: binding.sha, baseline: binding.status })
 
       entry.status = 'landed'
       entry.landedAt = nowISO()
