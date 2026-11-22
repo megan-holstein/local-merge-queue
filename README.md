@@ -418,7 +418,7 @@ and minutes added to a gate are paid on every single landing.
 
 **The merge is bound to the commit the gate ran on.** After the setup, the run records the branch's commit and the worktree's status. After the gate, and again right before the merge, it checks both: an entry whose branch moved, whose worktree's HEAD moved, or whose tracked files differ from the record (an edit, a staged change, a deletion) stalls with `changed during the gate: …` and a report, and nothing is published or merged. The publish and the merge name the recorded commit and never the branch ref, so a commit made in the worktree while the gate ran cannot land ungated. An untracked file is not a change to what lands, since only commits land; cleanup is what keeps such a file safe (see [Cleanup](#cleanup-and-what-happens-when-it-fails)). `resume` gates the entry again.
 
-The **final check** runs once, in the primary checkout, after the whole batch has landed.
+The **final check** runs once, in the primary checkout, after the whole batch has landed, and under the landing lock, so a second `land` cannot fast-forward that checkout beneath it.
 It reports rather than gates, because each entry already passed the gate on its own
 content. A repo whose full test sweep takes minutes puts the sweep in the gate, where a red
 result stalls the entry and leaves `main` untouched, and keeps the final check to a fast
@@ -572,6 +572,7 @@ A gate that runs a whole test sweep before the merge stalls an entry on any red 
 - `issue` and `expires` are required. An entry past its date is `EXPIRED` and not honored, so the suite blocks again. An expiry more than 30 days out is `INVALID`, and at most 5 entries count.
 - `knownRedRefuse` names a file in the primary checkout (one suite path per line, `#` comments) of suites the list may never name. An entry that names one is `REFUSED`; a list whose refuse file is missing refuses every entry.
 - `land`, `land --dry-run`, `resume` and `status` print every entry with its state, and `land` prints it again after the gate output.
+- The file is written once the landing lock is held, so a second `land` that is refused never touches the file the running holder's gates read.
 - The honored entries are written to `<state>/known-red/<repo>.tsv` (suite, issue, expiry, tab-separated) and the file's path reaches every setup step, gate step and final check as `$LOCAL_MERGE_QUEUE_KNOWN_RED`; it is unset when nothing is honored. The repo's test runner decides what a listed suite's failure means: the queue only says what is allowed and for how long.
 
 ### A stall holds only its own lanes

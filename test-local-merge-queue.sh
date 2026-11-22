@@ -2299,6 +2299,34 @@ check "a hung final check is ended and reported as timed out, after the entry la
 r3_config c5 '"gateTimeoutMinutes": -3, "gate": ["true"]'
 out=$($LOCAL_MERGE_QUEUE status c5 2>&1); rc=$?
 check "a gateTimeoutMinutes that is not a positive number is refused"                     '[[ $rc != 0 && "$out" == *gateTimeoutMinutes* ]]'
+
+echo
+echo "── round 3 · the known-red file is written under the lock; the final check runs under it ──"
+# THE NIT (reviewer, finding 7): a second land about to be refused deleted and rewrote the file the
+# running holder's gates read, and the final check ran after the lock was released.
+r3_init c6
+soon=$(node -e 'const d=new Date(Date.now()+5*86400000);console.log(d.toISOString().slice(0,10))')
+cat > "$ROOT/c6-final.sh" <<'SH'
+#!/bin/bash
+[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/c6" ] && echo held > "$ROOT/c6-final-under-lock"
+exit 0
+SH
+r3_config c6 "\"gate\": [\"$(r3_gate_step c6)\"], \"finalCheck\": \"bash $ROOT/c6-final.sh\", \"knownRed\": [{\"suite\": \"test/x.test.mjs\", \"issue\": \"o/r#1\", \"expires\": \"$soon\"}]"
+r3_branch c6 kr kr.txt=1
+r3_queue c6 kr
+r3_hold c6; : > "$ROOT/c6-gate.log"
+$LOCAL_MERGE_QUEUE land c6 > "$ROOT/c6-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c6-gate-started"
+kr="$LOCAL_MERGE_QUEUE_STATE/known-red/c6.tsv"
+check "(setup of the test) the running holder wrote the known-red file"                  '[[ -f "$kr" ]]'
+echo "SENTINEL-written-by-the-test" >> "$kr"
+out=$($LOCAL_MERGE_QUEUE land c6 2>&1); rc=$?
+check "(setup of the test) a second land is refused while the first holds the lock"      '[[ $rc != 0 && "$out" == *"being landed already"* ]]'
+check "a refused second land does not delete or rewrite the file the holder's gates read" 'grep -q SENTINEL-written-by-the-test "$kr"'
+touch "$ROOT/c6-release"; wait $BG; r3_unhold c6
+check "the final check runs while the landing lock is still held"                        '[[ -f "$ROOT/c6-final-under-lock" ]]'
+check "…and the lock is released when the run ends"                                      '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c6" ]]'
 # ROUND3-END
 
 echo

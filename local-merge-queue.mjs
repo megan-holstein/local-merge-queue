@@ -2217,9 +2217,11 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
     die(`${key} is not ready to land:\n  - ${problems.join('\n  - ')}`)
   }
 
-  announceKnownRed(repo, { write: !dryRun })
-
   const lock = dryRun ? true : acquireLock(key)
+  // THE KNOWN-RED FILE IS WRITTEN UNDER THE LOCK: written before it, a second `land`
+  // that was about to be refused deleted and rewrote the file the running holder's gates
+  // read (found by the independent re-check, 2026-11-21).
+  if (lock) announceKnownRed(repo, { write: !dryRun })
   if (!lock) {
     const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
     if (owner && !pidAlive(owner.pid) && groupAlive(owner.gatePgid)) {
@@ -2758,6 +2760,27 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
     // `settleDeploy` gives: the line is expected to continue there. A one-lane
     // repo with a stall holds its one lane, so it settles nothing.
     settleDeploy(repo, dryRun, blockedLanes(repo, loadQueue().entries))
+
+    // 6. THE FINAL CHECK RUNS UNDER THE LANDING LOCK. It used to run after the lock was
+    //    released, so a second `land` could fast-forward the primary checkout (and rewrite
+    //    the known-red file) under it. The broad sweep, once, on the final tip. This
+    //    REPORTS; it does not gate, because each entry already passed the gate on exactly
+    //    its own content. A cleanup-only entry gates no lane, so in a one-lane repo
+    //    `landedLanes` would miss it; the final check there runs whenever anything landed.
+    if (landed.length) {
+      const finalLanes = multiLane(repo)
+        ? Object.keys(repo.lanes).filter(n => landedLanes.includes(n))
+        : Object.keys(repo.lanes)
+      for (const name of finalLanes) {
+        const lane = repo.lanes[name]
+        if (!lane.finalCheck || dryRun) continue
+        console.log(`\n${bold('final check')} ${dim(lane.finalCheck)}`)
+        const ok = await runGate(lane.finalCheck, repo.checkout, lane.gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })
+        console.log(ok ? green('  final check passed')
+          : gateTimedOut ? red(`  FINAL CHECK TIMED OUT after ${fmtMinutes(gateTimeoutMs(repo, name) / 60000)} and was ended — main is landed and pushed; this is a new task, not a rollback`)
+          : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
+      }
+    }
   } finally {
     if (!dryRun) {
       mutateQueue(q => { for (const e of q.entries) if (e.repo === key) delete e.batch })
@@ -2774,23 +2797,6 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   if (!landed.length && !stalledAtEnd.length) {
     console.log(dim('\nnothing approved to land'))
     return { landed, refused }
-  }
-
-  // 6. The broad sweep, once, on the final tip. This REPORTS; it does not gate,
-  //    because each entry already passed the gate on exactly its own content.
-  //    A cleanup-only entry gates no lane, so in a one-lane repo `landedLanes`
-  //    would miss it; the final check there runs whenever anything landed.
-  const finalLanes = multiLane(repo)
-    ? Object.keys(repo.lanes).filter(n => landedLanes.includes(n))
-    : Object.keys(repo.lanes)
-  for (const name of finalLanes) {
-    const lane = repo.lanes[name]
-    if (!lane.finalCheck || dryRun) continue
-    console.log(`\n${bold('final check')} ${dim(lane.finalCheck)}`)
-    const ok = await runGate(lane.finalCheck, repo.checkout, lane.gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })
-    console.log(ok ? green('  final check passed')
-      : gateTimedOut ? red(`  FINAL CHECK TIMED OUT after ${fmtMinutes(gateTimeoutMs(repo, name) / 60000)} and was ended — main is landed and pushed; this is a new task, not a rollback`)
-      : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
   }
 
   // The allow-list again, after the gate output that buries its first print.
