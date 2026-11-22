@@ -144,9 +144,36 @@ function runGate (cmd, cwd, env = {}) {
     if (signalled) return
     const child = spawn('bash', ['-lc', cmd], { cwd, stdio: 'inherit', env: { ...process.env, ...env }, detached: true })
     gateGroups.add(child.pid)
-    child.on('error', () => { gateGroups.delete(child.pid); if (!signalled) resolve(false) })
-    child.on('close', code => { gateGroups.delete(child.pid); if (!signalled) resolve(code === 0) })
+    noteGateGroup(child.pid)
+    child.on('error', () => { gateGroups.delete(child.pid); noteGateGroup(null); if (!signalled) resolve(false) })
+    child.on('close', code => { gateGroups.delete(child.pid); noteGateGroup(null); if (!signalled) resolve(code === 0) })
   })
+}
+
+// THE GATE'S PROCESS GROUP IS RECORDED IN THE LANDING LOCK. A gate runs in a group of
+// its own, so a run killed with SIGKILL leaves the gate running; the stale lock then
+// admitted a second run, which started a second gate in the same worktree while the
+// first still ran (found by the independent re-check, 2026-11-21). With the group in
+// the lock's owner record, `lockStale` treats a lock whose run is dead but whose gate
+// group is alive as held, and the message names the group.
+let gateLock = null        // { dir, token }: the landing lock this process holds
+function noteGateGroup (pgid) {
+  if (!gateLock) return
+  try {
+    const f = path.join(gateLock.dir, 'owner.json')
+    const o = readJSON(f, null)
+    if (!o || o.token !== gateLock.token) return
+    if (pgid) o.gatePgid = pgid; else delete o.gatePgid
+    const tmp = `${f}.tmp-${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify(o))
+    fs.renameSync(tmp, f)
+  } catch { /* the lock was released or taken over meanwhile */ }
+}
+
+// Does any process of this group still exist? EPERM means one does, and is not ours.
+function groupAlive (pgid) {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false
+  try { process.kill(-pgid, 0); return true } catch (e) { return e.code === 'EPERM' }
 }
 
 // Is a rebase sitting half-finished in this worktree? Asked of git rather than
@@ -522,7 +549,11 @@ function lockCreate (dir, token) {
 // Why this lock is debris, or null. A live holder is never stale.
 function lockStale (dir) {
   const o = lockOwner(dir)
-  if (o && Number.isInteger(o.pid)) return pidAlive(o.pid) ? null : `its holder, pid ${o.pid}, is gone`
+  if (o && Number.isInteger(o.pid)) {
+    if (pidAlive(o.pid)) return null
+    if (groupAlive(o.gatePgid)) return null          // the run is dead, its gate is not: the lock is still held
+    return `its holder, pid ${o.pid}, is gone`
+  }
   try { if (Date.now() - fs.statSync(dir).mtimeMs > 5000) return 'it has no owner' } catch { /* released while we looked */ }
   return null
 }
@@ -834,6 +865,7 @@ function acquireLock (key) {
   })
   if (!got.token) return null
   repoLockTokens.set(key, got.token)
+  gateLock = { dir, token: got.token }
   onExit(() => releaseLock(key))
   return dir
 }
@@ -842,6 +874,7 @@ function releaseLock (key) {
   const t = repoLockTokens.get(key)
   if (!t) return
   repoLockTokens.delete(key)
+  if (gateLock?.token === t) gateLock = null
   lockRelease(path.join(LOCK_DIR, key), t)
 }
 
@@ -1743,6 +1776,7 @@ function cmdStatus (cfg, args) {
       const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
       running = !!owner && Number.isInteger(owner.pid) && pidAlive(owner.pid)
       if (running) console.log(yellow(`  LOCKED by pid ${owner.pid} since ${owner.since} (${lockAge(owner)})`))
+      else if (groupAlive(owner?.gatePgid)) console.log(yellow(`  a landing run died (pid ${owner.pid} is gone), but the gate it started is still running (process group ${owner.gatePgid}); the lock is held until that gate ends`))
       else console.log(dim(`  a landing run died holding the lock (pid ${owner?.pid ?? '?'} is gone); the next land clears it`))
     }
     announceKnownRed(repo, { write: false })
@@ -2136,6 +2170,10 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   const lock = dryRun ? true : acquireLock(key)
   if (!lock) {
     const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
+    if (owner && !pidAlive(owner.pid) && groupAlive(owner.gatePgid)) {
+      die(`${key}: the landing run (pid ${owner.pid}, since ${owner.since}) is gone, but the gate it started is still running (process group ${owner.gatePgid}), so the lock stays held until that gate ends. ` +
+          `Wait for it, or end it with: kill -TERM -- -${owner.gatePgid}`)
+    }
     die(`${key} is being landed already (pid ${owner?.pid ?? '?'}, since ${owner?.since ?? '?'})`)
   }
   // Whatever way this run ends (a die, a signal), its batch marks go and its lock is released.

@@ -2201,6 +2201,37 @@ r3_outside c2 other/more.txt=more "outside push while stalled"
 : > "$ROOT/c2-gate.log"
 out=$($LOCAL_MERGE_QUEUE resume c2 2>&1); rc=$?
 check "resume sees a main that moved while the entry was stalled, rebases and gates again, and lands" '[[ $rc == 0 && "$out" == *"moved while stalled was stalled — rebasing it again"* && "$(r3_gates c2)" == 1 && -f "$ROOT/c2/other/more.txt" && -f "$ROOT/c2/stalled.txt" ]] && r3_main_eq c2'
+
+echo
+echo "── round 3 · a hard-killed run's gate cannot overlap a second gate ─────────"
+# THE REGRESSION (reviewer, finding 3): the gate runs in a process group of its own, so killing the
+# land process with SIGKILL no longer killed its gate, and the stale lock then admitted a second
+# gate in the same worktree while the first was still running.
+r3_init c3
+r3_config c3 "\"gate\": [\"$(r3_gate_step c3)\"], \"finalCheck\": \"true\""
+r3_branch c3 held held.txt=h
+r3_queue c3 held
+r3_hold c3; : > "$ROOT/c3-gate.log"
+$LOCAL_MERGE_QUEUE land c3 > "$ROOT/c3-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c3-gate-started"
+gpid=$(cat "$ROOT/c3-gate-pid"); pgid=$(ps -o pgid= -p "$gpid" | tr -d ' ')
+check "the landing lock records the gate's process group"                              '[[ -n "$pgid" ]] && grep -q "\"gatePgid\":$pgid[,}]" "$LOCAL_MERGE_QUEUE_STATE/locks/c3/owner.json"'
+kill -KILL $BG; wait $BG 2>/dev/null; sleep 0.3
+check "(setup of the test) the land process is dead and its gate is still running"      '! kill -0 $BG 2>/dev/null && kill -0 -- -$pgid 2>/dev/null'
+st=$($LOCAL_MERGE_QUEUE status c3 2>&1)
+check "status says the dead run's gate is still running, and not LOCKED"                '[[ "$st" == *"gate it started is still running"* && "$st" == *"$pgid"* && "$st" != *LOCKED* ]]'
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "a second land is refused while the orphaned gate runs, and names its process group"  '[[ $rc != 0 && "$out" == *"still running"* && "$out" == *"$pgid"* && "$out" != *"breaking a stale lock"* ]]'
+check "…and no second gate started"                                                      '[[ "$(r3_gates c3)" == 1 ]]'
+out=$($LOCAL_MERGE_QUEUE resume c3 2>&1); rc=$?
+check "resume is refused the same way"                                                   '[[ $rc != 0 && "$out" == *"still running"* && "$(r3_gates c3)" == 1 ]]'
+touch "$ROOT/c3-release"
+for i in $(seq 1 100); do kill -0 -- -$pgid 2>/dev/null || break; sleep 0.2; done
+r3_unhold c3
+check "(setup of the test) the orphaned gate has ended"                                   '! kill -0 -- -$pgid 2>/dev/null'
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "once the gate has ended the next land breaks the stale lock and lands the entry"  '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/c3/held.txt" ]] && r3_main_eq c3'
 # ROUND3-END
 
 echo
