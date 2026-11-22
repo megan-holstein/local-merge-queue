@@ -1971,8 +1971,9 @@ BG=$!
 wait_for "$ROOT/gate-started"; gpid=$(cat "$ROOT/gate-pid")
 kill -KILL $BG; wait $BG 2>/dev/null; sleep 0.3
 st=$($LOCAL_MERGE_QUEUE status b 2>&1)
-check "after SIGKILL the lock is left, and status says its holder died instead of LOCKED" '[[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/b" && "$st" == *"died holding the lock"* && "$st" != *LOCKED* && "$st" != *"gated together"* ]]'
-touch "$ROOT/gate-release"; sleep 0.5; unset HOLD_MATCH; clear_hold   # the orphaned gate of a SIGKILLed run ends on its own
+check "after SIGKILL the lock is left, and status says its run died (and that its gate is still running) instead of LOCKED" '[[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/b" && "$st" == *"a landing run died"* && "$st" == *"the gate it started is still running"* && "$st" != *LOCKED* && "$st" != *"gated together"* ]]'
+# The orphaned gate of a SIGKILLed run ends on its own once released; the lock stays held until it has (see the round-3 section).
+touch "$ROOT/gate-release"; for i in $(seq 1 100); do kill -0 $gpid 2>/dev/null || break; sleep 0.2; done; unset HOLD_MATCH; clear_hold
 : > "$BLOG"
 out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
 check "…and the next land breaks the dead lock and clears the marks" '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/brepo/sg-1.txt" && -f "$ROOT/brepo/sg-2.txt" ]]'
