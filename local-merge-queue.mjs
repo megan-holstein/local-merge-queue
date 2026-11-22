@@ -994,6 +994,37 @@ function bindingBroken (repo, entry, wt, rec) {
   return null
 }
 
+// ─── local main must equal origin's before an entry starts ───────────────────
+
+/**
+ * A RUN KILLED BETWEEN ITS LOCAL MERGE AND ITS PUSH LEAVES `main` AHEAD OF ORIGIN, and
+ * the next run used to read the entry as already landed: the independent re-check
+ * (2026-11-21) killed a run during the push, and the next run cleaned up the entry,
+ * deleting its worktree and its branch local and remote, though the merge existed
+ * nowhere but in the primary checkout. So before an entry starts, `main` is brought to
+ * `origin/main` by a fast-forward, and a `main` that is ahead of origin (or has
+ * diverged) stops the run with the commits named; nothing is cleaned up or reset
+ * for the operator, since the commits may be somebody's own. Returns the problem, or null.
+ */
+function syncMainWithOrigin (repo) {
+  const main = repo.mainBranch
+  const fetched = gitTry(['fetch', 'origin', '--prune'], repo.checkout)
+  if (!fetched.ok) return `git fetch failed: ${fetched.err}`
+  if (!gitTry(['rev-parse', '--verify', '-q', `origin/${main}`], repo.checkout).ok) return `origin has no ${main} branch`
+  const extra = gitTry(['log', '--format=%h %s', `origin/${main}..${main}`], repo.checkout).out.split('\n').filter(Boolean)
+  if (extra.length) {
+    return `${main} in ${repo.checkout} has ${extra.length} commit(s) that origin/${main} does not:\n` +
+      extra.slice(0, 5).map(l => `    ${l}`).join('\n') + (extra.length > 5 ? `\n    … and ${extra.length - 5} more` : '') + '\n' +
+      `  A landing run killed between its merge and its push leaves exactly this, and no entry has been cleaned up: the entries' branches and worktrees are untouched.\n` +
+      `  If these commits are such leftovers, discard them with: git -C ${repo.checkout} reset --hard origin/${main}\n` +
+      `  If they are anybody's own work, push or move them first. Then land again.`
+  }
+  const ff = gitTry(['merge', '--ff-only', `origin/${main}`], repo.checkout)
+  if (!ff.ok) return `${main} could not fast-forward to origin: ${ff.err}`
+  if (git(['rev-parse', main], repo.checkout) !== git(['rev-parse', `origin/${main}`], repo.checkout)) return `${main} does not equal origin/${main} after the fast-forward`
+  return null
+}
+
 // ─── the worktree's generated environment ───────────────────────────────────
 
 /**
@@ -1349,7 +1380,7 @@ function batchBlocker (repo, e, tip) {
   if (e.noRebase) return 'it is --no-rebase'
   if (!e.worktree || !fs.existsSync(e.worktree)) return 'its worktree is gone'
   if (!gitTry(['rev-parse', '--verify', '-q', `refs/heads/${e.branch}`], repo.checkout).ok) return 'its branch is gone'
-  if (gitTry(['merge-base', '--is-ancestor', e.branch, repo.mainBranch], repo.checkout).ok) return 'it is already in main (cleanup only)'
+  if (gitTry(['merge-base', '--is-ancestor', e.branch, `origin/${repo.mainBranch}`], repo.checkout).ok) return 'it is already in main (cleanup only)'
   const merges = gitTry(['rev-list', '--merges', '--count', `${tip}..${e.branch}`], repo.checkout)
   if (!merges.ok || merges.out !== '0') return 'it carries merge commits (a branch that merged main into itself is not rebased, and a batch rebases)'
   return null
@@ -1477,9 +1508,8 @@ function ensureBatchWorktree (repo, base) {
 // BatchFailure (or any other error) only BEFORE the push.
 async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
   const names = members.map(e => e.branch)
-  if (!run('git fetch origin --prune', repo.checkout)) throw new BatchFailure('git fetch failed')
-  const ff = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
-  if (!ff.ok) throw new BatchFailure(`${repo.mainBranch} could not fast-forward to origin: ${ff.err}`)
+  const drift = syncMainWithOrigin(repo)
+  if (drift) throw new BatchFailure(drift)
   const base = git(['rev-parse', repo.mainBranch], repo.checkout)
 
   // What each entry is now, so that a change during the gate is noticed.
@@ -2267,11 +2297,19 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         die(`the worktree for "${entry.branch}" is gone (${wt}) — dequeue the entry or repair the worktree`)
       }
 
+      // LOCAL MAIN MUST EQUAL ORIGIN'S BEFORE AN ENTRY STARTS (see `syncMainWithOrigin`),
+      // and "already in main" is asked of origin's main: a merge that exists only in the
+      // primary checkout is not a landed branch, and cleaning its entry up would delete
+      // the only copy.
+      console.log(dim('  fetching…'))
+      const drift = syncMainWithOrigin(repo)
+      if (drift) die(drift)
+
       // A branch already contained in main needs cleanup, not a merge. This is
       // where the roster's "merged; delete the worktree and this row" backlog
       // lands — the state that accumulates when a merge and its cleanup were
       // two separate acts by two different people.
-      const alreadyIn = gitTry(['merge-base', '--is-ancestor', entry.branch, repo.mainBranch], repo.checkout).ok
+      const alreadyIn = gitTry(['merge-base', '--is-ancestor', entry.branch, `origin/${repo.mainBranch}`], repo.checkout).ok
       // Set at step 2 below; read again at the pre-merge publish, which is why it
       // is declared out here rather than beside its use.
       let current = false
@@ -2315,15 +2353,19 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
             // rebase onto the `main` of the stall. `resume` rebases the entry
             // again, through step 1 like any other entry; a conflict there
             // stalls it again. A one-lane repo lands nothing past a stall, so
-            // there the branch is off `main` only if someone moved it by hand.
+            // there the branch is off `main` only if a push from outside the
+            // queue moved it.
             //
             // A --no-rebase entry is never rebased. It falls through to step 2,
             // which stalls it again, with the same reason, unless the fixer
             // has merged origin/main into it.
+            //
+            // The `origin/main` asked about here was fetched at the start of this
+            // entry, so a `main` that moved while the entry was stalled is seen, in
+            // a one-lane repo as well: the entry is rebased again and gated again.
             if (entry.noRebase) {
               console.log(dim(`  ${entry.branch} does not contain origin/${repo.mainBranch} — checking it again (--no-rebase)`))
             } else {
-              if (!multiLane(repo)) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
               console.log(dim(`  ${repo.mainBranch} moved while ${entry.branch} was stalled — rebasing it again`))
             }
             fresh = true
@@ -2339,11 +2381,6 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
 
         // 1. Bring main and the branch up to date.
         if (fresh) {
-          console.log(dim('  fetching…'))
-          if (!run('git fetch origin --prune', repo.checkout)) die('git fetch failed')
-          const pull = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
-          if (!pull.ok) die(`${repo.mainBranch} could not fast-forward to origin: ${pull.err}`)
-
           // 2. Put the branch on top of the main it will actually land on.
           //
           //    A BRANCH THAT ALREADY CONTAINS origin/main IS NOT REBASED. The

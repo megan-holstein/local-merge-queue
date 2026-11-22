@@ -2069,6 +2069,10 @@ r3_queue () {  # repo, branch...: enqueue each from its worktree, then approve t
   for b in "$@"; do ( cd "$(r3_wt "$n" "$b")" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1 ); done
   $LOCAL_MERGE_QUEUE approve "$@" --repo "$n" >/dev/null 2>&1
 }
+r3_outside () {  # repo, file=content, message: a commit pushed to origin's main by somebody else (the second clone)
+  local n="$1" pair="$2" msg="$3"
+  ( cd "$ROOT/$n-other" && git pull -q origin main 2>/dev/null; mkdir -p "$(dirname "${pair%%=*}")"; printf '%s' "${pair#*=}" > "${pair%%=*}"; git add -A && git commit -qm "$msg" && git push -q origin main )
+}
 r3_qinfo () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));console.log(q.entries.map(e=>e.branch+":"+e.status).join(","))'; }
 r3_gates () { local n; n=$(grep -c '^gate-run' "$ROOT/$1-gate.log" 2>/dev/null); echo "${n:-0}"; }
 r3_main_eq () { [[ "$(git -C "$ROOT/$1" rev-parse main)" == "$(git -C "$ROOT/$1-origin.git" rev-parse main)" ]]; }
@@ -2144,6 +2148,59 @@ r3_branch c1 plain plain.txt=gated
 r3_queue c1 plain
 $LOCAL_MERGE_QUEUE land c1 >/dev/null 2>&1
 check "the merge's second parent is the tip the run published, which is the commit the gate ran on" '[[ -n "$(grep "^refs/heads/plain " "$ROOT/c1-refs.log")" && "$(git -C "$ROOT/c1" rev-parse main^2)" == "$(grep "^refs/heads/plain " "$ROOT/c1-refs.log" | grep -v " 0000000" | tail -1 | cut -d" " -f2)" ]]'
+
+echo
+echo "── round 3 · local main must equal origin's before an entry starts ─────────"
+# THE DEFECT (reviewer, finding 2): a run killed between its local merge and its push left main
+# ahead of origin, and the next run read the entry as already landed, deleted its worktree and
+# its branch (local and remote) and dropped it, with the merge existing in the primary checkout only.
+r3_init c2
+r3_config c2 "\"gate\": [\"$(r3_gate_step c2)\"], \"finalCheck\": \"true\""
+r3_hook c2
+r3_branch c2 alpha alpha.txt=alpha
+r3_branch c2 beta beta.txt=beta
+r3_queue c2 alpha beta
+cat > "$ROOT/c2-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ]; then
+  touch "$ROOT/c2-push-started"
+  for i in $(seq 1 100); do [ -e "$ROOT/c2-kill-done" ] && break; sleep 0.2; done
+  echo "REJECTED BY TEST HOOK" >&2; exit 1
+fi
+SH
+origin_before=$(git -C "$ROOT/c2-origin.git" rev-parse main)
+$LOCAL_MERGE_QUEUE land c2 > "$ROOT/c2-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c2-push-started"
+kill -KILL $BG; wait $BG 2>/dev/null
+touch "$ROOT/c2-kill-done"; sleep 1; rm -f "$ROOT/c2-hook.sh"
+check "(setup of the test) the killed run left main ahead of origin by one merge and its branch commit, and origin untouched" '[[ "$(git -C "$ROOT/c2" rev-list --count origin/main..main)" == 2 && "$(git -C "$ROOT/c2-origin.git" rev-parse main)" == "$origin_before" ]]'
+out=$($LOCAL_MERGE_QUEUE land c2 2>&1); rc=$?
+check "the next run refuses, naming the commits main is ahead by and the command that discards it" '[[ $rc != 0 && "$out" == *"has 2 commit(s) that origin/main does not"* && "$out" == *"Merge alpha"* && "$out" == *"reset --hard origin/main"* ]]'
+check "…and cleans nothing up: the worktrees, the local and the remote branches stay"  '[[ -d "$(r3_wt c2 alpha)" && -d "$(r3_wt c2 beta)" ]] && git -C "$ROOT/c2" rev-parse --verify -q refs/heads/alpha >/dev/null && git -C "$ROOT/c2-origin.git" rev-parse --verify -q refs/heads/alpha >/dev/null'
+check "…the entries are still approved, and nothing reached origin"                     '[[ "$(r3_qinfo)" == alpha:approved,beta:approved && "$(git -C "$ROOT/c2-origin.git" rev-parse main)" == "$origin_before" ]]'
+git -C "$ROOT/c2" reset -q --hard origin/main
+: > "$ROOT/c2-gate.log"
+out=$($LOCAL_MERGE_QUEUE land c2 2>&1); rc=$?
+check "once the leftover is discarded, both entries land as gated entries"              '[[ $rc == 0 && -f "$ROOT/c2/alpha.txt" && -f "$ROOT/c2/beta.txt" ]] && r3_main_eq c2'
+check "…and each was gated"                                                             '[[ "$(r3_gates c2)" == 2 ]]'
+# A main that is merely behind is fast-forwarded, as it always was.
+r3_outside c2 other/bot.txt=bot "outside push"
+r3_branch c2 gamma gamma.txt=gamma; r3_queue c2 gamma
+out=$($LOCAL_MERGE_QUEUE land c2 2>&1); rc=$?
+check "a main that is only behind origin is fast-forwarded, and the entry lands on it"  '[[ $rc == 0 && -f "$ROOT/c2/other/bot.txt" && -f "$ROOT/c2/gamma.txt" ]] && r3_main_eq c2'
+
+# RESUME FETCHES BEFORE IT GATES (nit): a main that moved while the entry was stalled is seen,
+# and the entry is rebased and gated again, in a one-lane repo as well.
+r3_branch c2 stalled stalled.txt=s
+r3_queue c2 stalled
+touch "$ROOT/c2-fail"; : > "$ROOT/c2-gate.log"
+$LOCAL_MERGE_QUEUE land c2 >/dev/null 2>&1; rc=$?
+rm -f "$ROOT/c2-fail"
+check "(setup of the test) the entry stalls on its gate"                                '[[ $rc == 2 && "$(r3_qinfo)" == stalled:stalled ]]'
+r3_outside c2 other/more.txt=more "outside push while stalled"
+: > "$ROOT/c2-gate.log"
+out=$($LOCAL_MERGE_QUEUE resume c2 2>&1); rc=$?
+check "resume sees a main that moved while the entry was stalled, rebases and gates again, and lands" '[[ $rc == 0 && "$out" == *"moved while stalled was stalled — rebasing it again"* && "$(r3_gates c2)" == 1 && -f "$ROOT/c2/other/more.txt" && -f "$ROOT/c2/stalled.txt" ]] && r3_main_eq c2'
 # ROUND3-END
 
 echo

@@ -268,7 +268,7 @@ git add -A && git rebase --continue
 local-merge-queue resume <repo>
 ```
 
-The line then continues from that entry. Two things about that are worth saying out loud.
+The line then continues from that entry. `resume` fetches first: a `main` that moved while the entry was stalled (another lane landing, or a push from outside the queue) is seen, and the entry is rebased and gated again, in a one-lane repo as well as a multi-lane one. Two things about that are worth saying out loud.
 
 - **A gate failure after the rebase is the queue working rather than a bug.** It means the
   branch passed on the old `main` and fails on the new one, which is precisely what would
@@ -595,6 +595,7 @@ A repo with no `lanes` key behaves exactly as before. `loadConfig` gives it one 
 - **Interruption.** `SIGINT`, `SIGTERM` and `SIGHUP` stop the run's gate (each gate step runs in a process group of its own, which receives `SIGTERM`, then `SIGKILL` after five seconds), release the landing lock and the queue lock, clear the run's batch marks and exit 130, 143 or 129. `SIGKILL` runs nothing: it leaves a lock whose holder is dead (and possibly an orphaned gate); `status` reports a dead run's lock as such, never as `LOCKED`, and the next command that needs the lock breaks it. Any other way out (a `die`, a failed push) releases the same things.
 - It refuses to land a repo whose primary checkout is dirty or off `main`, naming what is
   dirty, so that another session's in-flight edit is never swept into a landing.
+- **Local `main` equals `origin/main` before every entry starts.** The run fetches, fast-forwards a `main` that is behind, and stops, naming the commits, when `main` has commits `origin/main` does not (what a run killed between its merge and its push leaves behind). "Already in main" is asked of `origin/main`, so a merge that exists only in the primary checkout is never read as a landed branch and its entry is never cleaned up. Nothing is reset for you, since those commits may be somebody's own; the message prints the `reset --hard origin/main` that discards a killed run's leftovers.
 - A push failure rolls the local merge back rather than leaving `main` ahead of `origin`.
 - `git branch -d` rather than `-D` does the deletion, so an unmerged branch survives.
 
