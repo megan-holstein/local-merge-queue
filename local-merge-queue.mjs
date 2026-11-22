@@ -660,10 +660,15 @@ function lockAcquire (dir, { waitMs = 0, onBroken = () => {} } = {}) {
 function lockRelease (dir, token) {
   if (!token) return
   const o = lockOwner(dir)
-  if (!o || o.token !== token) return
+  if (!o || o.token !== token) return                // guard 1: the lock is not ours, so it is not touched at all
+  const seam = process.env.LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM      // a test seam: stop between the two guards
+  if (seam) {
+    fs.writeFileSync(`${seam}.checked`, '')
+    for (let i = 0; i < 200 && !fs.existsSync(`${seam}.go`); i++) sleepMs(50)
+  }
   const away = `${dir}.gone-${token}`
   try { fs.renameSync(dir, away) } catch { return }
-  if (lockOwner(away)?.token !== token) {            // not ours after all: put it back
+  if (lockOwner(away)?.token !== token) {            // guard 2: not ours after all (it changed hands in between): put it back
     try { fs.renameSync(away, dir) } catch { /* taken meanwhile */ }
     return
   }
@@ -1448,7 +1453,12 @@ ${behind} If this branch should leave the queue instead, \`local-merge-queue deq
 //      Red, a conflict, or any error: nothing was pushed, the candidate is
 //      dropped, and the entries land one at a time, so the entry that fails is
 //      the one that stalls.
-class BatchFailure extends Error {}
+// `published` names the entries whose rebased tips were already pushed to origin when the
+// batch failed (a failure at the push of `main` or after the first publish), so that the
+// message can say the remote branches were rewritten.
+class BatchFailure extends Error {
+  constructor (message, published = []) { super(message); this.published = published }
+}
 
 // The label a batch groups by: the lanes an entry carries, `~` marking one it only
 // reached. A one-lane repo has one label for everything.
@@ -1701,13 +1711,21 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
 
   // PUBLISH EACH ENTRY'S REBASED TIP, so that its pull request retires as merged,
   // and then push `main`, once, to the commit that was gated.
+  const published = []
   for (const e of members) {
     const was = info.get(e.branch)
     const pub = gitTry(['push', `--force-with-lease=${e.branch}:${was.remoteSha}`, 'origin', `${was.rebasedTip}:refs/heads/${e.branch}`], repo.checkout)
-    if (!pub.ok) throw new BatchFailure(`publishing the rebased tip of ${e.branch} failed: ${pub.err}`)
+    if (!pub.ok) throw new BatchFailure(`publishing the rebased tip of ${e.branch} failed: ${pub.err}`, published)
+    published.push(e.branch)
+  }
+  // APPROVAL IS READ AGAIN AFTER THE TIPS ARE PUSHED AND BEFORE `main` IS: the pushes are
+  // network round trips, and an entry unapproved or dequeued in that time must not land.
+  for (const e of members) {
+    const fresh = freshEntry(e)
+    if (!fresh || fresh.status !== 'approved') throw new BatchFailure(`${e.branch} was ${fresh ? 'unapproved' : 'dequeued'} while the batch's tips were being published`, published)
   }
   const push = gitTry(['push', 'origin', `${candidate}:refs/heads/${repo.mainBranch}`], repo.checkout)
-  if (!push.ok) throw new BatchFailure(`origin rejected the push of ${repo.mainBranch}, so nothing has landed: ${push.err}`)
+  if (!push.ok) throw new BatchFailure(`origin rejected the push of ${repo.mainBranch}, so nothing has landed: ${push.err}`, published)
 
   // ---- from here the batch has landed; nothing below may throw ----
   const ffm = gitTry(['merge', '--ff-only', candidate], repo.checkout)
@@ -1718,8 +1736,17 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
     const was = info.get(e.branch)
     console.log(`\n${bold('──')} ${bold(e.branch)} ${dim(e.worktree)} ${dim('(landed in the batch)')}`)
     // The branch moves to the tip that was published, so that cleanup can prove it contained.
-    const rs = gitTry(['reset', '--hard', '-q', was.rebasedTip], e.worktree)
-    if (!rs.ok) console.log(red(`  COULD NOT MOVE ${e.branch} TO ITS PUBLISHED TIP: ${rs.err}`))
+    // NEVER WITH `reset --hard`, which discards work: the worktree is checked, and moved with
+    // `reset --keep` (which refuses rather than discard) only if it is still on the commit
+    // the batch was built from with nothing changed; otherwise it stays as it is and cleanup
+    // keeps the worktree and the branch (see `cleanupLanded`).
+    const head = gitTry(['rev-parse', 'HEAD'], e.worktree)
+    if (head.ok && head.out === was.branchSha && !gitTry(['status', '--porcelain'], e.worktree).out) {
+      const rs = gitTry(['reset', '--keep', '-q', was.rebasedTip], e.worktree)
+      if (!rs.ok) console.log(red(`  COULD NOT MOVE ${e.branch} TO ITS PUBLISHED TIP: ${rs.err}`))
+    } else {
+      console.log(red(`  ${e.branch}'s worktree changed after the batch's final check, so its branch was not moved to the published tip`))
+    }
     try { cleanupLanded(repo, e, e.worktree, { landedTip: was.rebasedTip }) } catch (err) { console.log(red(`  cleanup of ${e.branch} failed: ${err.message}`)) }
     e.status = 'landed'
     removeEntry(e)
@@ -2382,7 +2409,10 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
               for (const e of members) noBatch.add(e.branch)
               clearMarks()
               console.log(red(`  BATCH FAILED: ${err instanceof BatchFailure ? err.message : `unexpected error: ${err.message}`}`))
-              console.log(red(`  Nothing has landed and no entry's branch moved. Falling back to landing ${names.join(', ')} one at a time.`))
+              const rewrote = err.published?.length
+                ? ` The remote ${err.published.length === 1 ? 'branch' : 'branches'} of ${err.published.join(', ')} already carry ${err.published.length === 1 ? 'its' : 'their'} rebased ${err.published.length === 1 ? 'tip' : 'tips'}: origin's copy was rewritten (the same content; the next landing force-pushes it again with a lease).`
+                : ''
+              console.log(red(`  Nothing has landed and no entry's local branch moved.${rewrote} Falling back to landing ${names.join(', ')} one at a time.`))
             }
           }
         }

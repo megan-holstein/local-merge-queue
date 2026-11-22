@@ -2387,6 +2387,128 @@ r3_queue c7 byhand2
 git -C "$ROOT/c7" merge -q --no-ff -m "merged by hand again" byhand2 && git -C "$ROOT/c7" push -q origin main
 out=$($LOCAL_MERGE_QUEUE land c7 2>&1)
 check "a clean cleanup-only entry is removed entirely: worktree, local and remote branch" '[[ ! -d "$(r3_wt c7 byhand2)" ]] && ! git -C "$ROOT/c7" rev-parse --verify -q refs/heads/byhand2 >/dev/null && ! git -C "$ROOT/c7-origin.git" rev-parse --verify -q refs/heads/byhand2 >/dev/null'
+
+echo
+echo "── round 3 · batched landing: the guards the re-check found unpinned ────────"
+# The re-check removed each guard in turn and found that nothing failed. Each test here fails when
+# the guard it names is taken out, because it asserts the guard's own message (or its effect).
+export HERE
+r3_init c8
+r3_hook c8
+r3_config c8 "\"batch\": {\"max\": 5}, \"gate\": [\"$(r3_gate_step c8)\"], \"finalCheck\": \"true\""
+cat > "$ROOT/c8-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c8-hold-main" ]; then
+  touch "$ROOT/c8-push-started"
+  for i in $(seq 1 150); do [ -e "$ROOT/c8-go" ] && break; sleep 0.2; done
+fi
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c8-reject-main" ]; then echo "REJECTED BY TEST HOOK" >&2; exit 1; fi
+if [ -e "$ROOT/c8-unapprove-on" ] && [ "$ref" = "refs/heads/$(cat "$ROOT/c8-unapprove-on")" ]; then node "$HERE/local-merge-queue.mjs" unapprove "$(cat "$ROOT/c8-unapprove")" --repo c8 >/dev/null 2>&1; fi
+SH
+c8_pair () {  # a prefix: two entries, approved
+  r3_branch c8 "$1-1" "$1-1.txt=1"; r3_branch c8 "$1-2" "$1-2.txt=2"; r3_queue c8 "$1-1" "$1-2"
+}
+c8_gated () {  # a land run whose batch gate is held; the caller acts, then it is released
+  r3_hold c8; : > "$ROOT/c8-gate.log"
+  $LOCAL_MERGE_QUEUE land c8 > "$ROOT/c8-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c8-gate-started"
+}
+c8_release () { touch "$ROOT/c8-release"; wait $BG; rc=$?; out=$(cat "$ROOT/c8-land.out"); r3_unhold c8; }
+
+# 1. Guard: an entry's worktree must still be clean.
+c8_pair wc
+c8_gated
+echo "left by somebody" > "$(r3_wt c8 wc-2)/scratch.txt"
+c8_release
+check "an untracked file made in an entry's worktree during the batch gate fails the batch" '[[ "$out" == *"BATCH FAILED: wc-2 changed while the batch was gated"* ]]'
+check "…and the entries still land, one at a time"                                         '[[ -f "$ROOT/c8/wc-1.txt" && -f "$ROOT/c8/wc-2.txt" ]]'
+
+# 2. Guard: the entry's remote branch is compared with what it was. Nothing is published before it fails.
+c8_pair rb
+c8_gated
+( cd "$ROOT/c8-other" && git fetch -q origin rb-2 && git checkout -q -B rb-2 origin/rb-2 && echo theirs > rb-theirs.txt && git add -A && git commit -qm "pushed to the remote branch during the gate" && git push -q origin rb-2 && git checkout -q main )
+: > "$ROOT/c8-refs.log"
+c8_release
+check "a push to an entry's remote branch during the batch gate fails the batch with that message" '[[ "$out" == *"BATCH FAILED: rb-2 changed while the batch was gated"* ]]'
+
+# 3. Guard: origin's main moved while the candidate was gated.
+c8_pair mv
+c8_gated
+r3_outside c8 other/moved.txt=1 "pushed to main during the batch gate"
+: > "$ROOT/c8-refs.log"
+c8_release
+check "main moving during the batch gate fails the batch with the stale-gate message, not at the push" '[[ "$out" == *"BATCH FAILED: main moved while the candidate was gated, so the gate result is stale"* ]]'
+check "…and before any entry's tip was published for the batch"                              '[[ "$out" != *"BATCH FAILED: origin rejected"* ]]'
+
+# 4. Guard: each entry's rebased tip is published before main is pushed, so its pull request can retire as merged.
+c8_pair pb
+: > "$ROOT/c8-refs.log"
+$LOCAL_MERGE_QUEUE land c8 > "$ROOT/c8-land.out" 2>&1; rc=$?
+out=$(cat "$ROOT/c8-land.out")
+second=$(grep "^refs/heads/pb-2 " "$ROOT/c8-refs.log" | grep -v " 0000000" | head -1 | cut -d" " -f2)
+check "(setup of the test) the pair landed as one batch"                                      '[[ $rc == 0 && "$out" == *"gated together in one batch, landed in one push: pb-1, pb-2"* ]]'
+check "the second entry's rebased tip was pushed to its own branch on origin, before main"     '[[ -n "$second" && "$(grep -n "^refs/heads/pb-2 $second" "$ROOT/c8-refs.log" | head -1 | cut -d: -f1)" -lt "$(grep -n "^refs/heads/main " "$ROOT/c8-refs.log" | head -1 | cut -d: -f1)" ]]'
+check "…and that tip is reachable from main (which is what lets its pull request close as merged)" '[[ -n "$second" ]] && git -C "$ROOT/c8-origin.git" merge-base --is-ancestor $second main'
+
+# 5. Approval is re-checked after the tips are pushed and before main is.
+c8_pair ap
+echo ap-2 > "$ROOT/c8-unapprove-on"; echo ap-1 > "$ROOT/c8-unapprove"
+: > "$ROOT/c8-refs.log"
+out=$($LOCAL_MERGE_QUEUE land c8 2>&1)
+rm -f "$ROOT/c8-unapprove-on" "$ROOT/c8-unapprove"
+check "an entry unapproved while the tips are being pushed fails the batch before main is pushed" '[[ "$out" == *"BATCH FAILED: ap-1 was unapproved"* ]]'
+check "…and the unapproved entry does not land (it stays enqueued), while the other does"      '[[ ! -f "$ROOT/c8/ap-1.txt" && -f "$ROOT/c8/ap-2.txt" && "$(r3_qinfo)" == ap-1:enqueued ]]'
+$LOCAL_MERGE_QUEUE dequeue ap-1 --repo c8 >/dev/null 2>&1
+
+# 6. No `reset --hard` discards work in an entry's worktree after the push.
+c8_pair rs
+rm -f "$ROOT/c8-push-started" "$ROOT/c8-go"; touch "$ROOT/c8-hold-main"
+$LOCAL_MERGE_QUEUE land c8 > "$ROOT/c8-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c8-push-started"
+echo "an edit made after the final check" >> "$(r3_wt c8 rs-1)/rs-1.txt"
+echo "a new file" > "$(r3_wt c8 rs-1)/notes.txt"
+touch "$ROOT/c8-go"; wait $BG; rc=$?; rm -f "$ROOT/c8-hold-main"; out=$(cat "$ROOT/c8-land.out")
+check "(setup of the test) the batch landed both entries"                                      '[[ $rc == 0 && "$(git -C "$ROOT/c8" show main:rs-1.txt)" == 1 && -f "$ROOT/c8/rs-2.txt" ]]'
+check "an uncommitted edit and a new file made in an entry's worktree after the final check survive" '[[ "$(cat "$(r3_wt c8 rs-1)/rs-1.txt")" == *"an edit made after the final check"* && -f "$(r3_wt c8 rs-1)/notes.txt" ]]'
+check "…the entry's worktree and branch are kept, and the run says why"                        '[[ "$out" == *"WORKTREE KEPT"* ]] && git -C "$ROOT/c8" rev-parse --verify -q refs/heads/rs-1 >/dev/null'
+
+# 7. A failed batch says the remote tips were rewritten.
+c8_pair fm
+touch "$ROOT/c8-reject-main"
+out=$($LOCAL_MERGE_QUEUE land c8 2>&1)
+rm -f "$ROOT/c8-reject-main"
+check "the failed-batch message says the entries' remote tips were already rewritten"          '[[ "$out" == *"BATCH FAILED: origin rejected the push of main, so nothing has landed"* && "$out" == *"remote branch"*"fm-1, fm-2"*"already"*"rebased tips"* && "$out" == *"Falling back to landing fm-1, fm-2 one at a time"* ]]'
+
+echo
+echo "── round 3 · both guards of a lock's release are kept, and each is pinned ───"
+# lockRelease removes a lock only if it is ours, and checks that again after moving it aside (and puts
+# it back if it was not). The re-check found the first guard removable with every test still green, and
+# the second insufficient alone under contention (demonstrated), so each must be pinned by a test
+# that fails without it. The seam LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM=<prefix> writes <prefix>.checked
+# when a release gets past the first guard, and waits there for <prefix>.go.
+LG="$ROOT/c8b-state"
+printf '{ "repos": { "x": { "checkout": "%s" } } }\n' "$ROOT" > "$ROOT/c8b-repos.json"; export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/c8b-repos.json"
+c8b_queue () { rm -rf "$LG"; mkdir -p "$LG"; node -e 'require("fs").writeFileSync(process.argv[1]+"/queue.json",JSON.stringify({entries:[{repo:"x",branch:"x1",worktree:"/x",status:"enqueued",lanes:[],reached:[]}]}))' "$LG"; rm -f "$ROOT/c8b-seam".* "$ROOT/c8b-pause"; }
+# Guard 1: a release of a lock that is not ours never moves it aside.
+c8b_queue
+touch "$ROOT/c8b-seam.go"
+LOCAL_MERGE_QUEUE_STATE="$LG" LOCAL_MERGE_QUEUE_TEST_PAUSE_IN_LOCK="$ROOT/c8b-pause" LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM="$ROOT/c8b-seam" $LOCAL_MERGE_QUEUE approve x1 --repo x >/dev/null 2>&1 &
+BG=$!
+for i in $(seq 1 100); do [[ -f "$LG/queue.lock/owner.json" ]] && break; sleep 0.1; done
+echo "{\"pid\":$$,\"token\":\"someone-elses-token\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LG/queue.lock/owner.json"
+touch "$ROOT/c8b-pause"; wait $BG
+check "a release whose lock is not its own stops at the first guard: it never moves the lock aside" '[[ ! -e "$ROOT/c8b-seam.checked" ]] && grep -q someone-elses-token "$LG/queue.lock/owner.json"'
+# Guard 2: the lock changed hands between the first guard and the rename, so what was moved aside is put back.
+c8b_queue
+LOCAL_MERGE_QUEUE_STATE="$LG" LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM="$ROOT/c8b-seam" $LOCAL_MERGE_QUEUE approve x1 --repo x >/dev/null 2>&1 &
+BG=$!
+r3_wait "$ROOT/c8b-seam.checked"
+rm -rf "$LG/queue.lock"; mkdir "$LG/queue.lock"
+echo "{\"pid\":$$,\"token\":\"took-over-meanwhile\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LG/queue.lock/owner.json"
+touch "$ROOT/c8b-seam.go"; wait $BG
+check "a release that finds another process's lock where its own was puts that lock back untouched" '[[ -f "$LG/queue.lock/owner.json" ]] && grep -q took-over-meanwhile "$LG/queue.lock/owner.json" && ! ls "$LG" | grep -q "gone-"'
+rm -rf "$LG" "$ROOT/c8b-seam".* "$ROOT/c8b-pause"
 # ROUND3-END
 
 echo
