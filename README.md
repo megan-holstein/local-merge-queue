@@ -434,7 +434,7 @@ machine.
 "batch": { "max": 5, "keep": ["node_modules"] }
 ```
 
-- **Per repository**: the `batch` key on the repo's entry (a repo-level key, never a lane's). Absent means off, and a repo without it behaves exactly as it did before this existed. `max` is an integer of at least 2. `keep` and `lockfiles` are described under [the batch worktree](#the-batch-worktree).
+- **Per repository**: the `batch` key on the repo's entry (a repo-level key, never a lane's). Absent means off, and a repo without it behaves exactly as it did before this existed. `max` is an integer of at least 2, and **only a `max` turns batching on for every run**: a `batch` key with `keep` (and `lockfiles`) but no `max` configures the batch worktree for the runs that pass `--batch`, which use a maximum of 5, and leaves every other run unbatched. `keep` and `lockfiles` are described under [the batch worktree](#the-batch-worktree).
 - **Per run**: `local-merge-queue land <repo> --batch` turns it on (a maximum of 5 where the repo has no `batch` key), and `--no-batch` turns it off for one run. Both flags together are refused. `resume` accepts them too.
 - Batching is tested against `git` 2.38 and newer and refuses an older one (`local-merge-queue: batched landing needs git 2.38 or newer`). A run without batching has no such floor.
 

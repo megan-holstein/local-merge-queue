@@ -268,13 +268,15 @@ function gateTimeoutMs (repo, laneName) {
 }
 
 // `batch` is opt-in per repository: {"max": 5}. Absent, the repository lands one
-// entry at a time, as it always has. A repo-level key, never a lane's.
+// entry at a time, as it always has. A repo-level key, never a lane's. ONLY A `max` TURNS
+// BATCHING ON FOR EVERY RUN: a `batch` with `keep` or `lockfiles` and no `max` configures
+// the batch worktree for the runs that pass `--batch`, and leaves the rest unbatched.
 const BATCH_DEFAULT_MAX = 5
 function checkBatch (key, repo) {
   if (repo.batch === undefined) return
   const b = repo.batch
-  if (!b || typeof b !== 'object' || Array.isArray(b) || !Number.isInteger(b.max) || b.max < 2) {
-    die(`repo "${key}": "batch" must look like { "max": 5 }, an integer of at least 2 (a batch of one is a landing run of one)`)
+  if (!b || typeof b !== 'object' || Array.isArray(b) || (b.max !== undefined && (!Number.isInteger(b.max) || b.max < 2))) {
+    die(`repo "${key}": "batch" must look like { "max": 5 } or { "keep": ["node_modules"] }; a "max" is an integer of at least 2 (a batch of one is a landing run of one), and only a "max" turns batching on for every run`)
   }
   // `keep`: the dependency directories of the batch worktree that survive between
   // batches (relative paths, e.g. ["node_modules"]). `lockfiles`: the files whose
@@ -296,7 +298,7 @@ function batchFor (repo, args) {
   if (args['--batch'] && args['--no-batch']) die('pass --batch or --no-batch, not both')
   if (args['--no-batch']) return null
   if (args['--batch']) return { max: repo.batch?.max ?? BATCH_DEFAULT_MAX }
-  return repo.batch ? { max: repo.batch.max } : null
+  return repo.batch?.max ? { max: repo.batch.max } : null
 }
 
 // A LANE IS A SET OF PATHS WITH ITS OWN SETUP AND GATE. Every repo has lanes
@@ -2988,7 +2990,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   if (!dryRun) announceKnownRed(repo, { write: false })
 
   if (landed.length) {
-    console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
+    console.log(`\n${green(bold(dryRun ? 'would land' : 'landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
     landed.forEach(b => console.log(`  · ${b}`))
     for (const names of batchesRun) console.log(dim(`  gated together in one batch, landed in one push: ${names.join(', ')}`))
   }

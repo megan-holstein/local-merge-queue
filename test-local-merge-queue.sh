@@ -2626,6 +2626,25 @@ c9_gated
 r3_outside c9 other/anything.txt=1 "bot: anything"
 c9_release
 check "in a one-lane repo any commit on origin's main during the gate stalls the entry"           '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* ]]'
+
+echo
+echo "── round 3 · batch.keep without a max leaves batching off; a dry run does not say it landed ──"
+# The config can now name the batch worktree's kept dependency directories (batch.keep) without
+# turning batching on for every run: only a "max" does that. --batch turns it on for one run.
+r3_init c10
+r3_config c10 '"batch": {"keep": ["node_modules"]}, "gate": ["true"], "finalCheck": "true"'
+r3_branch c10 k1 k1.txt=1; r3_branch c10 k2 k2.txt=2; r3_queue c10 k1 k2
+out=$($LOCAL_MERGE_QUEUE land c10 --dry-run 2>&1); rc=$?
+check "a batch key with keep and no max is accepted, and batching stays off for a run without --batch" '[[ $rc == 0 && "$out" != *"gated together, one gate run"* ]]'
+out=$($LOCAL_MERGE_QUEUE land c10 --dry-run --batch 2>&1); rc=$?
+check "--batch turns it on for the run, with the default maximum"                         '[[ $rc == 0 && "$out" == *"gated together, one gate run: k1, k2"* ]]'
+check "a dry run says it would land the entries, not that it landed them"                  '[[ "$out" == *"would land"* && "$out" != *"landed"*"branch(es) into"* ]]'
+r3_config c10 '"batch": {"max": 5, "keep": ["node_modules"]}, "gate": ["true"], "finalCheck": "true"'
+out=$($LOCAL_MERGE_QUEUE land c10 --dry-run 2>&1)
+check "a max in the config still turns batching on for every run"                         '[[ "$out" == *"gated together, one gate run: k1, k2"* ]]'
+r3_config c10 '"batch": {"keep": "node_modules"}, "gate": ["true"]'
+out=$($LOCAL_MERGE_QUEUE status c10 2>&1); rc=$?
+check "a keep that is not an array of relative paths is still refused"                      '[[ $rc != 0 && "$out" == *batch.keep* ]]'
 # ROUND3-END
 
 echo
