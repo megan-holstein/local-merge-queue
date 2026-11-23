@@ -2224,6 +2224,8 @@ st=$($LOCAL_MERGE_QUEUE status c3 2>&1)
 check "status says the dead run's gate is still running, and not LOCKED"                '[[ "$st" == *"gate it started is still running"* && "$st" == *"$pgid"* && "$st" != *LOCKED* ]]'
 out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
 check "a second land is refused while the orphaned gate runs, and names its process group"  '[[ $rc != 0 && "$out" == *"still running"* && "$out" == *"$pgid"* && "$out" != *"breaking a stale lock"* ]]'
+check "…the message says to look at the group first (the exact ps command) and how to release the lock by hand if it is not a gate" '[[ "$out" == *"ps -o pid,pgid,etime,command -g $pgid"* && "$out" == *"rm -rf $LOCAL_MERGE_QUEUE_STATE/locks/c3"* && "$out" == *"unrelated process"* ]]'
+check "…and status carries the same hint"                                                 '[[ "$($LOCAL_MERGE_QUEUE status c3 2>&1)" == *"ps -o pid,pgid,etime,command -g $pgid"* ]]'
 check "…and no second gate started"                                                      '[[ "$(r3_gates c3)" == 1 ]]'
 out=$($LOCAL_MERGE_QUEUE resume c3 2>&1); rc=$?
 check "resume is refused the same way"                                                   '[[ $rc != 0 && "$out" == *"still running"* && "$(r3_gates c3)" == 1 ]]'
@@ -2233,6 +2235,17 @@ r3_unhold c3
 check "(setup of the test) the orphaned gate has ended"                                   '! kill -0 -- -$pgid 2>/dev/null'
 out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
 check "once the gate has ended the next land breaks the stale lock and lands the entry"  '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/c3/held.txt" ]] && r3_main_eq c3'
+# A recycled group id: the dead run's recorded group is now some unrelated live process (here, this
+# test's own group). The lock cannot tell, so it is held; the message's hand release is the way out.
+r3_branch c3 recycled recycled.txt=1; r3_queue c3 recycled
+dead=$(sh -c 'echo $$'); mypg=$(ps -o pgid= -p $$ | tr -d ' ')
+rm -rf "$LOCAL_MERGE_QUEUE_STATE/locks/c3"; mkdir -p "$LOCAL_MERGE_QUEUE_STATE/locks/c3"
+echo "{\"pid\":$dead,\"token\":\"dead-run\",\"since\":\"2026-01-01T00:00:00.000Z\",\"gatePgid\":$mypg}" > "$LOCAL_MERGE_QUEUE_STATE/locks/c3/owner.json"
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "a lock whose recorded group is now an unrelated live process refuses, as it cannot tell"      '[[ $rc != 0 && "$out" == *"ps -o pid,pgid,etime,command -g $mypg"* ]]'
+eval "$(grep -o 'rm -rf [^ ]*locks/c3' <<<"$out" | head -1)"
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "…and the hand release the message prints clears it: the next land goes ahead"                 '[[ $rc == 0 && -f "$ROOT/c3/recycled.txt" ]]'
 
 echo
 echo "── round 3 · a branch name with a slash does not crash the stall report ────"

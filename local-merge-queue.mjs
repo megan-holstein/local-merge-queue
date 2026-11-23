@@ -203,6 +203,8 @@ function noteGateGroup (pgid) {
   } catch { /* the lock was released or taken over meanwhile */ }
 }
 
+const groupHint = pgid => `ps -o pid,pgid,etime,command -g ${pgid}`
+
 // Does any process of this group still exist? EPERM means one does, and is not ours.
 function groupAlive (pgid) {
   if (!Number.isInteger(pgid) || pgid <= 1) return false
@@ -1964,7 +1966,10 @@ function cmdStatus (cfg, args) {
       const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
       running = !!owner && Number.isInteger(owner.pid) && pidAlive(owner.pid)
       if (running) console.log(yellow(`  LOCKED by pid ${owner.pid} since ${owner.since} (${lockAge(owner)})`))
-      else if (groupAlive(owner?.gatePgid)) console.log(yellow(`  a landing run died (pid ${owner.pid} is gone), but the gate it started is still running (process group ${owner.gatePgid}); the lock is held until that gate ends`))
+      else if (groupAlive(owner?.gatePgid)) {
+        console.log(yellow(`  a landing run died (pid ${owner.pid} is gone), but the gate it started is still running (process group ${owner.gatePgid}); the lock is held until that gate ends`))
+        console.log(dim(`  look at what the group is first: ${groupHint(owner.gatePgid)}   (if it is not a gate, release the lock: rm -rf ${path.join(LOCK_DIR, key)})`))
+      }
       else console.log(dim(`  a landing run died holding the lock (pid ${owner?.pid ?? '?'} is gone); the next land clears it`))
     }
     announceKnownRed(repo, { write: false })
@@ -2449,8 +2454,11 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   if (!lock) {
     const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
     if (owner && !pidAlive(owner.pid) && groupAlive(owner.gatePgid)) {
-      die(`${key}: the landing run (pid ${owner.pid}, since ${owner.since}) is gone, but the gate it started is still running (process group ${owner.gatePgid}), so the lock stays held until that gate ends. ` +
-          `Wait for it, or end it with: kill -TERM -- -${owner.gatePgid}`)
+      die(`${key}: the landing run (pid ${owner.pid}, since ${owner.since}) is gone, but the gate it started is still running (process group ${owner.gatePgid}), so the lock stays held until that gate ends.\n` +
+          `  Look at what that group is before you end anything:  ${groupHint(owner.gatePgid)}\n` +
+          `  If it is a gate of this repository, wait for it, or end it with:  kill -TERM -- -${owner.gatePgid}\n` +
+          `  If it is not (a process group id can be reused by an unrelated process once the gate's own group is gone), nothing of this repository is running: ` +
+          `confirm that, then release the lock by hand with:  rm -rf ${path.join(LOCK_DIR, key)}`)
     }
     die(`${key} is being landed already (pid ${owner?.pid ?? '?'}, since ${owner?.since ?? '?'})`)
   }
