@@ -1168,7 +1168,7 @@ function inspectMovedMain (repo, gatedLanes, wt, base) {
   if (!fetched.ok || !tip.ok || tip.out === base) return { moved: false }
   const newTip = tip.out
   if (!gitTry(['merge-base', '--is-ancestor', base, newTip], repo.checkout).ok) {
-    return { moved: true, newTip, commits: [], touched: [], fatal: true, blocker: `origin/${main} was rewritten: it no longer descends from ${short(base)}, the commit the gate ran against` }
+    return { moved: true, newTip, commits: [], touched: [], reachOnly: [], fatal: true, blocker: `origin/${main} was rewritten: it no longer descends from ${short(base)}, the commit the gate ran against` }
   }
   const shas = gitTry(['rev-list', '--reverse', `${base}..${newTip}`], repo.checkout).out.split('\n').filter(Boolean)
   const commits = shas.map(sha => {
@@ -1193,7 +1193,10 @@ function inspectMovedMain (repo, gatedLanes, wt, base) {
   })
   // The lanes the new commits touch (or reach) among those this entry gated, in the entry's order.
   const touched = gatedLanes.filter(n => commits.some(c => c.inside.some(i => i.lane === n)))
-  return { moved: true, newTip, commits, blocker: null, touched }
+  // A lane the commits only REACH (none changes one of its paths) is gated again by its `reach.gate`
+  // where it has one, as an entry that only reached the lane is.
+  const reachOnly = touched.filter(n => !commits.some(c => c.inside.some(i => i.lane === n && i.how === 'touches')))
+  return { moved: true, newTip, commits, blocker: null, touched, reachOnly }
 }
 
 // ─── local main must equal origin's before an entry starts ───────────────────
@@ -3019,7 +3022,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         let gone = false
         // Run again the gates of `lanes` on the redone merge `m2`, in the entry's worktree
         // (detached at `m2` for the run, then back on the branch). Returns a reason it failed, or null.
-        const regate = async (lanes, m2) => {
+        const regate = async (lanes, m2, reachOnly = []) => {
           const detach = gitTry(['checkout', '--detach', m2], wt)
           if (!detach.ok) return `the redone merge could not be checked out in the entry's worktree to be gated: ${detach.err}`
           let why = null
@@ -3027,7 +3030,8 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           if (!setup.ok) why = `worktree setup ${setup.timedOut ? 'timed out' : 'failed'}${multiLane(repo) ? ` in lane ${setup.lane}` : ''} on the new ${repo.mainBranch}: ${setup.failed}`
           gate: for (const name of lanes) {
             if (why) break
-            for (const step of gateStepsFor(repo, entry, name)) {
+            const steps = reachOnly.includes(name) && repo.lanes[name].reach?.gate ? repo.lanes[name].reach.gate : gateStepsFor(repo, entry, name)
+            for (const step of steps) {
               console.log(dim(`  gate${multiLane(repo) ? ` [${name}]` : ''} (${repo.mainBranch} moved): ${step}`))
               if (!await runGate(step, wt, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) {
                 why = `the gate${multiLane(repo) ? ` of lane ${name}` : ''} ${gateTimedOut ? 'timed out' : 'failed'} on the new ${repo.mainBranch}: ${step}`
@@ -3068,7 +3072,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           }
           if (mv.touched.length) {
             const m2 = git(['rev-parse', repo.mainBranch], repo.checkout)
-            const failed = await regate(mv.touched, m2)
+            const failed = await regate(mv.touched, m2, mv.reachOnly)
             const afterwards = failed ? null : bindingBroken(repo, entry, wt, binding, runLanes)
             const drift = failed || afterwards ? null : (git(['rev-parse', repo.mainBranch], repo.checkout) === m2 ? null : `local ${repo.mainBranch} moved while the lanes were gated again`)
             if (failed || afterwards || drift) {

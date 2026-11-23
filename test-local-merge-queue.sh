@@ -2641,12 +2641,12 @@ check "a rejection with no move of main is still rolled back and fatal (entry st
 $LOCAL_MERGE_QUEUE dequeue s7 --repo c9 >/dev/null 2>&1
 
 # 7. A lane that REACHES the commit's paths (the lane's own reach rule) is gated again.
-cfg_lanes ', "reach": { "when": "grep -q ^other/" }'
+cfg_lanes ", \"reach\": { \"when\": \"grep -q ^other/\", \"gate\": [\"$(r3_gate_step c9 a-reach)\"] }"
 r3_branch c9 s8 a/s8.txt=1; r3_queue c9 s8
 c9_gated
 r3_outside c9 other/read-by-a.txt=1 "bot: a file the gated lane reads"
 c9_release
-check "a commit that reaches the gated lane by its reach rule gets that lane's gate run again, and lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 && "$out" == *"lane a"* ]] && r3_main_eq c9'
+check "a commit that reaches the gated lane by its reach rule gets that lane's reach gate run again (not the full gate), and lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 && "$(r3_lane_gates c9 a)" == 1 && "$(r3_lane_gates c9 a-reach)" == 1 && "$out" == *"lane a"* ]] && r3_main_eq c9'
 
 # 8. One lane: every path belongs to the one lane, so the one lane's gate runs again.
 r3_config c9 "\"gate\": [\"$(r3_gate_step c9)\"], \"finalCheck\": \"true\""
