@@ -2286,6 +2286,7 @@ out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
 hpid=$(cat "$ROOT/c5-hung-pid")
 check "a gate that runs past gateTimeoutMinutes stalls its entry (exit 2) with a timeout message"  '[[ $rc == 2 && "$out" == *"timed out after"* && "$(r3_qinfo)" == hangs:stalled ]]'
 check "…the hung gate, which ignores SIGTERM, was ended (SIGKILL after five seconds) in bounded time" '! kill -0 $hpid 2>/dev/null && (( SECONDS - start < 60 ))'
+check "…and a limit under a minute is said in seconds, not as 0.03 minutes"               '[[ "$out" == *"timed out after 2 seconds"* && "$out" != *"0.03 minutes"* ]]'
 check "…the landing lock was released, and nothing landed"                               '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" && ! -e "$ROOT/c5/hangs.txt" ]]'
 check "…and the stall report says the gate timed out"                                    'grep -q "timed out" "$LOCAL_MERGE_QUEUE_STATE/reports/c5-hangs.md"'
 $LOCAL_MERGE_QUEUE dequeue hangs --repo c5 >/dev/null 2>&1
@@ -2917,6 +2918,46 @@ c14_entry g5
 touch "$ROOT/c14-commit-on-push"
 out=$($LOCAL_MERGE_QUEUE land c14 2>&1); rc=$?
 check "a commit made in the worktree while the publish push is in flight does not land"   '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c14/sneaky.txt" && ! -e "$ROOT/c14/g5.txt" ]] && r3_main_eq c14'
+
+echo
+echo "── round 3 · review item 7: the batch's reset --keep, and the redeploy push fetches first ──"
+# 1. `git reset --keep` refuses where `--hard` would overwrite: a file made in an entry's worktree in
+# the window between the guard and the branch move, named like a file the published tip brings.
+r3_init c15
+r3_hook c15
+r3_config c15 "\"batch\": {\"max\": 5}, \"gate\": [\"$(r3_gate_step c15)\"], \"finalCheck\": \"true\""
+r3_branch c15 k-1 k-1.txt=1; r3_branch c15 k-2 k-2.txt=2; r3_queue c15 k-1 k-2
+rm -f "$ROOT"/c15-hold.*; touch "$ROOT/c15-hold.batch-move-k-1.go"
+LOCAL_MERGE_QUEUE_TEST_HOLD="$ROOT/c15-hold" $LOCAL_MERGE_QUEUE land c15 > "$ROOT/c15-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c15-hold.batch-move-k-2"
+echo "mine, made after the guard" > "$(r3_wt c15 k-2)/k-1.txt"
+touch "$ROOT/c15-hold.batch-move-k-2.go"; wait $BG; rc=$?; out=$(cat "$ROOT/c15-land.out")
+check "(setup of the test) the batch landed both entries"                                  '[[ "$out" == *"landed in one push: k-1, k-2"* && -f "$ROOT/c15/k-2.txt" ]]'
+check "a file made in the window between the guard and the branch move is not overwritten: the move is refused, not forced" '[[ "$(cat "$(r3_wt c15 k-2)/k-1.txt")" == "mine, made after the guard" && "$out" == *"COULD NOT MOVE k-2"* ]]'
+check "…and the entry's worktree and branch are kept (exit 3)"                               '[[ $rc == 3 && "$out" == *"WORKTREE KEPT"* ]]'
+
+# 2. The redeploy (settle) push fetches before it resets local main.
+r3_init c15r
+r3_hook c15r
+r3_config c15r "\"deploy\": {\"skipMarker\": \"[skip-deploy]\"}, \"gate\": [\"$(r3_gate_step c15r)\"], \"finalCheck\": \"true\""
+r3_branch c15r d1 d1.txt=1; r3_branch c15r d2 d2.txt=2; r3_queue c15r d1 d2
+touch "$ROOT/c15r-fail-after-first"
+$LOCAL_MERGE_QUEUE land c15r >/dev/null 2>&1; rc=$?
+rm -f "$ROOT/c15r-fail-after-first"
+check "(setup of the test) d1 landed marked and d2 stalled, so main sits on a build the host was told to skip" '[[ $rc == 2 && -f "$ROOT/c15r/d1.txt" && "$(git -C "$ROOT/c15r" log -1 --format=%B main)" == *"[skip-deploy]"* ]]'
+$LOCAL_MERGE_QUEUE dequeue d2 --repo c15r >/dev/null 2>&1
+cat > "$ROOT/c15r-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c15r-bot" ] && [ -z "${IN_BOT:-}" ]; then
+  rm -f "$ROOT/c15r-bot"
+  ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; export IN_BOT=1
+    cd "$ROOT/c15r-other" && git pull -q origin main && echo x > bot.txt && git add -A && git commit -qm "bot" && git push -q origin main ) >/dev/null 2>&1
+  echo "REJECTED: main moved" >&2; exit 1
+fi
+SH
+touch "$ROOT/c15r-bot"
+out=$($LOCAL_MERGE_QUEUE land c15r 2>&1)
+check "a redeploy push rejected because origin moved leaves local main on origin's new tip, not on a stale one" '[[ "$out" == *"THE REDEPLOY PUSH FAILED"* ]] && r3_main_eq c15r'
 # ROUND3-END
 
 echo

@@ -181,7 +181,10 @@ function runGate (cmd, cwd, env = {}, { timeoutMs = 0 } = {}) {
   })
 }
 
-const fmtMinutes = m => `${m} minute${m === 1 ? '' : 's'}`
+const fmtMinutes = m => {
+  if (m < 1) { const sec = Math.max(1, Math.round(m * 60)); return `${sec} second${sec === 1 ? '' : 's'}` }
+  return `${m} minute${m === 1 ? '' : 's'}`
+}
 
 // THE GATE'S PROCESS GROUP IS RECORDED IN THE LANDING LOCK. A gate runs in a group of
 // its own, so a run killed with SIGKILL leaves the gate running; the stale lock then
@@ -1448,6 +1451,8 @@ function settleDeploy (repo, dryRun, blocked = new Set()) {
   }
   const push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
   if (!push.ok) {
+    // Fetched first: a reset to a stale `origin/<main>` would put local main behind origin's.
+    gitTry(['fetch', 'origin', repo.mainBranch], repo.checkout)
     gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
     console.log(red(`  THE REDEPLOY PUSH FAILED: ${push.err || '(no stderr)'}`))
     console.log(red(`  Rolled it back. Production is still serving the build from before this landing run;`))
@@ -1854,6 +1859,7 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
     // keeps the worktree and the branch (see `cleanupLanded`).
     const head = gitTry(['rev-parse', 'HEAD'], e.worktree)
     if (head.ok && head.out === was.branchSha && !gitTry(['status', '--porcelain'], e.worktree).out) {
+      testHold(`batch-move-${e.branch}`)                // test seam: the window between the check above and the move below
       const rs = gitTry(['reset', '--keep', '-q', was.rebasedTip], e.worktree)
       if (!rs.ok) console.log(red(`  COULD NOT MOVE ${e.branch} TO ITS PUBLISHED TIP: ${rs.err}`))
     } else {
