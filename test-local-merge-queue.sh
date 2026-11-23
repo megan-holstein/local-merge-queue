@@ -3,7 +3,10 @@
 # Nothing here touches a real repo.
 set -u
 
-ROOT="$(mktemp -d "${TMPDIR:-/tmp}/local-merge-queue-test.XXXXXX")"
+# macOS sets TMPDIR with a trailing slash. The queue prints the paths node normalizes ("T//x" becomes
+# "T/x"), and several cases compare its output with $ROOT-based paths, so $ROOT must already be normal.
+_TMP="${TMPDIR:-/tmp}"
+ROOT="$(mktemp -d "${_TMP%/}/local-merge-queue-test.XXXXXX")"
 export LOCAL_MERGE_QUEUE_STATE="$ROOT/state"
 export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/repos.json"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +17,7 @@ bad ()  { FAIL=$((FAIL+1)); echo "  FAIL — $1"; }
 check () { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 echo "sandbox: $ROOT"
+check "the sandbox path is already normal (a TMPDIR ending in a slash gives no double slash)" '[[ "$ROOT" != *//* ]]'
 
 # ── build a throwaway repo: bare origin + primary checkout + two worktrees ────
 git init -q --bare "$ROOT/origin.git"
