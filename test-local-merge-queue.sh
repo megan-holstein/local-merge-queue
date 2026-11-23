@@ -2047,7 +2047,7 @@ r3_init () {  # name: origin, primary checkout (lanes' folders a/, b/, other/), 
   git init -q --bare "$ROOT/$n-origin.git"
   git init -q -b main "$ROOT/$n"
   ( cd "$ROOT/$n" && git config user.email t@t.t && git config user.name T && git remote add origin "$ROOT/$n-origin.git" \
-    && mkdir -p a b other && echo base > base.txt && echo a > a/f.txt && echo b > b/f.txt && echo o > other/f.txt \
+    && mkdir -p a b other && printf 'ign/\n*.scratch\n' > .gitignore && echo base > base.txt && echo a > a/f.txt && echo b > b/f.txt && echo o > other/f.txt \
     && git add -A && git commit -qm base && git push -qu origin main )
   git clone -q "$ROOT/$n-origin.git" "$ROOT/$n-other" 2>/dev/null
   git -C "$ROOT/$n-other" config user.email t@t.t; git -C "$ROOT/$n-other" config user.name T
@@ -2359,7 +2359,7 @@ c7_window
 echo "work in progress" > "$(r3_wt c7 late)/notes.txt"
 echo "an edit made after the gate" >> "$(r3_wt c7 late)/late.txt"
 c7_release
-check "an entry is landed, whatever was made in its worktree meanwhile"                 '[[ $rc == 0 && "$(r3_qinfo)" == "" && "$(git -C "$ROOT/c7" show main:late.txt)" == gated ]]'
+check "an entry is landed, whatever was made in its worktree meanwhile (exit 3: a cleanup left residue)" '[[ $rc == 3 && "$(r3_qinfo)" == "" && "$(git -C "$ROOT/c7" show main:late.txt)" == gated ]]'
 check "…the untracked file and the uncommitted edit made after the gate survive: the worktree is kept" '[[ -f "$(r3_wt c7 late)/notes.txt" && "$(cat "$(r3_wt c7 late)/late.txt")" == *"an edit made after the gate"* ]]'
 check "…the branch stays with its worktree, and the run says why, in red, as residue"    'git -C "$ROOT/c7" rev-parse --verify -q refs/heads/late >/dev/null && [[ "$out" == *"WORKTREE KEPT"* && "$out" == *notes.txt* ]]'
 rm -rf "$(r3_wt c7 late)"; git -C "$ROOT/c7" worktree prune; git -C "$ROOT/c7" branch -q -D late; git -C "$ROOT/c7-origin.git" branch -q -D late 2>/dev/null
@@ -2371,7 +2371,7 @@ c7_window
 ( cd "$ROOT/c7-other" && git fetch -q origin foreign && git checkout -q -B foreign origin/foreign && echo theirs > theirs.txt && git add -A && git commit -qm "pushed by somebody else after the publish" && git push -q origin foreign && git checkout -q main )
 theirs=$(git -C "$ROOT/c7-other" rev-parse foreign)
 c7_release
-check "an entry whose remote branch gained a commit after the publish still lands"       '[[ $rc == 0 && "$(git -C "$ROOT/c7" show main:foreign.txt)" == gated ]]'
+check "an entry whose remote branch gained a commit after the publish still lands (exit 3)" '[[ $rc == 3 && "$(git -C "$ROOT/c7" show main:foreign.txt)" == gated ]]'
 check "…and the remote branch is kept, with the commit somebody else pushed"             '[[ "$(git -C "$ROOT/c7-origin.git" rev-parse refs/heads/foreign)" == "$theirs" && "$out" == *"REMOTE BRANCH KEPT"* && "$out" == *"is not the landed tip"* ]]'
 check "…while the clean worktree and the local branch are removed as before"              '[[ ! -d "$(r3_wt c7 foreign)" ]] && ! git -C "$ROOT/c7" rev-parse --verify -q refs/heads/foreign >/dev/null'
 
@@ -2470,7 +2470,7 @@ r3_wait "$ROOT/c8-push-started"
 echo "an edit made after the final check" >> "$(r3_wt c8 rs-1)/rs-1.txt"
 echo "a new file" > "$(r3_wt c8 rs-1)/notes.txt"
 touch "$ROOT/c8-go"; wait $BG; rc=$?; rm -f "$ROOT/c8-hold-main"; out=$(cat "$ROOT/c8-land.out")
-check "(setup of the test) the batch landed both entries"                                      '[[ $rc == 0 && "$(git -C "$ROOT/c8" show main:rs-1.txt)" == 1 && -f "$ROOT/c8/rs-2.txt" ]]'
+check "(setup of the test) the batch landed both entries (exit 3: the kept worktree is residue)" '[[ $rc == 3 && "$(git -C "$ROOT/c8" show main:rs-1.txt)" == 1 && -f "$ROOT/c8/rs-2.txt" ]]'
 check "an uncommitted edit and a new file made in an entry's worktree after the final check survive" '[[ "$(cat "$(r3_wt c8 rs-1)/rs-1.txt")" == *"an edit made after the final check"* && -f "$(r3_wt c8 rs-1)/notes.txt" ]]'
 check "…the entry's worktree and branch are kept, and the run says why"                        '[[ "$out" == *"WORKTREE KEPT"* ]] && git -C "$ROOT/c8" rev-parse --verify -q refs/heads/rs-1 >/dev/null'
 
@@ -2646,6 +2646,55 @@ check "a max in the config still turns batching on for every run"               
 r3_config c10 '"batch": {"keep": "node_modules"}, "gate": ["true"]'
 out=$($LOCAL_MERGE_QUEUE status c10 2>&1); rc=$?
 check "a keep that is not an array of relative paths is still refused"                      '[[ $rc != 0 && "$out" == *batch.keep* ]]'
+
+echo
+echo "── round 3 · cleanup: what the gate leaves is the gate's; what appears after it is kept, and said truly ──"
+# THE DEFECT (reviewer): cleanup's baseline was taken before the gate, so a gate that leaves any
+# non-ignored file (a temp folder, build output) made every landing end in WORKTREE KEPT, with a
+# cure that failed on exactly that case and no trace in status.
+r3_init c11
+r3_hook c11
+cat > "$ROOT/c11-gate.sh" <<'SH'
+#!/bin/bash
+mkdir -p tmpout ign && echo x > tmpout/junk && echo y > ign/cache
+SH
+r3_config c11 "\"gate\": [\"bash $ROOT/c11-gate.sh\"], \"finalCheck\": \"true\""
+r3_branch c11 leaves leaves.txt=1
+r3_queue c11 leaves
+out=$($LOCAL_MERGE_QUEUE land c11 2>&1); rc=$?
+check "a gate that leaves a non-ignored folder and an ignored one does not keep the worktree: the entry lands and is cleaned up, exit 0" '[[ $rc == 0 && "$out" != *"WORKTREE KEPT"* && ! -d "$(r3_wt c11 leaves)" ]] && ! git -C "$ROOT/c11" rev-parse --verify -q refs/heads/leaves >/dev/null'
+check "…and the ignored files that went with the worktree were named before they went"    '[[ "$out" == *"ignored files go with the worktree: ign/"* ]]'
+
+cat > "$ROOT/c11-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c11-hold-main" ]; then
+  touch "$ROOT/c11-push-started"
+  for i in $(seq 1 150); do [ -e "$ROOT/c11-go" ] && break; sleep 0.2; done
+fi
+SH
+c11_window () {  # branch, then the commands to run in the worktree while the push of main is held
+  local b="$1"; shift
+  rm -f "$ROOT/c11-push-started" "$ROOT/c11-go"; touch "$ROOT/c11-hold-main"
+  $LOCAL_MERGE_QUEUE land c11 > "$ROOT/c11-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c11-push-started"
+  ( cd "$(r3_wt c11 $b)" && eval "$@" )
+  touch "$ROOT/c11-go"; wait $BG; rc=$?; rm -f "$ROOT/c11-hold-main"; out=$(cat "$ROOT/c11-land.out")
+}
+r3_branch c11 late late.txt=1; r3_queue c11 late
+c11_window late 'echo mine > notes.txt; echo mine > later.scratch'
+check "files made after the gate (an untracked one and an ignored one) keep the worktree; the entry still lands" '[[ -f "$ROOT/c11/late.txt" && -f "$(r3_wt c11 late)/notes.txt" && -f "$(r3_wt c11 late)/later.scratch" ]]'
+check "…the message says what was found and that it appeared after the gate ended, not what the gate made" '[[ "$out" == *"WORKTREE KEPT: it holds files that appeared after the gate ended"* && "$out" == *"?? notes.txt"* && "$out" == *"!! later.scratch"* && "$out" != *"tmpout"* ]]'
+check "…the run exits 3, which says a cleanup left something"                              '[[ $rc == 3 ]]'
+st=$($LOCAL_MERGE_QUEUE status c11 2>&1)
+check "status names the kept worktree, its reason and the way to finish it"                '[[ "$st" == *"left a worktree kept"* && "$st" == *"late"* && "$st" == *"Look first: git -C"* && "$st" == *"worktree remove --force"* && "$st" == *"notes.txt"* ]]'
+cure=$(grep -m1 "Then, once you have kept what you want: " <<<"$st" | perl -pe 's/\e\[[0-9;]*m//g; s/.*what you want: //')
+bash -c "$cure" >/dev/null 2>&1; crc=$?
+check "the cure that is printed works on this case: it removes the worktree and the branch"  '[[ $crc == 0 && ! -d "$(r3_wt c11 late)" ]] && ! git -C "$ROOT/c11" rev-parse --verify -q refs/heads/late >/dev/null'
+check "…and status stops naming it once it is gone"                                         '[[ "$($LOCAL_MERGE_QUEUE status c11 2>&1)" != *"left a worktree kept"* ]]'
+# An ignored file alone, made after the gate, keeps the worktree too: it is deleted by --force and no status line shows it.
+r3_branch c11 ignoredlate ignoredlate.txt=1; r3_queue c11 ignoredlate
+c11_window ignoredlate 'echo mine > only.scratch'
+check "an ignored file made after the gate keeps the worktree"                              '[[ "$out" == *"WORKTREE KEPT"* && "$out" == *"!! only.scratch"* && -f "$(r3_wt c11 ignoredlate)/only.scratch" && $rc == 3 ]]'
 # ROUND3-END
 
 echo

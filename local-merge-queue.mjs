@@ -1067,8 +1067,11 @@ function preflight (repo) {
  * to what lands, since only commits land, and it does not stall the entry; cleanup
  * is what keeps such a file safe (`cleanupLanded`).
  */
-const statusLines = wt => gitTry(['status', '--porcelain'], wt).out.split('\n').filter(Boolean)
-const trackedOnly = lines => lines.filter(l => !l.startsWith('??'))
+// `ignored` adds the ignored files and directories (`!! path`), which the binding does not
+// care about and cleanup does (`git worktree remove --force` deletes them).
+const statusLines = (wt, { ignored = false } = {}) =>
+  gitTry(['status', '--porcelain', ...(ignored ? ['--ignored=traditional'] : [])], wt).out.split('\n').filter(Boolean)
+const trackedOnly = lines => lines.filter(l => !l.startsWith('??') && !l.startsWith('!!'))
 
 function recordBinding (repo, entry, wt) {
   const head = gitTry(['rev-parse', 'HEAD'], wt)
@@ -1967,7 +1970,23 @@ function cmdStatus (cfg, args) {
     if (!cfg.repos[key]) continue
     reportResidue(key, cfg.repos[key])
     reportUndeployedTip(key, cfg.repos[key])
+    reportKept(key, q)
   }
+}
+
+// Landed entries whose worktree the run kept (it held files made after the gate): still on
+// disk, in no queue entry, so `status` names them until they are cleared.
+function reportKept (key, q) {
+  const kept = (q.kept || []).filter(k => k.repo === key && fs.existsSync(k.worktree))
+  if (!kept.length) return
+  console.log(yellow(`${key}: ${kept.length} landed entr${kept.length === 1 ? 'y' : 'ies'} left a worktree kept, because it holds files the run did not make`))
+  for (const k of kept) {
+    console.log(dim(`  · ${k.branch} — ${k.worktree}`))
+    console.log(dim(`    ${k.reason}`))
+    console.log(dim(`    Look first: ${k.look}`))
+    console.log(dim(`    Then, once you have kept what you want: ${k.cure}`))
+  }
+  console.log('')
 }
 
 /**
@@ -2168,7 +2187,21 @@ function cmdOrder (cfg, args) {
 // branch is deleted only if its tip on origin IS the landed tip: a commit somebody
 // pushed to it after the publish would be deleted with it. Either refusal is said in red
 // as residue, and the merge is done regardless.
-function cleanupLanded (repo, entry, wt, { landedTip = null, baseline = [] } = {}) {
+// A landed entry whose worktree was kept is no longer in the queue, so the queue file keeps
+// a record of it (`kept`), for `status` to show until the worktree is gone. The run's exit
+// status is 3 when any cleanup left residue (and nothing stalled or was refused).
+let residueLeft = 0
+function recordKept (repo, entry, wt, reason, cure, look) {
+  mutateQueue(q => {
+    q.kept = (q.kept || []).filter(k => fs.existsSync(k.worktree) && !(k.repo === repo.key && k.branch === entry.branch))
+    q.kept.push({ repo: repo.key, branch: entry.branch, worktree: wt, reason, cure, look, since: nowISO() })
+  })
+}
+
+// `baseline` is the worktree's status, ignored files included, as the gate left it, and `gated`
+// says there is one; without it (a cleanup-only entry, a batched one) the worktree was clean
+// when the entry was enqueued, and its ignored files (dependencies) are expected.
+function cleanupLanded (repo, entry, wt, { landedTip = null, baseline = [], gated = false } = {}) {
   const short = x => String(x).slice(0, 9)
   if (!landedTip) {
     const tip = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
@@ -2197,19 +2230,37 @@ function cleanupLanded (repo, entry, wt, { landedTip = null, baseline = [] } = {
   }
 
   const keepWorktree = []
+  let ignoredHere = []
   if (fs.existsSync(wt)) {
-    const extra = statusLines(wt).filter(l => !baseline.includes(l))
-    if (extra.length) keepWorktree.push(`it holds uncommitted or untracked files made since the gate: ${extra.map(l => l.trim()).join('; ')}`)
+    const all = statusLines(wt, { ignored: true })
+    ignoredHere = all.filter(l => l.startsWith('!!')).map(l => l.slice(3))
+    const extra = all.filter(l => !baseline.includes(l) && (gated || !l.startsWith('!!')))
+    if (extra.length) {
+      keepWorktree.push(gated
+        ? `it holds files that appeared after the gate ended: ${extra.map(l => l.trim()).join('; ')}`
+        : `it holds files that were not there when the entry was enqueued: ${extra.map(l => l.trim()).join('; ')}`)
+    }
     const head = gitTry(['rev-parse', 'HEAD'], wt)
     if (landedTip && (!head.ok || head.out !== landedTip)) keepWorktree.push(`its HEAD is ${head.ok ? short(head.out) : '(unreadable)'}, not the landed tip ${short(landedTip)}`)
     if (!landedTip) keepWorktree.push('the landed tip could not be read')
   }
+  // `worktree remove --force` deletes ignored files too, which no status line of the
+  // ordinary kind shows: they are named here before they go, so the run never deletes
+  // what its output did not say.
+  if (!keepWorktree.length && ignoredHere.length) {
+    console.log(dim(`  ignored files go with the worktree: ${ignoredHere.slice(0, 8).join(', ')}${ignoredHere.length > 8 ? `, and ${ignoredHere.length - 8} more` : ''}`))
+  }
   const rm = keepWorktree.length ? null : gitTry(['worktree', 'remove', '--force', wt], repo.checkout)
   if (rm) step('worktree removed', rm, `worktree still registered at ${wt}`)
   else {
+    const look = `git -C ${wt} status --ignored`
+    const cure = `git -C ${repo.checkout} worktree remove --force ${wt} && git -C ${repo.checkout} branch -d ${entry.branch}`
     console.log(red(`  WORKTREE KEPT: ${keepWorktree.join('; ')}.`))
     console.log(red(`  Removing it would delete that work, so the worktree and the local branch stay; the merge is done.`))
-    residue.push(`worktree kept at ${wt} (${keepWorktree.join('; ')}); once it is safe: git worktree remove ${wt}, then git branch -d ${entry.branch}`)
+    console.log(dim(`  Look first: ${look}`))
+    console.log(dim(`  Then, once you have kept what you want: ${cure}`))
+    residue.push(`worktree kept at ${wt}: ${keepWorktree.join('; ')}. Look first: ${look}. Then: ${cure} (branch -D instead of -d only if you do not want commits made there after the merge)`)
+    recordKept(repo, entry, wt, keepWorktree.join('; '), cure, look)
   }
   // PRUNE BETWEEN THE TWO, ALWAYS. `git branch -d` refuses a branch git
   // still believes is checked out in a worktree, and a worktree whose
@@ -2324,6 +2375,7 @@ function cleanupLanded (repo, entry, wt, { landedTip = null, baseline = [] } = {
   // reason to stall the line or to leave the entry looking unfinished. It is
   // said once, plainly, where the person running the landing run will read it.
   if (residue.length) {
+    residueLeft += residue.length
     console.log(red(`  ${entry.branch} landed, but its cleanup left residue:`))
     for (const r of residue) console.log(red(`    · ${r}`))
     console.log(dim('    Clear it by hand; the merge itself is done and pushed.'))
@@ -2796,6 +2848,12 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           continue
         }
 
+        // 3-. WHAT THE GATE LEFT BEHIND IS RECORDED HERE, for cleanup: whatever the worktree
+        //     holds when the gate ends (build output, a temp folder, ignored files) is the
+        //     gate's own, and is not "made since the gate". The binding above keeps the
+        //     record from before the gate; cleanup uses this one.
+        binding.after = statusLines(wt, { ignored: true })
+
         // 3a. THE QUEUE MAY HAVE CHANGED DURING THE GATE, which takes minutes. An
         //     entry unapproved or dequeued in that time is not landed.
         if (withdrawn(entry)) continue
@@ -2927,7 +2985,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         landedLanes.push(...runLanes.filter(n => !(entry.reached || []).includes(n)))
       }
 
-      cleanupLanded(repo, entry, wt, alreadyIn ? {} : { landedTip: binding.sha, baseline: binding.status })
+      cleanupLanded(repo, entry, wt, alreadyIn ? {} : { landedTip: binding.sha, baseline: binding.after, gated: true })
 
       entry.status = 'landed'
       entry.landedAt = nowISO()
@@ -3086,3 +3144,4 @@ if (!fn) { console.error(red(`local-merge-queue: unknown command "${cmd}"`)); cm
 const result = await fn(cfg, args)
 if (result && result.refused) process.exit(1)
 if (result && result.stalledOn) process.exit(2)
+if (residueLeft) process.exit(3)             // landed, but a cleanup step left something behind (said in red above)
