@@ -1,4 +1,0 @@
-[
- {"name":"keep-to-hard","frags":["c15.sh"],"old":"const rs = gitTry(['reset', '--keep', '-q', was.rebasedTip], e.worktree)","new":"const rs = gitTry(['reset', '--hard', '-q', was.rebasedTip], e.worktree)"},
- {"name":"redeploy-no-fetch","frags":["c15.sh"],"old":"    gitTry(['fetch', 'origin', repo.mainBranch], repo.checkout)\n    gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)\n    console.log(red(`  THE REDEPLOY PUSH FAILED","new":"    gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)\n    console.log(red(`  THE REDEPLOY PUSH FAILED"}
-]
