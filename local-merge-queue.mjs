@@ -31,6 +31,9 @@ const STATE_DIR = process.env.LOCAL_MERGE_QUEUE_STATE || path.join(XDG_STATE, 'l
 const QUEUE_PATH = path.join(STATE_DIR, 'queue.json')
 const LOCK_DIR = path.join(STATE_DIR, 'locks')
 const REPORT_DIR = path.join(STATE_DIR, 'reports')
+// A branch name may contain `/` (feat/x), which a file name cannot, so the report's name
+// carries it as %2F: one flat file per entry, whatever the branch is called.
+const reportFile = (key, branch) => path.join(REPORT_DIR, `${key}-${branch.replaceAll('/', '%2F')}.md`)
 const QUEUE_LOCK = path.join(STATE_DIR, 'queue.lock')
 const BATCH_DIR = path.join(STATE_DIR, 'batch')
 
@@ -136,17 +139,79 @@ for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) 
 
 // A gate step, setup step or final check with live output, in a process group of
 // its own. Asynchronous, so that a signal is handled while it runs.
-function runGate (cmd, cwd, env = {}) {
+// `timeoutMs` (from the repository's or lane's `gateTimeoutMinutes`) ends a step that runs
+// longer: its process group gets SIGTERM, then SIGKILL five seconds later, and the step
+// counts as failed, with `gateTimedOut` set for the caller to say so. A gate that hangs
+// would otherwise hold the landing lock for ever, since a live holder is never broken.
+let gateTimedOut = false
+function runGate (cmd, cwd, env = {}, { timeoutMs = 0 } = {}) {
   return new Promise(resolve => {
+    gateTimedOut = false
     // Once a signal has come in, nothing more is started and nothing downstream of a
     // killed gate runs (a fallback, a stall report): the promise never settles and the
     // signal handler ends the process.
     if (signalled) return
     const child = spawn('bash', ['-lc', cmd], { cwd, stdio: 'inherit', env: { ...process.env, ...env }, detached: true })
     gateGroups.add(child.pid)
-    child.on('error', () => { gateGroups.delete(child.pid); if (!signalled) resolve(false) })
-    child.on('close', code => { gateGroups.delete(child.pid); if (!signalled) resolve(code === 0) })
+    noteGateGroup(child.pid)
+    let timedOut = false
+    let timer = null
+    const finish = ok => { clearTimeout(timer); gateGroups.delete(child.pid); noteGateGroup(null); if (!signalled) resolve(ok) }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true
+        gateTimedOut = true
+        console.error(yellow(`\n  local-merge-queue: the step ran past its limit of ${fmtMinutes(timeoutMs / 60000)} — ending it`))
+        try { process.kill(-child.pid, 'SIGTERM') } catch { /* gone */ }
+        setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL') } catch { /* gone */ } }, 5000).unref()
+      }, timeoutMs)
+    }
+    child.on('error', () => finish(false))
+    child.on('close', code => {
+      if (!timedOut) return finish(code === 0)
+      // The shell is gone; wait (bounded) until its whole group is, so that nothing the
+      // gate started is still running when the entry is stalled and the lock released.
+      const started = Date.now()
+      const poll = setInterval(() => {
+        if (groupAlive(child.pid) && Date.now() - started < 8000) return
+        clearInterval(poll)
+        finish(false)
+      }, 100)
+    })
   })
+}
+
+const fmtMinutes = m => {
+  if (m < 1) { const sec = Math.max(1, Math.round(m * 60)); return `${sec} second${sec === 1 ? '' : 's'}` }
+  return `${m} minute${m === 1 ? '' : 's'}`
+}
+
+// THE GATE'S PROCESS GROUP IS RECORDED IN THE LANDING LOCK. A gate runs in a group of
+// its own, so a run killed with SIGKILL leaves the gate running; the stale lock then
+// admitted a second run, which started a second gate in the same worktree while the
+// first still ran (found by the independent re-check, 2026-11-21). With the group in
+// the lock's owner record, `lockStale` treats a lock whose run is dead but whose gate
+// group is alive as held, and the message names the group.
+let gateLock = null        // { dir, token }: the landing lock this process holds
+function noteGateGroup (pgid) {
+  if (!gateLock) return
+  try {
+    const f = path.join(gateLock.dir, 'owner.json')
+    const o = readJSON(f, null)
+    if (!o || o.token !== gateLock.token) return
+    if (pgid) o.gatePgid = pgid; else delete o.gatePgid
+    const tmp = `${f}.tmp-${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify(o))
+    fs.renameSync(tmp, f)
+  } catch { /* the lock was released or taken over meanwhile */ }
+}
+
+const groupHint = pgid => `ps -o pid,pgid,etime,command -g ${pgid}`
+
+// Does any process of this group still exist? EPERM means one does, and is not ours.
+function groupAlive (pgid) {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false
+  try { process.kill(-pgid, 0); return true } catch (e) { return e.code === 'EPERM' }
 }
 
 // Is a rebase sitting half-finished in this worktree? Asked of git rather than
@@ -159,6 +224,16 @@ function rebaseInProgress (wt) {
   if (!g.ok) return false
   return fs.existsSync(path.join(g.out, 'rebase-merge')) ||
          fs.existsSync(path.join(g.out, 'rebase-apply'))
+}
+
+// A TEST SEAM, like LOCAL_MERGE_QUEUE_TEST_PAUSE_IN_LOCK: with LOCAL_MERGE_QUEUE_TEST_HOLD=<prefix>
+// the run stops at a named point, writes <prefix>.<point>, and waits (up to 15 s) for
+// <prefix>.<point>.go, so a test can act in the window between two checks. Never set outside tests.
+function testHold (point) {
+  const seam = process.env.LOCAL_MERGE_QUEUE_TEST_HOLD
+  if (!seam) return
+  fs.writeFileSync(`${seam}.${point}`, '')
+  for (let i = 0; i < 300 && !fs.existsSync(`${seam}.${point}.go`); i++) sleepMs(50)
 }
 
 function pidAlive (pid) {
@@ -187,18 +262,36 @@ function loadConfig () {
     repo.mainBranch ||= 'main'
     repo.lanes = loadLanes(key, repo)
     checkBatch(key, repo)
+    checkTimeout(key, repo)
   }
   return cfg
 }
 
+// `gateTimeoutMinutes`: how long one setup step, gate step or final check may run, at repo
+// level or (overriding it) inside a lane. A positive number; fractions are allowed.
+function checkTimeout (key, repo) {
+  const bad = (where, v) => die(`repo "${key}": ${where}gateTimeoutMinutes must be a positive number of minutes, not ${JSON.stringify(v)}`)
+  if (repo.gateTimeoutMinutes !== undefined && !(typeof repo.gateTimeoutMinutes === 'number' && repo.gateTimeoutMinutes > 0 && Number.isFinite(repo.gateTimeoutMinutes))) bad('', repo.gateTimeoutMinutes)
+  for (const [name, lane] of Object.entries(repo.lanes)) {
+    const v = lane.gateTimeoutMinutes
+    if (v !== undefined && !(typeof v === 'number' && v > 0 && Number.isFinite(v))) bad(`lane "${name}": `, v)
+  }
+}
+function gateTimeoutMs (repo, laneName) {
+  const m = repo.lanes[laneName]?.gateTimeoutMinutes ?? repo.gateTimeoutMinutes
+  return m ? m * 60000 : 0
+}
+
 // `batch` is opt-in per repository: {"max": 5}. Absent, the repository lands one
-// entry at a time, as it always has. A repo-level key, never a lane's.
+// entry at a time, as it always has. A repo-level key, never a lane's. ONLY A `max` TURNS
+// BATCHING ON FOR EVERY RUN: a `batch` with `keep` or `lockfiles` and no `max` configures
+// the batch worktree for the runs that pass `--batch`, and leaves the rest unbatched.
 const BATCH_DEFAULT_MAX = 5
 function checkBatch (key, repo) {
   if (repo.batch === undefined) return
   const b = repo.batch
-  if (!b || typeof b !== 'object' || Array.isArray(b) || !Number.isInteger(b.max) || b.max < 2) {
-    die(`repo "${key}": "batch" must look like { "max": 5 }, an integer of at least 2 (a batch of one is a landing run of one)`)
+  if (!b || typeof b !== 'object' || Array.isArray(b) || (b.max !== undefined && (!Number.isInteger(b.max) || b.max < 2))) {
+    die(`repo "${key}": "batch" must look like { "max": 5 } or { "keep": ["node_modules"] }; a "max" is an integer of at least 2 (a batch of one is a landing run of one), and only a "max" turns batching on for every run`)
   }
   // `keep`: the dependency directories of the batch worktree that survive between
   // batches (relative paths, e.g. ["node_modules"]). `lockfiles`: the files whose
@@ -220,7 +313,7 @@ function batchFor (repo, args) {
   if (args['--batch'] && args['--no-batch']) die('pass --batch or --no-batch, not both')
   if (args['--no-batch']) return null
   if (args['--batch']) return { max: repo.batch?.max ?? BATCH_DEFAULT_MAX }
-  return repo.batch ? { max: repo.batch.max } : null
+  return repo.batch?.max ? { max: repo.batch.max } : null
 }
 
 // A LANE IS A SET OF PATHS WITH ITS OWN SETUP AND GATE. Every repo has lanes
@@ -229,7 +322,7 @@ function batchFor (repo, args) {
 // Everything after this function reads `repo.lanes` and never the repo-level
 // keys, which is what makes a repo without `lanes` behave exactly as it did
 // before lanes existed.
-const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'finalCheck', 'protectedPaths', 'deploy', 'reach']
+const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'gateModifies', 'finalCheck', 'protectedPaths', 'deploy', 'reach']
 
 function loadLanes (key, repo) {
   if (repo.lanes === undefined) {
@@ -237,6 +330,7 @@ function loadLanes (key, repo) {
     for (const k of LANE_KEYS) if (repo[k] !== undefined) lane[k] = repo[k]
     for (const k of LANE_KEYS) delete repo[k]
     repo.shared = []
+    checkGateModifies(key, key, lane)
     return { [key]: finishLane(lane) }
   }
   if (!repo.lanes || typeof repo.lanes !== 'object' || Array.isArray(repo.lanes) || !Object.keys(repo.lanes).length) {
@@ -264,6 +358,7 @@ function loadLanes (key, repo) {
     }
     lanes[name] = finishLane({ ...lane })
     checkReach(key, name, lanes[name])
+    checkGateModifies(key, name, lanes[name])
   }
   return lanes
 }
@@ -285,6 +380,17 @@ function checkReach (key, name, lane) {
   }
 }
 
+// `gateModifies`: path prefixes (relative to the repository root) a gate step of the lane may
+// change in the entry's worktree, such as a lockfile an install rewrites. Empty by default. The
+// commit binding does not count a tracked change under one of them as a change during the gate.
+function checkGateModifies (key, name, lane) {
+  const v = lane.gateModifies
+  if (v === undefined) return
+  if (!Array.isArray(v) || !v.every(x => typeof x === 'string' && x && !path.isAbsolute(x) && !x.split('/').includes('..'))) {
+    die(`repo "${key}": lane "${name}": gateModifies must be an array of relative path prefixes inside the repository, with no ".."`)
+  }
+}
+
 function finishLane (lane) {
   lane.gate ||= []
   lane.setup ||= []
@@ -295,6 +401,18 @@ function finishLane (lane) {
 // Brackets, lane by lane in the output, appear only for a repo with more than
 // one lane, so a one-lane repo prints what it printed before lanes existed.
 function multiLane (repo) { return Object.keys(repo.lanes).length > 1 }
+
+// The lanes one path belongs to, by the lanes' own rules: under `shared` it belongs to every
+// lane, under a lane's prefix to that lane, and any other path to the lane that takes "*".
+// A path that matches no lane at all (no "*" lane in the repo) belongs to none.
+function lanesForPath (repo, p) {
+  const names = Object.keys(repo.lanes)
+  if (repo.shared.some(s => p.startsWith(s))) return names
+  const owners = names.filter(n => Array.isArray(repo.lanes[n].paths) && repo.lanes[n].paths.some(s => p.startsWith(s)))
+  if (owners.length) return owners
+  const catchAll = names.find(n => repo.lanes[n].paths === '*')
+  return catchAll ? [catchAll] : []
+}
 
 // Which lanes does a branch touch? The paths its diff against the merge base
 // with `mainBranch` changes, each mapped to lanes: a path under a lane's prefix
@@ -319,12 +437,9 @@ function lanesOf (repo, cwd, branch, out = {}, { base: given = null, fail = die 
   const hit = new Set()
   const changed = diff.out.split('\n').filter(Boolean)
   for (const p of changed) {
-    if (repo.shared.some(s => p.startsWith(s))) { names.forEach(n => hit.add(n)); continue }
-    const owners = names.filter(n => Array.isArray(repo.lanes[n].paths) && repo.lanes[n].paths.some(s => p.startsWith(s)))
-    if (owners.length) { owners.forEach(n => hit.add(n)); continue }
-    const catchAll = names.find(n => repo.lanes[n].paths === '*')
-    if (!catchAll) fail(`"${branch}" changes ${p}, which no lane of ${repo.key} claims and no lane takes "*"`)
-    hit.add(catchAll)
+    const owners = lanesForPath(repo, p)
+    if (!owners.length) fail(`"${branch}" changes ${p}, which no lane of ${repo.key} claims and no lane takes "*"`)
+    owners.forEach(n => hit.add(n))
   }
   // REACH: a lane the paths above did not put in the entry can still be broken
   // by them (a test in one lane that bundles a file of another). The lane says
@@ -522,7 +637,11 @@ function lockCreate (dir, token) {
 // Why this lock is debris, or null. A live holder is never stale.
 function lockStale (dir) {
   const o = lockOwner(dir)
-  if (o && Number.isInteger(o.pid)) return pidAlive(o.pid) ? null : `its holder, pid ${o.pid}, is gone`
+  if (o && Number.isInteger(o.pid)) {
+    if (pidAlive(o.pid)) return null
+    if (groupAlive(o.gatePgid)) return null          // the run is dead, its gate is not: the lock is still held
+    return `its holder, pid ${o.pid}, is gone`
+  }
   try { if (Date.now() - fs.statSync(dir).mtimeMs > 5000) return 'it has no owner' } catch { /* released while we looked */ }
   return null
 }
@@ -580,10 +699,15 @@ function lockAcquire (dir, { waitMs = 0, onBroken = () => {} } = {}) {
 function lockRelease (dir, token) {
   if (!token) return
   const o = lockOwner(dir)
-  if (!o || o.token !== token) return
+  if (!o || o.token !== token) return                // guard 1: the lock is not ours, so it is not touched at all
+  const seam = process.env.LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM      // a test seam: stop between the two guards
+  if (seam) {
+    fs.writeFileSync(`${seam}.checked`, '')
+    for (let i = 0; i < 200 && !fs.existsSync(`${seam}.go`); i++) sleepMs(50)
+  }
   const away = `${dir}.gone-${token}`
   try { fs.renameSync(dir, away) } catch { return }
-  if (lockOwner(away)?.token !== token) {            // not ours after all: put it back
+  if (lockOwner(away)?.token !== token) {            // guard 2: not ours after all (it changed hands in between): put it back
     try { fs.renameSync(away, dir) } catch { /* taken meanwhile */ }
     return
   }
@@ -834,6 +958,7 @@ function acquireLock (key) {
   })
   if (!got.token) return null
   repoLockTokens.set(key, got.token)
+  gateLock = { dir, token: got.token }
   onExit(() => releaseLock(key))
   return dir
 }
@@ -842,6 +967,7 @@ function releaseLock (key) {
   const t = repoLockTokens.get(key)
   if (!t) return
   repoLockTokens.delete(key)
+  if (gateLock?.token === t) gateLock = null
   lockRelease(path.join(LOCK_DIR, key), t)
 }
 
@@ -950,6 +1076,160 @@ function preflight (repo) {
   return problems
 }
 
+// ─── what the gate vouched for ──────────────────────────────────────────────
+
+/**
+ * THE GATE'S CLAIM IS THAT IT RAN ON EXACTLY WHAT WILL LAND, so the merge is bound
+ * to the commit the gate ran on and not to whatever the branch ref holds later.
+ *
+ * Found by the independent re-check of 2026-11-21: a commit made in the entry's
+ * worktree during the gate (which takes minutes, and on a loaded machine an hour)
+ * moved the branch, and the merge, which named the branch, landed a tree the gate
+ * had never seen. So after the setup, and before the gate runs, the run records
+ * the branch's commit and the worktree's status; after the gate and again right
+ * before the merge it asks whether either changed, and stalls the entry if so; and
+ * the publish and the merge name the recorded commit, never the branch.
+ *
+ * What counts as a change in the worktree is a tracked file that differs from the
+ * record (an edit, a staged change, a deletion). An untracked file is not a change
+ * to what lands, since only commits land, and it does not stall the entry; cleanup
+ * is what keeps such a file safe (`cleanupLanded`).
+ */
+// `ignored` adds the ignored files and directories (`!! path`), which the binding does not
+// care about and cleanup does (`git worktree remove --force` deletes them).
+// (Not through `gitTry`, which trims its output: the first status line begins with a space.)
+const statusLines = (wt, { ignored = false } = {}) =>
+  (spawnSync('git', ['status', '--porcelain', ...(ignored ? ['--ignored=traditional'] : [])], { cwd: wt, encoding: 'utf8' }).stdout || '').split('\n').filter(Boolean)
+const trackedOnly = lines => lines.filter(l => !l.startsWith('??') && !l.startsWith('!!'))
+
+function recordBinding (repo, entry, wt) {
+  const head = gitTry(['rev-parse', 'HEAD'], wt)
+  const ref = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
+  if (!head.ok || !ref.ok || head.out !== ref.out) return { error: `the worktree is not on the tip of ${entry.branch}` }
+  return { sha: head.out, status: statusLines(wt) }
+}
+
+// A porcelain status line's path (both sides of a rename).
+const statusPaths = l => l.slice(3).split(' -> ')
+
+// Why the gate no longer vouches for what would land, or null. A tracked change under a
+// `gateModifies` prefix of one of the lanes the entry gated is the gate's own doing.
+function bindingBroken (repo, entry, wt, rec, gatedLanes = []) {
+  const allowed = gatedLanes.flatMap(n => repo.lanes[n]?.gateModifies || [])
+  const exempt = l => allowed.length > 0 && statusPaths(l).every(p => allowed.some(a => p === a || p.startsWith(a)))
+  const short = s => s.slice(0, 9)
+  const ref = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
+  if (!ref.ok) return `the branch ${entry.branch} is gone`
+  if (ref.out !== rec.sha) return `${entry.branch} moved from ${short(rec.sha)}, the commit the gate ran on, to ${short(ref.out)}`
+  const head = gitTry(['rev-parse', 'HEAD'], wt)
+  if (!head.ok || head.out !== rec.sha) return `the worktree's HEAD moved from ${short(rec.sha)}, the commit the gate ran on, to ${head.ok ? short(head.out) : '(unreadable)'}`
+  const was = trackedOnly(rec.status).filter(l => !exempt(l))
+  const now = trackedOnly(statusLines(wt)).filter(l => !exempt(l))
+  const differ = [...now.filter(l => !was.includes(l)), ...was.filter(l => !now.includes(l))]
+  if (differ.length) {
+    return `tracked files in the worktree changed (${differ.map(l => l.trim()).join('; ')}); if a gate step is meant to change such a file, name its path in the lane's "gateModifies"`
+  }
+  return null
+}
+
+// ─── origin's main moved under a passing gate ─────────────────────────────────
+
+/**
+ * THE PUSH OF `main` WAS REJECTED, SO DID ORIGIN'S `main` MOVE DURING THE GATE, AND IF IT DID,
+ * DID ANYTHING THE GATE COVERED CHANGE?
+ *
+ * On 2026-11-22 a 54-minute gate passed and the push was rejected as a non-fast-forward
+ * because a scheduled bot had pushed one commit to origin's `main` during the gate, changing
+ * one data file under a folder outside every lane the entry's gate covered. The run rolled the
+ * merge back and exited, and the gate had to be paid again. The remedy: fetch; redo the merge on
+ * the new `main` (what merges is still the gated commit), at most twice, and run again only the
+ * gates of the lanes the new commits touch, none if they touch none; a rewritten history, a third
+ * move, a merge that does not redo, or a re-run gate that fails stalls the entry, saying `main`
+ * moved under a passing gate. Lanes are independent by the queue's own definition (their own paths,
+ * setup and gate, with `shared` and `reach` declaring the exceptions, both of which are asked), so
+ * the gates of the lanes nothing touched have nothing new to say.
+ *
+ * A path belongs to a lane by the lanes' own rules (`lanesForPath`; a path no lane claims
+ * belongs to none, so it is outside). A lane the entry gated that has a `reach` rule is asked
+ * about the commit's paths too, since a path outside the lane can still be one the lane's tests
+ * read. A commit is examined by its own changes (against each parent, for a merge), never by
+ * the net diff of the range, so a change that a later commit reverts still counts.
+ *
+ * Returns { moved: false } when origin's `main` is where the run left it (the push failed for
+ * another reason), else { moved: true, newTip, commits: [{sha, subject, paths, inside}], touched,
+ * blocker } where `touched` names the gated lanes the commits touch or reach, and `blocker` (set
+ * with `fatal`) says why the merge may not be redone at all (rewritten history), or is null.
+ */
+function inspectMovedMain (repo, gatedLanes, wt, base) {
+  const main = repo.mainBranch
+  const short = x => x.slice(0, 9)
+  const fetched = gitTry(['fetch', 'origin', main], repo.checkout)
+  const tip = gitTry(['rev-parse', '--verify', '-q', `origin/${main}`], repo.checkout)
+  if (!fetched.ok || !tip.ok || tip.out === base) return { moved: false }
+  const newTip = tip.out
+  if (!gitTry(['merge-base', '--is-ancestor', base, newTip], repo.checkout).ok) {
+    return { moved: true, newTip, commits: [], touched: [], reachOnly: [], fatal: true, blocker: `origin/${main} was rewritten: it no longer descends from ${short(base)}, the commit the gate ran against` }
+  }
+  const shas = gitTry(['rev-list', '--reverse', `${base}..${newTip}`], repo.checkout).out.split('\n').filter(Boolean)
+  const commits = shas.map(sha => {
+    const subject = gitTry(['log', '-1', '--format=%s', sha], repo.checkout).out
+    const raw = spawnSync('git', ['diff-tree', '-m', '--root', '-r', '--name-only', '--no-commit-id', '-z', sha], { cwd: repo.checkout, encoding: 'utf8' })
+    const paths = [...new Set((raw.stdout || '').split('\0').filter(Boolean))]
+    const inside = []                              // how this commit touches what the gate covered
+    for (const p of paths) {
+      for (const n of lanesForPath(repo, p).filter(n => gatedLanes.includes(n))) {
+        if (!inside.some(i => i.lane === n && i.how === 'touches')) inside.push({ lane: n, how: 'touches', path: p })
+      }
+    }
+    if (paths.length) {
+      for (const n of gatedLanes) {
+        const r = repo.lanes[n].reach
+        if (!r || inside.some(i => i.lane === n)) continue
+        const res = spawnSync('bash', ['-c', r.when], { cwd: wt, input: paths.join('\n') + '\n', encoding: 'utf8', env: process.env })
+        if (res.status !== 1) inside.push({ lane: n, how: 'reaches', path: paths.join(', ') })   // 0 = reached; anything else could not answer, so it counts
+      }
+    }
+    return { sha: gitTry(['log', '-1', '--format=%h', sha], repo.checkout).out, subject, paths, inside }
+  })
+  // The lanes the new commits touch (or reach) among those this entry gated, in the entry's order.
+  const touched = gatedLanes.filter(n => commits.some(c => c.inside.some(i => i.lane === n)))
+  // A lane the commits only REACH (none changes one of its paths) is gated again by its `reach.gate`
+  // where it has one, as an entry that only reached the lane is.
+  const reachOnly = touched.filter(n => !commits.some(c => c.inside.some(i => i.lane === n && i.how === 'touches')))
+  return { moved: true, newTip, commits, blocker: null, touched, reachOnly }
+}
+
+// ─── local main must equal origin's before an entry starts ───────────────────
+
+/**
+ * A RUN KILLED BETWEEN ITS LOCAL MERGE AND ITS PUSH LEAVES `main` AHEAD OF ORIGIN, and
+ * the next run used to read the entry as already landed: the independent re-check
+ * (2026-11-21) killed a run during the push, and the next run cleaned up the entry,
+ * deleting its worktree and its branch local and remote, though the merge existed
+ * nowhere but in the primary checkout. So before an entry starts, `main` is brought to
+ * `origin/main` by a fast-forward, and a `main` that is ahead of origin (or has
+ * diverged) stops the run with the commits named; nothing is cleaned up or reset
+ * for the operator, since the commits may be somebody's own. Returns the problem, or null.
+ */
+function syncMainWithOrigin (repo) {
+  const main = repo.mainBranch
+  const fetched = gitTry(['fetch', 'origin', '--prune'], repo.checkout)
+  if (!fetched.ok) return `git fetch failed: ${fetched.err}`
+  if (!gitTry(['rev-parse', '--verify', '-q', `origin/${main}`], repo.checkout).ok) return `origin has no ${main} branch`
+  const extra = gitTry(['log', '--format=%h %s', `origin/${main}..${main}`], repo.checkout).out.split('\n').filter(Boolean)
+  if (extra.length) {
+    return `${main} in ${repo.checkout} has ${extra.length} commit(s) that origin/${main} does not:\n` +
+      extra.slice(0, 5).map(l => `    ${l}`).join('\n') + (extra.length > 5 ? `\n    … and ${extra.length - 5} more` : '') + '\n' +
+      `  A landing run killed between its merge and its push leaves exactly this, and no entry has been cleaned up: the entries' branches and worktrees are untouched.\n` +
+      `  If these commits are such leftovers, discard them with: git -C ${repo.checkout} reset --hard origin/${main}\n` +
+      `  If they are anybody's own work, push or move them first. Then land again.`
+  }
+  const ff = gitTry(['merge', '--ff-only', `origin/${main}`], repo.checkout)
+  if (!ff.ok) return `${main} could not fast-forward to origin: ${ff.err}`
+  if (git(['rev-parse', main], repo.checkout) !== git(['rev-parse', `origin/${main}`], repo.checkout)) return `${main} does not equal origin/${main} after the fast-forward`
+  return null
+}
+
 // ─── the worktree's generated environment ───────────────────────────────────
 
 /**
@@ -984,12 +1264,13 @@ async function ensureWorktreeSetup (repo, wt, laneNames, { force = false } = {})
   for (const name of laneNames) {
     const lane = repo.lanes[name]
     if (!lane.setup.length) continue
-    if (!force && lane.setupWhen && await runGate(lane.setupWhen, wt, env)) continue
+    const timeoutMs = gateTimeoutMs(repo, name)
+    if (!force && lane.setupWhen && await runGate(lane.setupWhen, wt, env, { timeoutMs })) continue
     const label = multiLane(repo) ? `${repo.key}/${name}` : repo.key
     console.log(yellow(`  this worktree has no generated environment — running ${label}'s setup`))
     for (const step of lane.setup) {
       console.log(dim(`  setup: ${step}`))
-      if (!await runGate(step, wt, env)) return { ok: false, ran: true, failed: step, probe: lane.setupWhen, lane: name }
+      if (!await runGate(step, wt, env, { timeoutMs })) return { ok: false, ran: true, failed: step, probe: lane.setupWhen, lane: name, timedOut: gateTimedOut, timeoutMs }
     }
     console.log(dim('  setup complete — the gate has an environment to run in'))
     ran = true
@@ -1173,6 +1454,8 @@ function settleDeploy (repo, dryRun, blocked = new Set()) {
   }
   const push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
   if (!push.ok) {
+    // Fetched first: a reset to a stale `origin/<main>` would put local main behind origin's.
+    gitTry(['fetch', 'origin', repo.mainBranch], repo.checkout)
     gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
     console.log(red(`  THE REDEPLOY PUSH FAILED: ${push.err || '(no stderr)'}`))
     console.log(red(`  Rolled it back. Production is still serving the build from before this landing run;`))
@@ -1198,7 +1481,7 @@ function settleDeploy (repo, dryRun, blocked = new Set()) {
  */
 function writeStallReport (repo, entry, kind, detail, conflicted, ownerCall, fixSteps = [], { behindMain = false } = {}) {
   fs.mkdirSync(REPORT_DIR, { recursive: true })
-  const file = path.join(REPORT_DIR, `${repo.key}-${entry.branch}.md`)
+  const file = reportFile(repo.key, entry.branch)
   const midRebase = rebaseInProgress(entry.worktree)
   const clearIt = behindMain
     ? `**This branch was enqueued with \`--no-rebase\`, so the queue started no rebase.**
@@ -1290,7 +1573,12 @@ ${behind} If this branch should leave the queue instead, \`local-merge-queue deq
 //      Red, a conflict, or any error: nothing was pushed, the candidate is
 //      dropped, and the entries land one at a time, so the entry that fails is
 //      the one that stalls.
-class BatchFailure extends Error {}
+// `published` names the entries whose rebased tips were already pushed to origin when the
+// batch failed (a failure at the push of `main` or after the first publish), so that the
+// message can say the remote branches were rewritten.
+class BatchFailure extends Error {
+  constructor (message, published = []) { super(message); this.published = published }
+}
 
 // The label a batch groups by: the lanes an entry carries, `~` marking one it only
 // reached. A one-lane repo has one label for everything.
@@ -1305,7 +1593,7 @@ function batchBlocker (repo, e, tip) {
   if (e.noRebase) return 'it is --no-rebase'
   if (!e.worktree || !fs.existsSync(e.worktree)) return 'its worktree is gone'
   if (!gitTry(['rev-parse', '--verify', '-q', `refs/heads/${e.branch}`], repo.checkout).ok) return 'its branch is gone'
-  if (gitTry(['merge-base', '--is-ancestor', e.branch, repo.mainBranch], repo.checkout).ok) return 'it is already in main (cleanup only)'
+  if (gitTry(['merge-base', '--is-ancestor', e.branch, `origin/${repo.mainBranch}`], repo.checkout).ok) return 'it is already in main (cleanup only)'
   const merges = gitTry(['rev-list', '--merges', '--count', `${tip}..${e.branch}`], repo.checkout)
   if (!merges.ok || merges.out !== '0') return 'it carries merge commits (a branch that merged main into itself is not rebased, and a batch rebases)'
   return null
@@ -1433,9 +1721,8 @@ function ensureBatchWorktree (repo, base) {
 // BatchFailure (or any other error) only BEFORE the push.
 async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
   const names = members.map(e => e.branch)
-  if (!run('git fetch origin --prune', repo.checkout)) throw new BatchFailure('git fetch failed')
-  const ff = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
-  if (!ff.ok) throw new BatchFailure(`${repo.mainBranch} could not fast-forward to origin: ${ff.err}`)
+  const drift = syncMainWithOrigin(repo)
+  if (drift) throw new BatchFailure(drift)
   const base = git(['rev-parse', repo.mainBranch], repo.checkout)
 
   // What each entry is now, so that a change during the gate is noticed.
@@ -1514,12 +1801,14 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
   }
   // ONE GATE, on the tip, for the lanes the entries share.
   const setup = await ensureWorktreeSetup(repo, bw, first.run, { force: changed })
-  if (!setup.ok) throw new BatchFailure(`worktree setup failed${multiLane(repo) ? ` in lane ${setup.lane}` : ''}: ${setup.failed}`)
+  if (!setup.ok) throw new BatchFailure(`worktree setup ${setup.timedOut ? `timed out after ${fmtMinutes(setup.timeoutMs / 60000)}` : 'failed'}${multiLane(repo) ? ` in lane ${setup.lane}` : ''}: ${setup.failed}`)
   writeJSON(batchMetaPath(repo), { lockfiles: hash })
   for (const name of first.run) {
     for (const step of gateStepsFor(repo, { reached: first.reached }, name)) {
       console.log(dim(`  gate: ${step}`))
-      if (!await runGate(step, bw, repo.lanes[name].gateEnv || {})) throw new BatchFailure(`the gate${multiLane(repo) ? ` of lane ${name}` : ''} failed on the candidate: ${step}`)
+      if (!await runGate(step, bw, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) {
+        throw new BatchFailure(`the gate${multiLane(repo) ? ` of lane ${name}` : ''} ${gateTimedOut ? `timed out after ${fmtMinutes(gateTimeoutMs(repo, name) / 60000)}` : 'failed'} on the candidate: ${step}`)
+      }
     }
   }
 
@@ -1542,13 +1831,21 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
 
   // PUBLISH EACH ENTRY'S REBASED TIP, so that its pull request retires as merged,
   // and then push `main`, once, to the commit that was gated.
+  const published = []
   for (const e of members) {
     const was = info.get(e.branch)
     const pub = gitTry(['push', `--force-with-lease=${e.branch}:${was.remoteSha}`, 'origin', `${was.rebasedTip}:refs/heads/${e.branch}`], repo.checkout)
-    if (!pub.ok) throw new BatchFailure(`publishing the rebased tip of ${e.branch} failed: ${pub.err}`)
+    if (!pub.ok) throw new BatchFailure(`publishing the rebased tip of ${e.branch} failed: ${pub.err}`, published)
+    published.push(e.branch)
+  }
+  // APPROVAL IS READ AGAIN AFTER THE TIPS ARE PUSHED AND BEFORE `main` IS: the pushes are
+  // network round trips, and an entry unapproved or dequeued in that time must not land.
+  for (const e of members) {
+    const fresh = freshEntry(e)
+    if (!fresh || fresh.status !== 'approved') throw new BatchFailure(`${e.branch} was ${fresh ? 'unapproved' : 'dequeued'} while the batch's tips were being published`, published)
   }
   const push = gitTry(['push', 'origin', `${candidate}:refs/heads/${repo.mainBranch}`], repo.checkout)
-  if (!push.ok) throw new BatchFailure(`origin rejected the push of ${repo.mainBranch}, so nothing has landed: ${push.err}`)
+  if (!push.ok) throw new BatchFailure(`origin rejected the push of ${repo.mainBranch}, so nothing has landed: ${push.err}`, published)
 
   // ---- from here the batch has landed; nothing below may throw ----
   const ffm = gitTry(['merge', '--ff-only', candidate], repo.checkout)
@@ -1559,9 +1856,19 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
     const was = info.get(e.branch)
     console.log(`\n${bold('──')} ${bold(e.branch)} ${dim(e.worktree)} ${dim('(landed in the batch)')}`)
     // The branch moves to the tip that was published, so that cleanup can prove it contained.
-    const rs = gitTry(['reset', '--hard', '-q', was.rebasedTip], e.worktree)
-    if (!rs.ok) console.log(red(`  COULD NOT MOVE ${e.branch} TO ITS PUBLISHED TIP: ${rs.err}`))
-    try { cleanupLanded(repo, e, e.worktree) } catch (err) { console.log(red(`  cleanup of ${e.branch} failed: ${err.message}`)) }
+    // NEVER WITH `reset --hard`, which discards work: the worktree is checked, and moved with
+    // `reset --keep` (which refuses rather than discard) only if it is still on the commit
+    // the batch was built from with nothing changed; otherwise it stays as it is and cleanup
+    // keeps the worktree and the branch (see `cleanupLanded`).
+    const head = gitTry(['rev-parse', 'HEAD'], e.worktree)
+    if (head.ok && head.out === was.branchSha && !gitTry(['status', '--porcelain'], e.worktree).out) {
+      testHold(`batch-move-${e.branch}`)                // test seam: the window between the check above and the move below
+      const rs = gitTry(['reset', '--keep', '-q', was.rebasedTip], e.worktree)
+      if (!rs.ok) console.log(red(`  COULD NOT MOVE ${e.branch} TO ITS PUBLISHED TIP: ${rs.err}`))
+    } else {
+      console.log(red(`  ${e.branch}'s worktree changed after the batch's final check, so its branch was not moved to the published tip`))
+    }
+    try { cleanupLanded(repo, e, e.worktree, { landedTip: was.rebasedTip }) } catch (err) { console.log(red(`  cleanup of ${e.branch} failed: ${err.message}`)) }
     e.status = 'landed'
     removeEntry(e)
   }
@@ -1669,6 +1976,10 @@ function cmdStatus (cfg, args) {
       const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
       running = !!owner && Number.isInteger(owner.pid) && pidAlive(owner.pid)
       if (running) console.log(yellow(`  LOCKED by pid ${owner.pid} since ${owner.since} (${lockAge(owner)})`))
+      else if (groupAlive(owner?.gatePgid)) {
+        console.log(yellow(`  a landing run died (pid ${owner.pid} is gone), but the gate it started is still running (process group ${owner.gatePgid}); the lock is held until that gate ends`))
+        console.log(dim(`  look at what the group is first: ${groupHint(owner.gatePgid)}   (if it is not a gate, release the lock: rm -rf ${path.join(LOCK_DIR, key)})`))
+      }
       else console.log(dim(`  a landing run died holding the lock (pid ${owner?.pid ?? '?'} is gone); the next land clears it`))
     }
     announceKnownRed(repo, { write: false })
@@ -1706,7 +2017,23 @@ function cmdStatus (cfg, args) {
     if (!cfg.repos[key]) continue
     reportResidue(key, cfg.repos[key])
     reportUndeployedTip(key, cfg.repos[key])
+    reportKept(key, q)
   }
+}
+
+// Landed entries whose worktree the run kept (it held files made after the gate): still on
+// disk, in no queue entry, so `status` names them until they are cleared.
+function reportKept (key, q) {
+  const kept = (q.kept || []).filter(k => k.repo === key && fs.existsSync(k.worktree))
+  if (!kept.length) return
+  console.log(yellow(`${key}: ${kept.length} landed entr${kept.length === 1 ? 'y' : 'ies'} left a worktree kept, because it holds files the run did not make`))
+  for (const k of kept) {
+    console.log(dim(`  · ${k.branch} — ${k.worktree}`))
+    console.log(dim(`    ${k.reason}`))
+    console.log(dim(`    Look first: ${k.look}`))
+    console.log(dim(`    Then, once you have kept what you want: ${k.cure}`))
+  }
+  console.log('')
 }
 
 /**
@@ -1896,7 +2223,37 @@ function cmdOrder (cfg, args) {
 
 // CLEANUP, the same for an entry landed alone and for each entry of a batch.
 // `wt` is the entry's worktree; the branch is already on `main` and pushed.
-function cleanupLanded (repo, entry, wt) {
+//
+// CLEANUP DESTROYS ONLY WHAT IT CAN SHOW IS LANDED. `landedTip` is the commit that was
+// merged (the gated commit, or the published tip of a batched entry, or an already-merged
+// branch's tip). The worktree is removed only if its HEAD is that commit and its status
+// shows nothing the gate had not already found there (`baseline`: the status recorded
+// after the setup; an empty list for an entry that was not gated in its own worktree),
+// because `worktree remove --force` deletes uncommitted and untracked files, and work
+// made in the worktree after the gate is the author's and was never landed. The remote
+// branch is deleted only if its tip on origin IS the landed tip: a commit somebody
+// pushed to it after the publish would be deleted with it. Either refusal is said in red
+// as residue, and the merge is done regardless.
+// A landed entry whose worktree was kept is no longer in the queue, so the queue file keeps
+// a record of it (`kept`), for `status` to show until the worktree is gone. The run's exit
+// status is 3 when any cleanup left residue (and nothing stalled or was refused).
+let residueLeft = 0
+function recordKept (repo, entry, wt, reason, cure, look) {
+  mutateQueue(q => {
+    q.kept = (q.kept || []).filter(k => fs.existsSync(k.worktree) && !(k.repo === repo.key && k.branch === entry.branch))
+    q.kept.push({ repo: repo.key, branch: entry.branch, worktree: wt, reason, cure, look, since: nowISO() })
+  })
+}
+
+// `baseline` is the worktree's status, ignored files included, as the gate left it, and `gated`
+// says there is one; without it (a cleanup-only entry, a batched one) the worktree was clean
+// when the entry was enqueued, and its ignored files (dependencies) are expected.
+function cleanupLanded (repo, entry, wt, { landedTip = null, baseline = [], gated = false } = {}) {
+  const short = x => String(x).slice(0, 9)
+  if (!landedTip) {
+    const tip = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
+    landedTip = tip.ok ? tip.out : null
+  }
   // 5. Cleanup — the lifecycle the roster rule asks for, done by the thing
   //    that did the merge rather than by whoever remembers.
   //
@@ -1919,8 +2276,39 @@ function cleanupLanded (repo, entry, wt) {
     return false
   }
 
-  const rm = gitTry(['worktree', 'remove', '--force', wt], repo.checkout)
-  step('worktree removed', rm, `worktree still registered at ${wt}`)
+  const keepWorktree = []
+  let ignoredHere = []
+  if (fs.existsSync(wt)) {
+    const all = statusLines(wt, { ignored: true })
+    ignoredHere = all.filter(l => l.startsWith('!!')).map(l => l.slice(3))
+    const extra = all.filter(l => !baseline.includes(l) && (gated || !l.startsWith('!!')))
+    if (extra.length) {
+      keepWorktree.push(gated
+        ? `it holds files that appeared after the gate ended: ${extra.map(l => l.trim()).join('; ')}`
+        : `it holds files that were not there when the entry was enqueued: ${extra.map(l => l.trim()).join('; ')}`)
+    }
+    const head = gitTry(['rev-parse', 'HEAD'], wt)
+    if (landedTip && (!head.ok || head.out !== landedTip)) keepWorktree.push(`its HEAD is ${head.ok ? short(head.out) : '(unreadable)'}, not the landed tip ${short(landedTip)}`)
+    if (!landedTip) keepWorktree.push('the landed tip could not be read')
+  }
+  // `worktree remove --force` deletes ignored files too, which no status line of the
+  // ordinary kind shows: they are named here before they go, so the run never deletes
+  // what its output did not say.
+  if (!keepWorktree.length && ignoredHere.length) {
+    console.log(dim(`  ignored files go with the worktree: ${ignoredHere.slice(0, 8).join(', ')}${ignoredHere.length > 8 ? `, and ${ignoredHere.length - 8} more` : ''}`))
+  }
+  const rm = keepWorktree.length ? null : gitTry(['worktree', 'remove', '--force', wt], repo.checkout)
+  if (rm) step('worktree removed', rm, `worktree still registered at ${wt}`)
+  else {
+    const look = `git -C ${wt} status --ignored`
+    const cure = `git -C ${repo.checkout} worktree remove --force ${wt} && git -C ${repo.checkout} branch -d ${entry.branch}`
+    console.log(red(`  WORKTREE KEPT: ${keepWorktree.join('; ')}.`))
+    console.log(red(`  Removing it would delete that work, so the worktree and the local branch stay; the merge is done.`))
+    console.log(dim(`  Look first: ${look}`))
+    console.log(dim(`  Then, once you have kept what you want: ${cure}`))
+    residue.push(`worktree kept at ${wt}: ${keepWorktree.join('; ')}. Look first: ${look}. Then: ${cure} (branch -D instead of -d only if you do not want commits made there after the merge)`)
+    recordKept(repo, entry, wt, keepWorktree.join('; '), cure, look)
+  }
   // PRUNE BETWEEN THE TWO, ALWAYS. `git branch -d` refuses a branch git
   // still believes is checked out in a worktree, and a worktree whose
   // directory has gone without `worktree remove` leaves exactly that belief
@@ -1929,7 +2317,7 @@ function cleanupLanded (repo, entry, wt) {
   // idempotent, and touches only admin files for worktrees that are already
   // gone — it can never remove a live one.
   gitTry(['worktree', 'prune'], repo.checkout)
-  let del = gitTry(['branch', '-d', entry.branch], repo.checkout)   // -d refuses if unmerged
+  let del = keepWorktree.length ? { ok: true, kept: true } : gitTry(['branch', '-d', entry.branch], repo.checkout)   // -d refuses if unmerged
   if (!del.ok) {
     // One retry, after a fetch. One way `-d` refuses is by reading the
     // branch as unmerged, and the merge that landed it is a commit `origin`
@@ -1965,7 +2353,7 @@ function cleanupLanded (repo, entry, wt) {
       del = forced
     }
   }
-  step('local branch deleted', del, `local branch \`${entry.branch}\` still exists`)
+  if (!del.kept) step('local branch deleted', del, `local branch \`${entry.branch}\` still exists`)
   // MOVE ANY PULL REQUEST STACKED ON THIS BRANCH ONTO main BEFORE THE
   // REMOTE BRANCH GOES — deleting a PR's base branch closes it permanently.
   // See retargetStackedPrs for the whole argument. It never fails a landing.
@@ -1993,7 +2381,17 @@ function cleanupLanded (repo, entry, wt) {
   // to wait for, and must not pay for this.
   let rdel = { ok: true }
   let prState = 'no github repo configured'
-  if (!repo.githubRepo) {
+  // The remote branch goes only if its tip on origin is the landed tip.
+  const lsr = gitTry(['ls-remote', 'origin', `refs/heads/${entry.branch}`], repo.checkout)
+  const remoteTip = lsr.ok ? (lsr.out.split(/\s+/)[0] || '') : null
+  if (remoteTip === null || (remoteTip && remoteTip !== landedTip)) {
+    console.log(red(remoteTip === null
+      ? `  REMOTE BRANCH KEPT: origin could not be asked what its tip is (${lsr.err || 'no stderr'}).`
+      : `  REMOTE BRANCH KEPT: its tip on origin is ${short(remoteTip)}, which is not the landed tip ${short(landedTip)} — somebody pushed to it after the publish, and deleting it would delete that work.`))
+    residue.push(`remote branch \`${entry.branch}\` kept on purpose — ${remoteTip === null ? 'origin could not be read' : `its tip ${short(remoteTip)} is not the landed tip ${short(landedTip)}`}; look at it, then: git -C ${repo.checkout} push origin --delete ${entry.branch}`)
+  } else if (!remoteTip) {
+    console.log(dim('  remote branch already gone'))
+  } else if (!repo.githubRepo) {
     rdel = gitTry(['push', 'origin', '--delete', entry.branch], repo.checkout)
     step('remote branch deleted', rdel, `remote branch \`${entry.branch}\` still exists`)
   } else {
@@ -2024,6 +2422,7 @@ function cleanupLanded (repo, entry, wt) {
   // reason to stall the line or to leave the entry looking unfinished. It is
   // said once, plainly, where the person running the landing run will read it.
   if (residue.length) {
+    residueLeft += residue.length
     console.log(red(`  ${entry.branch} landed, but its cleanup left residue:`))
     for (const r of residue) console.log(red(`    · ${r}`))
     console.log(dim('    Clear it by hand; the merge itself is done and pushed.'))
@@ -2048,8 +2447,8 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   if (stalledNow.length && !resuming && Object.keys(repo.lanes).every(n => blocked.has(n))) {
     const stalled = stalledNow[0]
     die(`${key} is stalled on "${stalled.branch}" — resolve it, then: local-merge-queue resume ${key}\n` +
-        `  report: ${path.join(REPORT_DIR, `${key}-${stalled.branch}.md`)}` +
-        stalledNow.slice(1).map(e => `\n  also stalled on "${e.branch}" — report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`).join(''))
+        `  report: ${reportFile(key, stalled.branch)}` +
+        stalledNow.slice(1).map(e => `\n  also stalled on "${e.branch}" — report: ${reportFile(key, e.branch)}`).join(''))
   }
 
   const problems = preflight(repo)
@@ -2057,11 +2456,20 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
     die(`${key} is not ready to land:\n  - ${problems.join('\n  - ')}`)
   }
 
-  announceKnownRed(repo, { write: !dryRun })
-
   const lock = dryRun ? true : acquireLock(key)
+  // THE KNOWN-RED FILE IS WRITTEN UNDER THE LOCK: written before it, a second `land`
+  // that was about to be refused deleted and rewrote the file the running holder's gates
+  // read (found by the independent re-check, 2026-11-21).
+  if (lock) announceKnownRed(repo, { write: !dryRun })
   if (!lock) {
     const owner = readJSON(path.join(LOCK_DIR, key, 'owner.json'), null)
+    if (owner && !pidAlive(owner.pid) && groupAlive(owner.gatePgid)) {
+      die(`${key}: the landing run (pid ${owner.pid}, since ${owner.since}) is gone, but the gate it started is still running (process group ${owner.gatePgid}), so the lock stays held until that gate ends.\n` +
+          `  Look at what that group is before you end anything:  ${groupHint(owner.gatePgid)}\n` +
+          `  If it is a gate of this repository, wait for it, or end it with:  kill -TERM -- -${owner.gatePgid}\n` +
+          `  If it is not (a process group id can be reused by an unrelated process once the gate's own group is gone), nothing of this repository is running: ` +
+          `confirm that, then release the lock by hand with:  rm -rf ${path.join(LOCK_DIR, key)}`)
+    }
     die(`${key} is being landed already (pid ${owner?.pid ?? '?'}, since ${owner?.since ?? '?'})`)
   }
   // Whatever way this run ends (a die, a signal), its batch marks go and its lock is released.
@@ -2125,6 +2533,19 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   const stallLine = e => multiLane(repo)
     ? `Entries in ${lanePhrase(queueLanesOf(repo, e))} wait behind it; entries in other lanes keep landing.`
     : null
+  // A stall found after the gate has passed (the gate's claim no longer holds). Records it,
+  // writes the report and says so; returns 'end' when the run ends here (a one-lane repo)
+  // and 'next' when the loop goes on to the entries in other lanes.
+  const stallAfterGate = (entry, reason, kind, detail, fixSteps, headline) => {
+    if (!recordStall(entry, { status: 'stalled', ownerCall: false, stallReason: reason })) return 'next'
+    const file = writeStallReport(repo, entry, kind, detail, [], false, fixSteps)
+    console.error(red(`\n  STALLED — ${headline}`))
+    console.error(`  report: ${file}`)
+    if (!multiLane(repo)) return 'end'
+    console.error(dim(`  ${stallLine(entry)}`))
+    held.add(entry.branch)
+    return 'next'
+  }
   try {
     while (true) {
       const q2 = loadQueue()
@@ -2164,7 +2585,10 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
               for (const e of members) noBatch.add(e.branch)
               clearMarks()
               console.log(red(`  BATCH FAILED: ${err instanceof BatchFailure ? err.message : `unexpected error: ${err.message}`}`))
-              console.log(red(`  Nothing has landed and no entry's branch moved. Falling back to landing ${names.join(', ')} one at a time.`))
+              const rewrote = err.published?.length
+                ? ` The remote ${err.published.length === 1 ? 'branch' : 'branches'} of ${err.published.join(', ')} already carry ${err.published.length === 1 ? 'its' : 'their'} rebased ${err.published.length === 1 ? 'tip' : 'tips'}: origin's copy was rewritten (the same content; the next landing force-pushes it again with a lease).`
+                : ''
+              console.log(red(`  Nothing has landed and no entry's local branch moved.${rewrote} Falling back to landing ${names.join(', ')} one at a time.`))
             }
           }
         }
@@ -2210,11 +2634,24 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         die(`the worktree for "${entry.branch}" is gone (${wt}) — dequeue the entry or repair the worktree`)
       }
 
+      // LOCAL MAIN MUST EQUAL ORIGIN'S BEFORE AN ENTRY STARTS (see `syncMainWithOrigin`),
+      // and "already in main" is asked of origin's main: a merge that exists only in the
+      // primary checkout is not a landed branch, and cleaning its entry up would delete
+      // the only copy.
+      console.log(dim('  fetching…'))
+      const drift = syncMainWithOrigin(repo)
+      if (drift) die(drift)
+      // THE TRUNK THE ENTRY IS BUILT ON IS RECORDED HERE: local `main` as the sync left it. The
+      // gate takes minutes, and a pull or a stray commit in the primary checkout during it would
+      // move `main` under the rebase the gate ran on; the merge (and each redo) stalls the entry
+      // if local `main` is no longer this commit.
+      let trunk = git(['rev-parse', repo.mainBranch], repo.checkout)
+
       // A branch already contained in main needs cleanup, not a merge. This is
       // where the roster's "merged; delete the worktree and this row" backlog
       // lands — the state that accumulates when a merge and its cleanup were
       // two separate acts by two different people.
-      const alreadyIn = gitTry(['merge-base', '--is-ancestor', entry.branch, repo.mainBranch], repo.checkout).ok
+      const alreadyIn = gitTry(['merge-base', '--is-ancestor', entry.branch, `origin/${repo.mainBranch}`], repo.checkout).ok
       // Set at step 2 below; read again at the pre-merge publish, which is why it
       // is declared out here rather than beside its use.
       let current = false
@@ -2222,6 +2659,9 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
       // Lanes of the entry being landed, set at step 2a; the final check reads
       // them once the merge is pushed.
       let runLanes = []
+      // What the gate ran on: the branch's commit and the worktree's status, recorded
+      // after the setup (see `recordBinding`).
+      let binding = null
 
       if (alreadyIn) {
         console.log(dim(`  already contained in ${repo.mainBranch} — cleanup only, no merge`))
@@ -2255,15 +2695,19 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
             // rebase onto the `main` of the stall. `resume` rebases the entry
             // again, through step 1 like any other entry; a conflict there
             // stalls it again. A one-lane repo lands nothing past a stall, so
-            // there the branch is off `main` only if someone moved it by hand.
+            // there the branch is off `main` only if a push from outside the
+            // queue moved it.
             //
             // A --no-rebase entry is never rebased. It falls through to step 2,
             // which stalls it again, with the same reason, unless the fixer
             // has merged origin/main into it.
+            //
+            // The `origin/main` asked about here was fetched at the start of this
+            // entry, so a `main` that moved while the entry was stalled is seen, in
+            // a one-lane repo as well: the entry is rebased again and gated again.
             if (entry.noRebase) {
               console.log(dim(`  ${entry.branch} does not contain origin/${repo.mainBranch} — checking it again (--no-rebase)`))
             } else {
-              if (!multiLane(repo)) die(`"${entry.branch}" is not on top of origin/${repo.mainBranch} — rebase it before resuming`)
               console.log(dim(`  ${repo.mainBranch} moved while ${entry.branch} was stalled — rebasing it again`))
             }
             fresh = true
@@ -2279,11 +2723,6 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
 
         // 1. Bring main and the branch up to date.
         if (fresh) {
-          console.log(dim('  fetching…'))
-          if (!run('git fetch origin --prune', repo.checkout)) die('git fetch failed')
-          const pull = gitTry(['merge', '--ff-only', `origin/${repo.mainBranch}`], repo.checkout)
-          if (!pull.ok) die(`${repo.mainBranch} could not fast-forward to origin: ${pull.err}`)
-
           // 2. Put the branch on top of the main it will actually land on.
           //
           //    A BRANCH THAT ALREADY CONTAINS origin/main IS NOT REBASED. The
@@ -2398,15 +2837,16 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         if (!setup.ok) {
           // A multi-lane repo names the lane whose setup failed.
           const inLane = multiLane(repo) ? ` in lane ${setup.lane}` : ''
-          if (!recordStall(entry, { status: 'stalled', stallReason: `worktree setup failed${inLane}: ${setup.failed}` })) continue
-          const file = writeStallReport(repo, entry, `worktree setup failed${inLane}`,
+          const verb = setup.timedOut ? `worktree setup timed out after ${fmtMinutes(setup.timeoutMs / 60000)}` : 'worktree setup failed'
+          if (!recordStall(entry, { status: 'stalled', stallReason: `${verb}${inLane}: ${setup.failed}` })) continue
+          const file = writeStallReport(repo, entry, `${verb}${inLane}`,
             `This worktree lacked its generated environment — \`${setup.probe || '(no probe configured)'}\` said so —\n` +
-            `and the setup step that fills it in exited non-zero:\n\n` +
+            (setup.timedOut ? `and the setup step that fills it in ran past its limit and was ended:\n\n` : `and the setup step that fills it in exited non-zero:\n\n`) +
             `    ${setup.failed}\n\n` +
             `Its output is above, in the landing run log. The gate never ran; nothing here is a\n` +
             `verdict on the branch.`,
             [], false, [setup.failed])
-          console.error(red(`\n  STALLED — worktree setup failed${inLane} on ${entry.branch}`))
+          console.error(red(`\n  STALLED — ${verb}${inLane} on ${entry.branch}`))
           console.error(`  the step that failed: ${setup.failed}`)
           console.error(dim('  The rebase is complete — there is no conflict to resolve, and the gate'))
           console.error(dim('  has not run. Fix the environment in that worktree, then: local-merge-queue resume ' + key))
@@ -2417,25 +2857,45 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           continue
         }
 
+        // 2d. WHAT THE GATE WILL RUN ON IS RECORDED HERE: the branch's commit and the
+        //     worktree's status. The publish and the merge name this commit, and the
+        //     entry stalls if the branch or the worktree has changed by then.
+        binding = recordBinding(repo, entry, wt)
+        if (binding.error) {
+          const s = stallAfterGate(entry, binding.error, 'the worktree is not on its branch',
+            `${binding.error}, so the gate would not run on the commit that would land.`,
+            ['git status', `git checkout ${entry.branch}`], `${binding.error} (${entry.branch})`)
+          if (s === 'end') return { landed, stalledOn: entry.branch }
+          continue
+        }
+
         // 3. The gate: what would break a writer, run on exactly what will land.
         let gateOK = true
         let gateFailed = null
         let gateLane = null
+        let gateHung = false
         gate: for (const name of runLanes) {
           for (const step of gateStepsFor(repo, entry, name)) {
             console.log(dim(`  gate: ${step}`))
-            if (!await runGate(step, wt, repo.lanes[name].gateEnv || {})) { gateOK = false; gateFailed = step; gateLane = name; break gate }
+            if (!await runGate(step, wt, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) { gateOK = false; gateHung = gateTimedOut; gateFailed = step; gateLane = name; break gate }
           }
         }
         if (!gateOK) {
           // A multi-lane repo names the lane whose gate failed.
           const inLane = multiLane(repo) ? ` in lane ${gateLane}` : ''
-          if (!recordStall(entry, { status: 'stalled', stallReason: `gate failed after rebase${inLane}` })) continue
-          const file = writeStallReport(repo, entry, `gate failed after rebase${inLane}`,
-            `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
+          const hung = `gate timed out after ${fmtMinutes(gateTimeoutMs(repo, gateLane) / 60000)}${inLane}`
+          if (!recordStall(entry, { status: 'stalled', stallReason: gateHung ? hung : `gate failed after rebase${inLane}` })) continue
+          const file = writeStallReport(repo, entry, gateHung ? hung : `gate failed after rebase${inLane}`,
+            gateHung
+              ? `The gate step \`${gateFailed}\` ran past its limit (gateTimeoutMinutes) and was ended, with its whole process group. Its output so far is above, in the landing run log.`
+              : `The gate step \`${gateFailed}\` exited non-zero. Its output is above, in the landing run log.`,
             [], false, [gateFailed])
-          console.error(red(`\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} failed on ${entry.branch} after rebasing.`))
-          console.error(dim('  This is the queue working: it passed on the old main and fails on the new one.'))
+          console.error(red(gateHung
+            ? `\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} timed out after ${fmtMinutes(gateTimeoutMs(repo, gateLane) / 60000)} on ${entry.branch}: ${gateFailed}`
+            : `\n  STALLED — the gate${multiLane(repo) ? ` of lane ${gateLane}` : ''} failed on ${entry.branch} after rebasing.`))
+          console.error(dim(gateHung
+            ? '  The hung gate was ended and the landing lock is released when the run ends.'
+            : '  This is the queue working: it passed on the old main and fails on the new one.'))
           console.error(`  report: ${file}`)
           if (!multiLane(repo)) return { landed, stalledOn: entry.branch }
           console.error(dim(`  ${stallLine(entry)}`))
@@ -2443,9 +2903,36 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           continue
         }
 
+        // 3-. WHAT THE GATE LEFT BEHIND IS RECORDED HERE, for cleanup: whatever the worktree
+        //     holds when the gate ends (build output, a temp folder, ignored files) is the
+        //     gate's own, and is not "made since the gate". The binding above keeps the
+        //     record from before the gate; cleanup uses this one.
+        binding.after = statusLines(wt, { ignored: true })
+
         // 3a. THE QUEUE MAY HAVE CHANGED DURING THE GATE, which takes minutes. An
         //     entry unapproved or dequeued in that time is not landed.
         if (withdrawn(entry)) continue
+
+        // 3a'. THE BRANCH AND THE WORKTREE ARE WHAT THE GATE RAN ON, or the gate's
+        //      verdict is about something that will not land.
+        const bound = () => {
+          const broke = bindingBroken(repo, entry, wt, binding, runLanes)
+          if (!broke) return 'ok'
+          return stallAfterGate(entry, `changed during the gate: ${broke}`, 'the branch or its worktree changed during the gate',
+            `${broke}.\n\nThe gate ran on ${binding.sha}, so the gate did not see what would land. Nothing was published or merged.`,
+            ['git status', `git log --oneline origin/${repo.mainBranch}..${entry.branch}`,
+             '# take out or commit what changed (the gate runs again on resume), then resume'],
+            `${entry.branch} changed during the gate — ${broke}`)
+        }
+        testHold('before-first-check')
+        let b = bound()
+        if (b === 'end') return { landed, stalledOn: entry.branch }
+        if (b === 'next') continue
+        const trunkMoved = () => {
+          const now = git(['rev-parse', repo.mainBranch], repo.checkout)
+          return now === trunk ? null
+            : `local ${repo.mainBranch} moved during the gate: it was ${trunk.slice(0, 9)} when the entry started and is ${now.slice(0, 9)} now (a pull, or a commit made in the primary checkout)`
+        }
 
         // 3b. PUBLISH THE REBASED TIP BEFORE THE MERGE. Not optional bookkeeping:
         //     the pull request is the roster now, and this is the one step that
@@ -2462,7 +2949,8 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         //     --force-with-lease and not --force: the fetch at step 1 made the
         //     remote-tracking ref current, so the lease refuses exactly when it
         //     should — somebody pushed to the branch after the landing run began.
-        const pub = gitTry(['push', '--force-with-lease', 'origin', `${entry.branch}:${entry.branch}`], wt)
+        testHold('before-publish')
+        const pub = gitTry(['push', '--force-with-lease', 'origin', `${binding.sha}:refs/heads/${entry.branch}`], wt)
         if (pub.ok) {
           console.log(dim(current
             ? '  tip published (its PR will close as merged)'
@@ -2496,22 +2984,131 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           if (more && !markers.includes(marker)) markers.push(marker)
         }
         if (withdrawn(entry)) continue
+        testHold('before-second-check')
+        b = bound()
+        if (b === 'end') return { landed, stalledOn: entry.branch }
+        if (b === 'next') continue
+        // THE TRUNK IS RE-CHECKED BEFORE THE MERGE: the merge lands on local `main`, and a `main`
+        // that is not the commit the gate's rebase was built on means the gate did not see the
+        // trunk that would land (a pulled commit), or that a stray local commit would be pushed
+        // ungated.
+        const moved0 = trunkMoved()
+        if (moved0) {
+          const s = stallAfterGate(entry, `${moved0}, so the gate did not see the trunk this would land on`, 'local main moved during the gate',
+            `${moved0}.\n\nThe gate ran on ${binding.sha}, rebased onto ${trunk}. Nothing was published to ${repo.mainBranch} or merged; local ${repo.mainBranch} was left as it is.`,
+            ['# nothing to fix in the worktree. If the primary checkout holds a stray commit, move it elsewhere first;',
+             '# resume then rebases the branch onto the current main and gates it again'],
+            `${entry.branch} — ${moved0}`)
+          if (s === 'end') return { landed, stalledOn: entry.branch }
+          continue
+        }
         const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${markers.map(m => ` ${m}`).join('')}`
-        const mg = gitTry(['merge', '--no-ff', '-m', msg, entry.branch], repo.checkout)
+        // THE GATED COMMIT IS WHAT MERGES, not whatever the branch ref holds now.
+        let base = trunk                                                  // what the gate's merge was built on
+        testHold('before-merge')
+        const mg = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
 
-        const push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
-        if (!push.ok) {
-          gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
-          die(`push to origin/${repo.mainBranch} failed, so the merge was rolled back locally:\n${push.err}`)
+        // 4a. THE PUSH. If origin rejects it because its `main` moved during the gate, the merge
+        //     is redone on the new `main`, at most twice (see `inspectMovedMain`), and only the
+        //     gates of the lanes the new commits touch are run again, on the merged tree: none
+        //     when they touch no lane the entry gated. Lanes are independent by the queue's own
+        //     definition (their own paths, setup and gate, and `shared` and `reach` declare every
+        //     exception, both of which are asked), so the gate of a lane nothing touched has
+        //     nothing new to say, and a lane a commit touched is gated again, not waved through.
+        let push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
+        let redos = 0
+        let movedStall = null
+        let gone = false
+        // Run again the gates of `lanes` on the redone merge `m2`, in the entry's worktree
+        // (detached at `m2` for the run, then back on the branch). Returns a reason it failed, or null.
+        const regate = async (lanes, m2, reachOnly = []) => {
+          const detach = gitTry(['checkout', '--detach', m2], wt)
+          if (!detach.ok) return `the redone merge could not be checked out in the entry's worktree to be gated: ${detach.err}`
+          let why = null
+          const setup = await ensureWorktreeSetup(repo, wt, lanes)
+          if (!setup.ok) why = `worktree setup ${setup.timedOut ? 'timed out' : 'failed'}${multiLane(repo) ? ` in lane ${setup.lane}` : ''} on the new ${repo.mainBranch}: ${setup.failed}`
+          gate: for (const name of lanes) {
+            if (why) break
+            const steps = reachOnly.includes(name) && repo.lanes[name].reach?.gate ? repo.lanes[name].reach.gate : gateStepsFor(repo, entry, name)
+            for (const step of steps) {
+              console.log(dim(`  gate${multiLane(repo) ? ` [${name}]` : ''} (${repo.mainBranch} moved): ${step}`))
+              if (!await runGate(step, wt, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) {
+                why = `the gate${multiLane(repo) ? ` of lane ${name}` : ''} ${gateTimedOut ? 'timed out' : 'failed'} on the new ${repo.mainBranch}: ${step}`
+                break gate
+              }
+            }
+          }
+          const back = gitTry(['checkout', entry.branch], wt)
+          if (!back.ok) why ||= `the entry's worktree could not be put back on ${entry.branch}: ${back.err}`
+          return why
         }
+        while (!push.ok) {
+          const mv = inspectMovedMain(repo, runLanes, wt, base)
+          if (!mv.moved) {
+            gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
+            die(`push to origin/${repo.mainBranch} failed, so the merge was rolled back locally:\n${push.err}`)
+          }
+          gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)      // the merge is rolled back either way
+          let blocker = mv.fatal ? mv.blocker : null
+          if (!blocker && redos >= 2) blocker = `origin/${repo.mainBranch} moved again after 2 redos of the merge`
+          if (!blocker) { const broke = bindingBroken(repo, entry, wt, binding, runLanes); if (broke) blocker = `the gate no longer vouches for the entry: ${broke}` }
+          if (!blocker && withdrawn(entry)) { gone = true; break }
+          if (blocker) { movedStall = { mv, blocker }; break }
+          redos++
+          console.log(dim(`  origin/${repo.mainBranch} moved during the gate: ${mv.commits.length} new commit(s) (${mv.commits.map(c => `${c.sha} ${c.subject}`).join('; ') || 'none'}) — redoing the merge on it (redo ${redos} of 2); ` +
+            (mv.touched.length ? `they touch ${multiLane(repo) ? lanePhrase(mv.touched) : 'what the gate covers'}, so ${mv.touched.length === 1 && multiLane(repo) ? 'that lane\'s gate runs' : 'those gates run'} again and no other`
+              : 'none touches a lane this entry gated, so no gate runs again')))
+          base = mv.newTip
+          trunk = mv.newTip                   // local main was just reset to origin's
+          const movedAgain = trunkMoved()
+          if (movedAgain) { movedStall = { mv, blocker: movedAgain }; break }
+          const again = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
+          if (!again.ok) {
+            gitTry(['merge', '--abort'], repo.checkout)
+            gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
+            movedStall = { mv, blocker: `the merge could not be redone on the new ${repo.mainBranch}: ${again.err}` }
+            break
+          }
+          if (mv.touched.length) {
+            const m2 = git(['rev-parse', repo.mainBranch], repo.checkout)
+            const failed = await regate(mv.touched, m2, mv.reachOnly)
+            const afterwards = failed ? null : bindingBroken(repo, entry, wt, binding, runLanes)
+            const drift = failed || afterwards ? null : (git(['rev-parse', repo.mainBranch], repo.checkout) === m2 ? null : `local ${repo.mainBranch} moved while the lanes were gated again`)
+            if (failed || afterwards || drift) {
+              if (!drift) gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
+              movedStall = { mv, blocker: failed || (afterwards ? `the gate no longer vouches for the entry: ${afterwards}` : drift) }
+              break
+            }
+            binding.after = statusLines(wt, { ignored: true })     // what the second gate left is the gate's too
+            if (withdrawn(entry)) { gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout); gone = true; break }
+          }
+          push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
+        }
+        if (gone) continue
+        if (movedStall) {
+          const { mv, blocker } = movedStall
+          const list = mv.commits.map(c => `${c.sha} ${c.subject}`)
+          const named = list.length ? `${list.slice(0, 3).join('; ')}${list.length > 3 ? `; and ${list.length - 3} more` : ''}` : `origin/${repo.mainBranch} is now ${mv.newTip.slice(0, 9)}`
+          const reason = `main moved under a passing gate: ${named} — ${blocker}`
+          const s = stallAfterGate(entry, reason, 'main moved under a passing gate',
+            `origin/${repo.mainBranch} moved while the gate ran, and the push was rejected. The gate passed on ${binding.sha}, built on ${base.slice(0, 9)}.\n\n` +
+            `New commits on origin/${repo.mainBranch}:\n${mv.commits.map(c => `  ${c.sha} ${c.subject}\n    ${c.paths.join(', ') || '(no files)'}${c.inside.length ? `\n    ${c.inside.map(i => `${i.how} ${multiLane(repo) ? `lane ${i.lane}` : 'what the gate covers'} (${i.path})`).join('; ')}` : ''}`).join('\n') || '  (history was rewritten)'}\n\n` +
+            `Why the merge was not redone: ${blocker}.\n\nLocal ${repo.mainBranch} was reset to origin/${repo.mainBranch} (unless it had moved); nothing of this entry reached ${repo.mainBranch}.` +
+            (redos ? ` (The merge was redone ${redos} time(s) first.)` : ''),
+            ['# nothing to fix in the worktree: resume rebases the branch onto the new main and gates it again'],
+            `${entry.branch} — ${reason}`)
+          if (s === 'end') return { landed, stalledOn: entry.branch }
+          continue
+        }
+        if (redos) console.log(dim(`  (the merge was redone ${redos} time${redos === 1 ? '' : 's'} on a main that moved during the gate)`))
         console.log(green(`  landed on ${repo.mainBranch} and pushed`))
         // A lane the entry only reached was tested by it and changed nothing, so its
         // final check and deploy are not owed.
         landedLanes.push(...runLanes.filter(n => !(entry.reached || []).includes(n)))
       }
 
-      cleanupLanded(repo, entry, wt)
+      cleanupLanded(repo, entry, wt, alreadyIn ? {} : { landedTip: binding.sha, baseline: binding.after, gated: true })
 
       entry.status = 'landed'
       entry.landedAt = nowISO()
@@ -2531,6 +3128,27 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
     // `settleDeploy` gives: the line is expected to continue there. A one-lane
     // repo with a stall holds its one lane, so it settles nothing.
     settleDeploy(repo, dryRun, blockedLanes(repo, loadQueue().entries))
+
+    // 6. THE FINAL CHECK RUNS UNDER THE LANDING LOCK. It used to run after the lock was
+    //    released, so a second `land` could fast-forward the primary checkout (and rewrite
+    //    the known-red file) under it. The broad sweep, once, on the final tip. This
+    //    REPORTS; it does not gate, because each entry already passed the gate on exactly
+    //    its own content. A cleanup-only entry gates no lane, so in a one-lane repo
+    //    `landedLanes` would miss it; the final check there runs whenever anything landed.
+    if (landed.length) {
+      const finalLanes = multiLane(repo)
+        ? Object.keys(repo.lanes).filter(n => landedLanes.includes(n))
+        : Object.keys(repo.lanes)
+      for (const name of finalLanes) {
+        const lane = repo.lanes[name]
+        if (!lane.finalCheck || dryRun) continue
+        console.log(`\n${bold('final check')} ${dim(lane.finalCheck)}`)
+        const ok = await runGate(lane.finalCheck, repo.checkout, lane.gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })
+        console.log(ok ? green('  final check passed')
+          : gateTimedOut ? red(`  FINAL CHECK TIMED OUT after ${fmtMinutes(gateTimeoutMs(repo, name) / 60000)} and was ended — main is landed and pushed; this is a new task, not a rollback`)
+          : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
+      }
+    }
   } finally {
     if (!dryRun) {
       mutateQueue(q => { for (const e of q.entries) if (e.repo === key) delete e.batch })
@@ -2549,26 +3167,11 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
     return { landed, refused }
   }
 
-  // 6. The broad sweep, once, on the final tip. This REPORTS; it does not gate,
-  //    because each entry already passed the gate on exactly its own content.
-  //    A cleanup-only entry gates no lane, so in a one-lane repo `landedLanes`
-  //    would miss it; the final check there runs whenever anything landed.
-  const finalLanes = multiLane(repo)
-    ? Object.keys(repo.lanes).filter(n => landedLanes.includes(n))
-    : Object.keys(repo.lanes)
-  for (const name of finalLanes) {
-    const lane = repo.lanes[name]
-    if (!lane.finalCheck || dryRun) continue
-    console.log(`\n${bold('final check')} ${dim(lane.finalCheck)}`)
-    const ok = await runGate(lane.finalCheck, repo.checkout, lane.gateEnv || {})
-    console.log(ok ? green('  final check passed') : red('  FINAL CHECK FAILED — main is landed and pushed; this is a new task, not a rollback'))
-  }
-
   // The allow-list again, after the gate output that buries its first print.
   if (!dryRun) announceKnownRed(repo, { write: false })
 
   if (landed.length) {
-    console.log(`\n${green(bold('landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
+    console.log(`\n${green(bold(dryRun ? 'would land' : 'landed'))} ${landed.length} branch(es) into ${key}/${repo.mainBranch}:`)
     landed.forEach(b => console.log(`  · ${b}`))
     for (const names of batchesRun) console.log(dim(`  gated together in one batch, landed in one push: ${names.join(', ')}`))
   }
@@ -2579,7 +3182,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   console.error(red(`\n${bold('stalled')} ${stalledAtEnd.length} branch(es) in ${key}:`))
   for (const e of stalledAtEnd) {
     console.error(red(`  · ${e.branch} [${queueLanesOf(repo, e).join(', ')}] — ${e.stallReason || 'stalled'}`))
-    console.error(dim(`    report: ${path.join(REPORT_DIR, `${key}-${e.branch}.md`)}`))
+    console.error(dim(`    report: ${reportFile(key, e.branch)}`))
   }
   const waiting = Object.keys(repo.lanes).filter(n => blockedLanes(repo, stalledAtEnd).has(n))
   console.error(dim(`  Entries in ${lanePhrase(waiting)} wait behind ${stalledAtEnd.length === 1 ? 'this stall' : 'these stalls'}; entries in other lanes keep landing.`))
@@ -2664,3 +3267,4 @@ if (!fn) { console.error(red(`local-merge-queue: unknown command "${cmd}"`)); cm
 const result = await fn(cfg, args)
 if (result && result.refused) process.exit(1)
 if (result && result.stalledOn) process.exit(2)
+if (residueLeft) process.exit(3)             // landed, but a cleanup step left something behind (said in red above)

@@ -3,7 +3,10 @@
 # Nothing here touches a real repo.
 set -u
 
-ROOT="$(mktemp -d /tmp/local-merge-queue-test.XXXXXX)"
+# macOS sets TMPDIR with a trailing slash. The queue prints the paths node normalizes ("T//x" becomes
+# "T/x"), and several cases compare its output with $ROOT-based paths, so $ROOT must already be normal.
+_TMP="${TMPDIR:-/tmp}"
+ROOT="$(mktemp -d "${_TMP%/}/local-merge-queue-test.XXXXXX")"
 export LOCAL_MERGE_QUEUE_STATE="$ROOT/state"
 export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/repos.json"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +17,7 @@ bad ()  { FAIL=$((FAIL+1)); echo "  FAIL — $1"; }
 check () { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 echo "sandbox: $ROOT"
+check "the sandbox path is already normal (a TMPDIR ending in a slash gives no double slash)" '[[ "$ROOT" != *//* ]]'
 
 # ── build a throwaway repo: bare origin + primary checkout + two worktrees ────
 git init -q --bare "$ROOT/origin.git"
@@ -1971,8 +1975,9 @@ BG=$!
 wait_for "$ROOT/gate-started"; gpid=$(cat "$ROOT/gate-pid")
 kill -KILL $BG; wait $BG 2>/dev/null; sleep 0.3
 st=$($LOCAL_MERGE_QUEUE status b 2>&1)
-check "after SIGKILL the lock is left, and status says its holder died instead of LOCKED" '[[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/b" && "$st" == *"died holding the lock"* && "$st" != *LOCKED* && "$st" != *"gated together"* ]]'
-touch "$ROOT/gate-release"; sleep 0.5; unset HOLD_MATCH; clear_hold   # the orphaned gate of a SIGKILLed run ends on its own
+check "after SIGKILL the lock is left, and status says its run died (and that its gate is still running) instead of LOCKED" '[[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/b" && "$st" == *"a landing run died"* && "$st" == *"the gate it started is still running"* && "$st" != *LOCKED* && "$st" != *"gated together"* ]]'
+# The orphaned gate of a SIGKILLed run ends on its own once released; the lock stays held until it has (see the round-3 section).
+touch "$ROOT/gate-release"; for i in $(seq 1 100); do kill -0 $gpid 2>/dev/null || break; sleep 0.2; done; unset HOLD_MATCH; clear_hold
 : > "$BLOG"
 out=$($LOCAL_MERGE_QUEUE land b 2>&1); rc=$?
 check "…and the next land breaks the dead lock and clears the marks" '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/brepo/sg-1.txt" && -f "$ROOT/brepo/sg-2.txt" ]]'
@@ -2032,8 +2037,941 @@ git -C "$ROOT/brepo" branch -q -D cx-1 cx-2 2>/dev/null; git -C "$ROOT/borigin.g
 export LOCAL_MERGE_QUEUE_CONFIG="$SAVED_CONFIG" LOCAL_MERGE_QUEUE_STATE="$SAVED_STATE"
 cd "$ROOT/repo"
 
+# ROUND3-BEGIN
+echo
+echo "════ round 3: the fixes after the independent re-check ════════════════"
+# Each block below builds a repository of its own (a bare origin, a primary checkout and a
+# second clone that stands for a bot or another session) and points the tool at a state
+# directory and a config of its own, so no block depends on another's leftovers.
+export ROOT
+r3_wait () { local i; for i in $(seq 1 300); do [[ -e "$1" ]] && return 0; sleep 0.2; done; return 1; }
+r3_env () { export LOCAL_MERGE_QUEUE_STATE="$ROOT/$1-state" LOCAL_MERGE_QUEUE_CONFIG="$ROOT/$1-repos.json"; }
+r3_init () {  # name: origin, primary checkout (lanes' folders a/, b/, other/), a second clone
+  local n="$1"
+  git init -q --bare "$ROOT/$n-origin.git"
+  git init -q -b main "$ROOT/$n"
+  ( cd "$ROOT/$n" && git config user.email t@t.t && git config user.name T && git remote add origin "$ROOT/$n-origin.git" \
+    && mkdir -p a b other && printf 'ign/\n*.scratch\n' > .gitignore && echo base > base.txt && echo a > a/f.txt && echo b > b/f.txt && echo o > other/f.txt \
+    && git add -A && git commit -qm base && git push -qu origin main )
+  git clone -q "$ROOT/$n-origin.git" "$ROOT/$n-other" 2>/dev/null
+  git -C "$ROOT/$n-other" config user.email t@t.t; git -C "$ROOT/$n-other" config user.name T
+  r3_env "$n"
+}
+r3_config () {  # name, then the rest of the repo entry as JSON members (no braces)
+  local n="$1"; shift
+  printf '{ "repos": { "%s": { "checkout": "%s", %s } } }\n' "$n" "$ROOT/$n" "$1" > "$ROOT/$n-repos.json"
+}
+r3_wt () { echo "$ROOT/$1-${2//\//-}"; }
+r3_branch () {  # repo, branch, file=content ...  (the worktree is $ROOT/<repo>-<branch, with / as ->)
+  local n="$1" b="$2"; shift 2
+  local wt; wt="$(r3_wt "$n" "$b")"
+  git -C "$ROOT/$n" worktree add -q "$wt" -b "$b" >/dev/null 2>&1
+  local pair; for pair in "$@"; do mkdir -p "$(dirname "$wt/${pair%%=*}")"; printf '%s' "${pair#*=}" > "$wt/${pair%%=*}"; done
+  ( cd "$wt" && git add -A && git commit -qm "$b" && git push -qu origin "$b" 2>/dev/null )
+}
+r3_queue () {  # repo, branch...: enqueue each from its worktree, then approve them
+  local n="$1"; shift; local b
+  for b in "$@"; do ( cd "$(r3_wt "$n" "$b")" && $LOCAL_MERGE_QUEUE enqueue >/dev/null 2>&1 ); done
+  $LOCAL_MERGE_QUEUE approve "$@" --repo "$n" >/dev/null 2>&1
+}
+r3_outside () {  # repo, file=content, message: a commit pushed to origin's main by somebody else (the second clone)
+  local n="$1" pair="$2" msg="$3"
+  ( cd "$ROOT/$n-other" && git pull -q origin main 2>/dev/null; mkdir -p "$(dirname "${pair%%=*}")"; printf '%s' "${pair#*=}" > "${pair%%=*}"; git add -A && git commit -qm "$msg" && git push -q origin main )
+}
+r3_qinfo () { node -e 'const q=JSON.parse(require("fs").readFileSync(process.env.LOCAL_MERGE_QUEUE_STATE+"/queue.json"));console.log(q.entries.map(e=>e.branch+":"+e.status).join(","))'; }
+r3_gates () { local n; n=$(grep -c '^gate-run' "$ROOT/$1-gate.log" 2>/dev/null); echo "${n:-0}"; }
+r3_main_eq () { [[ "$(git -C "$ROOT/$1" rev-parse main)" == "$(git -C "$ROOT/$1-origin.git" rev-parse main)" ]]; }
+# A gate that records its runs. While <repo>-hold exists it announces itself (<repo>-gate-started,
+# <repo>-gate-pid) and waits for <repo>-release; it fails while <repo>-fail exists.
+cat > "$ROOT/r3-gate.sh" <<'SH'
+#!/bin/bash
+n="$1"; lane="${2:-}"
+echo "gate-run $(basename "$PWD") $lane" >> "$ROOT/$n-gate.log"
+if [ -e "$ROOT/$n-hold" ]; then
+  echo $$ > "$ROOT/$n-gate-pid"; touch "$ROOT/$n-gate-started"
+  for i in $(seq 1 600); do [ -e "$ROOT/$n-release" ] && break; sleep 0.2; done
+fi
+# <repo>-fail-after-first: every run after the first one fails
+if [ -e "$ROOT/$n-fail-after-first" ] && [ "$(grep -c '^gate-run' "$ROOT/$n-gate.log")" -gt 1 ]; then exit 1; fi
+[ ! -e "$ROOT/$n-fail" ]
+SH
+r3_hold () { rm -f "$ROOT/$1-release" "$ROOT/$1-gate-started" "$ROOT/$1-gate-pid" "$ROOT/$1-fail"; touch "$ROOT/$1-hold"; }
+r3_unhold () { rm -f "$ROOT/$1-hold" "$ROOT/$1-release" "$ROOT/$1-gate-started" "$ROOT/$1-fail"; }
+r3_gate_step () { echo "bash $ROOT/r3-gate.sh $1 ${2:-}"; }
+r3_lane_gates () { local n; n=$(grep -c "^gate-run .* $2\$" "$ROOT/$1-gate.log" 2>/dev/null); echo "${n:-0}"; }
+# The origin's pre-receive hook: it logs every ref pushed (<repo>-refs.log) and, when
+# <repo>-hook.sh exists, runs it with the ref and the new value, so a test can act at a chosen push.
+r3_hook () {  # repo
+  cat > "$ROOT/$1-origin.git/hooks/pre-receive" <<SH
+#!/bin/bash
+while read old new ref; do
+  echo "\$ref \$new" >> "$ROOT/$1-refs.log"
+  [ -e "$ROOT/$1-hook.sh" ] && . "$ROOT/$1-hook.sh"
+done
+exit 0
+SH
+  chmod +x "$ROOT/$1-origin.git/hooks/pre-receive"
+}
+
+echo
+echo "── round 3 · the merge is bound to the commit the gate ran on ──────────────"
+# THE DEFECT (reviewer, finding 1): the merge took whatever the branch ref held when it ran, so
+# a commit made in the worktree during the gate landed without the gate having seen it.
+r3_init c1
+r3_config c1 "\"gate\": [\"$(r3_gate_step c1)\"], \"finalCheck\": \"true\""
+r3_branch c1 sneak sneak.txt=gated
+r3_queue c1 sneak
+before=$(git -C "$ROOT/c1-origin.git" rev-parse main)
+r3_hold c1; : > "$ROOT/c1-gate.log"
+$LOCAL_MERGE_QUEUE land c1 > "$ROOT/c1-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c1-gate-started"
+( cd "$(r3_wt c1 sneak)" && echo ungated > sneaky.txt && git add -A && git commit -qm "made while the gate ran" )
+touch "$ROOT/c1-release"; wait $BG; rc=$?
+out=$(cat "$ROOT/c1-land.out"); r3_unhold c1
+check "a commit made in the worktree during the gate stalls the entry (exit 2)"       '[[ $rc == 2 && "$out" == *"changed during the gate"* && "$(r3_qinfo)" == sneak:stalled ]]'
+check "…and neither the gated work nor the ungated commit reached main or origin"     '[[ "$(git -C "$ROOT/c1" rev-parse main)" == "$before" && "$(git -C "$ROOT/c1-origin.git" rev-parse main)" == "$before" && ! -e "$ROOT/c1/sneaky.txt" && ! -e "$ROOT/c1/sneak.txt" ]]'
+check "…and the worktree, with the commit, is left for its author"                    '[[ -f "$(r3_wt c1 sneak)/sneaky.txt" ]] && git -C "$ROOT/c1" rev-parse --verify -q refs/heads/sneak >/dev/null'
+check "…and the stall report says the gate did not see what would land"               'grep -q "did not see what would land" "$LOCAL_MERGE_QUEUE_STATE/reports/c1-sneak.md"'
+# The author takes the commit out, the entry resumes, is gated again, and lands the gated content.
+( cd "$(r3_wt c1 sneak)" && git reset -q --hard HEAD~1 )
+: > "$ROOT/c1-gate.log"
+$LOCAL_MERGE_QUEUE resume c1 >/dev/null 2>&1; rc=$?
+check "resume gates the entry again and lands it"                                      '[[ $rc == 0 && "$(r3_gates c1)" == 1 && -f "$ROOT/c1/sneak.txt" && ! -e "$ROOT/c1/sneaky.txt" ]]'
+# An uncommitted edit of a tracked file made during the gate is a change too.
+r3_branch c1 edited edited.txt=gated
+r3_queue c1 edited
+r3_hold c1; : > "$ROOT/c1-gate.log"
+$LOCAL_MERGE_QUEUE land c1 > "$ROOT/c1-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c1-gate-started"
+echo "edited while the gate ran" >> "$(r3_wt c1 edited)/edited.txt"
+touch "$ROOT/c1-release"; wait $BG; rc=$?
+out=$(cat "$ROOT/c1-land.out"); r3_unhold c1
+check "an uncommitted edit of a tracked file during the gate stalls the entry too"    '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c1/edited.txt" ]]'
+# What merges is the gated commit itself: the second parent of the merge is the tip that was published.
+$LOCAL_MERGE_QUEUE dequeue edited --repo c1 >/dev/null 2>&1
+r3_hook c1; : > "$ROOT/c1-refs.log"
+r3_branch c1 plain plain.txt=gated
+r3_queue c1 plain
+$LOCAL_MERGE_QUEUE land c1 >/dev/null 2>&1
+check "the merge's second parent is the tip the run published, which is the commit the gate ran on" '[[ -n "$(grep "^refs/heads/plain " "$ROOT/c1-refs.log")" && "$(git -C "$ROOT/c1" rev-parse main^2)" == "$(grep "^refs/heads/plain " "$ROOT/c1-refs.log" | grep -v " 0000000" | tail -1 | cut -d" " -f2)" ]]'
+
+echo
+echo "── round 3 · local main must equal origin's before an entry starts ─────────"
+# THE DEFECT (reviewer, finding 2): a run killed between its local merge and its push left main
+# ahead of origin, and the next run read the entry as already landed, deleted its worktree and
+# its branch (local and remote) and dropped it, with the merge existing in the primary checkout only.
+r3_init c2
+r3_config c2 "\"gate\": [\"$(r3_gate_step c2)\"], \"finalCheck\": \"true\""
+r3_hook c2
+r3_branch c2 alpha alpha.txt=alpha
+r3_branch c2 beta beta.txt=beta
+r3_queue c2 alpha beta
+cat > "$ROOT/c2-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ]; then
+  touch "$ROOT/c2-push-started"
+  for i in $(seq 1 100); do [ -e "$ROOT/c2-kill-done" ] && break; sleep 0.2; done
+  echo "REJECTED BY TEST HOOK" >&2; exit 1
+fi
+SH
+origin_before=$(git -C "$ROOT/c2-origin.git" rev-parse main)
+$LOCAL_MERGE_QUEUE land c2 > "$ROOT/c2-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c2-push-started"
+kill -KILL $BG; wait $BG 2>/dev/null
+touch "$ROOT/c2-kill-done"; sleep 1; rm -f "$ROOT/c2-hook.sh"
+check "(setup of the test) the killed run left main ahead of origin by one merge and its branch commit, and origin untouched" '[[ "$(git -C "$ROOT/c2" rev-list --count origin/main..main)" == 2 && "$(git -C "$ROOT/c2-origin.git" rev-parse main)" == "$origin_before" ]]'
+out=$($LOCAL_MERGE_QUEUE land c2 2>&1); rc=$?
+check "the next run refuses, naming the commits main is ahead by and the command that discards it" '[[ $rc != 0 && "$out" == *"has 2 commit(s) that origin/main does not"* && "$out" == *"Merge alpha"* && "$out" == *"reset --hard origin/main"* ]]'
+check "…and cleans nothing up: the worktrees, the local and the remote branches stay"  '[[ -d "$(r3_wt c2 alpha)" && -d "$(r3_wt c2 beta)" ]] && git -C "$ROOT/c2" rev-parse --verify -q refs/heads/alpha >/dev/null && git -C "$ROOT/c2-origin.git" rev-parse --verify -q refs/heads/alpha >/dev/null'
+check "…the entries are still approved, and nothing reached origin"                     '[[ "$(r3_qinfo)" == alpha:approved,beta:approved && "$(git -C "$ROOT/c2-origin.git" rev-parse main)" == "$origin_before" ]]'
+git -C "$ROOT/c2" reset -q --hard origin/main
+: > "$ROOT/c2-gate.log"
+out=$($LOCAL_MERGE_QUEUE land c2 2>&1); rc=$?
+check "once the leftover is discarded, both entries land as gated entries"              '[[ $rc == 0 && -f "$ROOT/c2/alpha.txt" && -f "$ROOT/c2/beta.txt" ]] && r3_main_eq c2'
+check "…and each was gated"                                                             '[[ "$(r3_gates c2)" == 2 ]]'
+# A main that is merely behind is fast-forwarded, as it always was.
+r3_outside c2 other/bot.txt=bot "outside push"
+r3_branch c2 gamma gamma.txt=gamma; r3_queue c2 gamma
+out=$($LOCAL_MERGE_QUEUE land c2 2>&1); rc=$?
+check "a main that is only behind origin is fast-forwarded, and the entry lands on it"  '[[ $rc == 0 && -f "$ROOT/c2/other/bot.txt" && -f "$ROOT/c2/gamma.txt" ]] && r3_main_eq c2'
+
+# RESUME FETCHES BEFORE IT GATES (nit): a main that moved while the entry was stalled is seen,
+# and the entry is rebased and gated again, in a one-lane repo as well.
+r3_branch c2 stalled stalled.txt=s
+r3_queue c2 stalled
+touch "$ROOT/c2-fail"; : > "$ROOT/c2-gate.log"
+$LOCAL_MERGE_QUEUE land c2 >/dev/null 2>&1; rc=$?
+rm -f "$ROOT/c2-fail"
+check "(setup of the test) the entry stalls on its gate"                                '[[ $rc == 2 && "$(r3_qinfo)" == stalled:stalled ]]'
+r3_outside c2 other/more.txt=more "outside push while stalled"
+: > "$ROOT/c2-gate.log"
+out=$($LOCAL_MERGE_QUEUE resume c2 2>&1); rc=$?
+check "resume sees a main that moved while the entry was stalled, rebases and gates again, and lands" '[[ $rc == 0 && "$out" == *"moved while stalled was stalled — rebasing it again"* && "$(r3_gates c2)" == 1 && -f "$ROOT/c2/other/more.txt" && -f "$ROOT/c2/stalled.txt" ]] && r3_main_eq c2'
+
+echo
+echo "── round 3 · a hard-killed run's gate cannot overlap a second gate ─────────"
+# THE REGRESSION (reviewer, finding 3): the gate runs in a process group of its own, so killing the
+# land process with SIGKILL no longer killed its gate, and the stale lock then admitted a second
+# gate in the same worktree while the first was still running.
+r3_init c3
+r3_config c3 "\"gate\": [\"$(r3_gate_step c3)\"], \"finalCheck\": \"true\""
+r3_branch c3 held held.txt=h
+r3_queue c3 held
+r3_hold c3; : > "$ROOT/c3-gate.log"
+$LOCAL_MERGE_QUEUE land c3 > "$ROOT/c3-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c3-gate-started"
+gpid=$(cat "$ROOT/c3-gate-pid"); pgid=$(ps -o pgid= -p "$gpid" | tr -d ' ')
+check "the landing lock records the gate's process group"                              '[[ -n "$pgid" ]] && grep -q "\"gatePgid\":$pgid[,}]" "$LOCAL_MERGE_QUEUE_STATE/locks/c3/owner.json"'
+kill -KILL $BG; wait $BG 2>/dev/null; sleep 0.3
+check "(setup of the test) the land process is dead and its gate is still running"      '! kill -0 $BG 2>/dev/null && kill -0 -- -$pgid 2>/dev/null'
+st=$($LOCAL_MERGE_QUEUE status c3 2>&1)
+check "status says the dead run's gate is still running, and not LOCKED"                '[[ "$st" == *"gate it started is still running"* && "$st" == *"$pgid"* && "$st" != *LOCKED* ]]'
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "a second land is refused while the orphaned gate runs, and names its process group"  '[[ $rc != 0 && "$out" == *"still running"* && "$out" == *"$pgid"* && "$out" != *"breaking a stale lock"* ]]'
+check "…the message says to look at the group first (the exact ps command) and how to release the lock by hand if it is not a gate" '[[ "$out" == *"ps -o pid,pgid,etime,command -g $pgid"* && "$out" == *"rm -rf $LOCAL_MERGE_QUEUE_STATE/locks/c3"* && "$out" == *"unrelated process"* ]]'
+check "…and status carries the same hint"                                                 '[[ "$($LOCAL_MERGE_QUEUE status c3 2>&1)" == *"ps -o pid,pgid,etime,command -g $pgid"* ]]'
+check "…and no second gate started"                                                      '[[ "$(r3_gates c3)" == 1 ]]'
+out=$($LOCAL_MERGE_QUEUE resume c3 2>&1); rc=$?
+check "resume is refused the same way"                                                   '[[ $rc != 0 && "$out" == *"still running"* && "$(r3_gates c3)" == 1 ]]'
+touch "$ROOT/c3-release"
+for i in $(seq 1 100); do kill -0 -- -$pgid 2>/dev/null || break; sleep 0.2; done
+r3_unhold c3
+check "(setup of the test) the orphaned gate has ended"                                   '! kill -0 -- -$pgid 2>/dev/null'
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "once the gate has ended the next land breaks the stale lock and lands the entry"  '[[ $rc == 0 && "$out" == *"breaking a stale lock left by pid $BG"* && -f "$ROOT/c3/held.txt" ]] && r3_main_eq c3'
+# A recycled group id: the dead run's recorded group is now some unrelated live process (here, this
+# test's own group). The lock cannot tell, so it is held; the message's hand release is the way out.
+r3_branch c3 recycled recycled.txt=1; r3_queue c3 recycled
+dead=$(sh -c 'echo $$'); mypg=$(ps -o pgid= -p $$ | tr -d ' ')
+rm -rf "$LOCAL_MERGE_QUEUE_STATE/locks/c3"; mkdir -p "$LOCAL_MERGE_QUEUE_STATE/locks/c3"
+echo "{\"pid\":$dead,\"token\":\"dead-run\",\"since\":\"2026-01-01T00:00:00.000Z\",\"gatePgid\":$mypg}" > "$LOCAL_MERGE_QUEUE_STATE/locks/c3/owner.json"
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "a lock whose recorded group is now an unrelated live process refuses, as it cannot tell"      '[[ $rc != 0 && "$out" == *"ps -o pid,pgid,etime,command -g $mypg"* ]]'
+eval "$(grep -o 'rm -rf [^ ]*locks/c3' <<<"$out" | head -1)"
+out=$($LOCAL_MERGE_QUEUE land c3 2>&1); rc=$?
+check "…and the hand release the message prints clears it: the next land goes ahead"                 '[[ $rc == 0 && -f "$ROOT/c3/recycled.txt" ]]'
+
+echo
+echo "── round 3 · a branch name with a slash does not crash the stall report ────"
+# THE DEFECT (reviewer, finding 4): the report path was built from the branch name without creating
+# the folder the slash implies, so a stall threw ENOENT, exited 1 and left no report.
+r3_init c4
+r3_config c4 '"gate": ["false"], "finalCheck": "true"'
+r3_branch c4 feat/x x.txt=1
+r3_queue c4 feat/x
+out=$($LOCAL_MERGE_QUEUE land c4 2>&1); rc=$?
+check "a stall on a branch named feat/x exits 2, not with an uncaught exception"         '[[ $rc == 2 && "$out" != *ENOENT* && "$out" == *STALLED* ]]'
+check "…the report exists, under a file name with no slash in it"                        '[[ -f "$LOCAL_MERGE_QUEUE_STATE/reports/c4-feat%2Fx.md" && "$out" == *"c4-feat%2Fx.md"* ]]'
+check "…and the entry is recorded as stalled"                                            '[[ "$(r3_qinfo)" == "feat/x:stalled" ]]'
+out=$($LOCAL_MERGE_QUEUE land c4 2>&1)
+check "a second land names the same report"                                              '[[ "$out" == *"c4-feat%2Fx.md"* ]]'
+
+echo
+echo "── round 3 · a gate has a timeout the config sets, and a hung gate stalls its entry ──"
+# THE GAP (reviewer, finding 5): a hung gate held the landing lock forever, since a live holder is
+# never broken. gateTimeoutMinutes (per repository, or per lane) ends a step that runs longer:
+# its process group gets SIGTERM, and SIGKILL after five seconds.
+r3_init c5
+cat > "$ROOT/c5-hung.sh" <<'SH'
+#!/bin/bash
+# ignores SIGTERM, so only the escalation to SIGKILL ends it
+trap '' TERM
+echo $$ > "$ROOT/c5-hung-pid"
+while true; do sleep 1; done
+SH
+r3_config c5 "\"gateTimeoutMinutes\": 0.03, \"gate\": [\"bash $ROOT/c5-hung.sh\"], \"finalCheck\": \"true\""
+r3_branch c5 hangs hangs.txt=1
+r3_queue c5 hangs
+start=$SECONDS
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+hpid=$(cat "$ROOT/c5-hung-pid")
+check "a gate that runs past gateTimeoutMinutes stalls its entry (exit 2) with a timeout message"  '[[ $rc == 2 && "$out" == *"timed out after"* && "$(r3_qinfo)" == hangs:stalled ]]'
+check "…the hung gate, which ignores SIGTERM, was ended (SIGKILL after five seconds) in bounded time" '! kill -0 $hpid 2>/dev/null && (( SECONDS - start < 60 ))'
+check "…and a limit under a minute is said in seconds, not as 0.03 minutes"               '[[ "$out" == *"timed out after 2 seconds"* && "$out" != *"0.03 minutes"* ]]'
+check "…the landing lock was released, and nothing landed"                               '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" && ! -e "$ROOT/c5/hangs.txt" ]]'
+check "…and the stall report says the gate timed out"                                    'grep -q "timed out" "$LOCAL_MERGE_QUEUE_STATE/reports/c5-hangs.md"'
+$LOCAL_MERGE_QUEUE dequeue hangs --repo c5 >/dev/null 2>&1
+# A lane's own gateTimeoutMinutes wins over the repository's.
+cat > "$ROOT/c5-repos.json" <<JSON
+{ "repos": { "c5": { "checkout": "$ROOT/c5", "gateTimeoutMinutes": 100,
+  "lanes": { "a": { "paths": ["a/"], "gateTimeoutMinutes": 0.03, "gate": ["sleep 60"] }, "rest": { "paths": "*", "gate": ["true"] } } } } }
+JSON
+r3_branch c5 lane-a a/new.txt=1
+r3_queue c5 lane-a
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+check "a lane's gateTimeoutMinutes overrides the repository's, and the message names the lane" '[[ $rc == 2 && "$out" == *"timed out after"* && "$out" == *"lane a"* ]]'
+$LOCAL_MERGE_QUEUE dequeue lane-a --repo c5 >/dev/null 2>&1
+# A hung setup step stalls the entry the same way, and says it was the setup.
+r3_config c5 '"gateTimeoutMinutes": 0.03, "setupWhen": "false", "setup": ["sleep 60"], "gate": ["true"], "finalCheck": "true"'
+r3_branch c5 sets sets.txt=1
+r3_queue c5 sets
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+check "a hung setup step is ended and stalls the entry, saying it was the setup"          '[[ $rc == 2 && "$out" == *"worktree setup timed out"* && ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" ]]'
+$LOCAL_MERGE_QUEUE dequeue sets --repo c5 >/dev/null 2>&1
+# A hung final check is ended and reported; the run still ends.
+r3_config c5 '"gateTimeoutMinutes": 0.03, "gate": ["true"], "finalCheck": "sleep 60"'
+r3_branch c5 fin fin.txt=1
+r3_queue c5 fin
+out=$(gtimeout 120 $LOCAL_MERGE_QUEUE land c5 2>&1); rc=$?
+check "a hung final check is ended and reported as timed out, after the entry landed"     '[[ $rc == 0 && "$out" == *"FINAL CHECK TIMED OUT"* && -f "$ROOT/c5/fin.txt" && ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c5" ]]'
+# The key is validated.
+r3_config c5 '"gateTimeoutMinutes": -3, "gate": ["true"]'
+out=$($LOCAL_MERGE_QUEUE status c5 2>&1); rc=$?
+check "a gateTimeoutMinutes that is not a positive number is refused"                     '[[ $rc != 0 && "$out" == *gateTimeoutMinutes* ]]'
+
+echo
+echo "── round 3 · the known-red file is written under the lock; the final check runs under it ──"
+# THE NIT (reviewer, finding 7): a second land about to be refused deleted and rewrote the file the
+# running holder's gates read, and the final check ran after the lock was released.
+r3_init c6
+soon=$(node -e 'const d=new Date(Date.now()+5*86400000);console.log(d.toISOString().slice(0,10))')
+cat > "$ROOT/c6-final.sh" <<'SH'
+#!/bin/bash
+[ -d "$LOCAL_MERGE_QUEUE_STATE/locks/c6" ] && echo held > "$ROOT/c6-final-under-lock"
+exit 0
+SH
+r3_config c6 "\"gate\": [\"$(r3_gate_step c6)\"], \"finalCheck\": \"bash $ROOT/c6-final.sh\", \"knownRed\": [{\"suite\": \"test/x.test.mjs\", \"issue\": \"o/r#1\", \"expires\": \"$soon\"}]"
+r3_branch c6 kr kr.txt=1
+r3_queue c6 kr
+r3_hold c6; : > "$ROOT/c6-gate.log"
+$LOCAL_MERGE_QUEUE land c6 > "$ROOT/c6-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c6-gate-started"
+kr="$LOCAL_MERGE_QUEUE_STATE/known-red/c6.tsv"
+check "(setup of the test) the running holder wrote the known-red file"                  '[[ -f "$kr" ]]'
+echo "SENTINEL-written-by-the-test" >> "$kr"
+out=$($LOCAL_MERGE_QUEUE land c6 2>&1); rc=$?
+check "(setup of the test) a second land is refused while the first holds the lock"      '[[ $rc != 0 && "$out" == *"being landed already"* ]]'
+check "a refused second land does not delete or rewrite the file the holder's gates read" 'grep -q SENTINEL-written-by-the-test "$kr"'
+touch "$ROOT/c6-release"; wait $BG; r3_unhold c6
+check "the final check runs while the landing lock is still held"                        '[[ -f "$ROOT/c6-final-under-lock" ]]'
+check "…and the lock is released when the run ends"                                      '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/c6" ]]'
+
+echo
+echo "── round 3 · cleanup keeps what the gate did not see, and deletes only the landed tip ──"
+# THE NIT (reviewer, finding 8): cleanup ran `git worktree remove --force` and deleted the remote
+# branch whatever it held, so files made in the worktree after the gate were destroyed, and a commit
+# pushed to the remote branch after the publish was deleted with it. The origin's hook holds the
+# push of main until the test says go, which is the window those things happen in.
+r3_init c7
+r3_hook c7
+r3_config c7 "\"gate\": [\"$(r3_gate_step c7)\"], \"finalCheck\": \"true\""
+cat > "$ROOT/c7-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c7-hold-main" ]; then
+  touch "$ROOT/c7-push-started"
+  for i in $(seq 1 150); do [ -e "$ROOT/c7-go" ] && break; sleep 0.2; done
+fi
+SH
+c7_window () {  # runs a landing run whose push of main is held; the caller acts in the window, then it is released
+  rm -f "$ROOT/c7-push-started" "$ROOT/c7-go"; touch "$ROOT/c7-hold-main"
+  $LOCAL_MERGE_QUEUE land c7 > "$ROOT/c7-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c7-push-started"
+}
+c7_release () { touch "$ROOT/c7-go"; wait $BG; rc=$?; rm -f "$ROOT/c7-hold-main"; out=$(cat "$ROOT/c7-land.out"); }
+
+# 1. Work made in the worktree after the gate survives the cleanup.
+r3_branch c7 late late.txt=gated
+r3_queue c7 late
+c7_window
+echo "work in progress" > "$(r3_wt c7 late)/notes.txt"
+echo "an edit made after the gate" >> "$(r3_wt c7 late)/late.txt"
+c7_release
+check "an entry is landed, whatever was made in its worktree meanwhile (exit 3: a cleanup left residue)" '[[ $rc == 3 && "$(r3_qinfo)" == "" && "$(git -C "$ROOT/c7" show main:late.txt)" == gated ]]'
+check "…the untracked file and the uncommitted edit made after the gate survive: the worktree is kept" '[[ -f "$(r3_wt c7 late)/notes.txt" && "$(cat "$(r3_wt c7 late)/late.txt")" == *"an edit made after the gate"* ]]'
+check "…the branch stays with its worktree, and the run says why, in red, as residue"    'git -C "$ROOT/c7" rev-parse --verify -q refs/heads/late >/dev/null && [[ "$out" == *"WORKTREE KEPT"* && "$out" == *notes.txt* ]]'
+rm -rf "$(r3_wt c7 late)"; git -C "$ROOT/c7" worktree prune; git -C "$ROOT/c7" branch -q -D late; git -C "$ROOT/c7-origin.git" branch -q -D late 2>/dev/null
+
+# 2. A commit pushed to the remote branch after the publish is not deleted with it.
+r3_branch c7 foreign foreign.txt=gated
+r3_queue c7 foreign
+c7_window
+( cd "$ROOT/c7-other" && git fetch -q origin foreign && git checkout -q -B foreign origin/foreign && echo theirs > theirs.txt && git add -A && git commit -qm "pushed by somebody else after the publish" && git push -q origin foreign && git checkout -q main )
+theirs=$(git -C "$ROOT/c7-other" rev-parse foreign)
+c7_release
+check "an entry whose remote branch gained a commit after the publish still lands (exit 3)" '[[ $rc == 3 && "$(git -C "$ROOT/c7" show main:foreign.txt)" == gated ]]'
+check "…and the remote branch is kept, with the commit somebody else pushed"             '[[ "$(git -C "$ROOT/c7-origin.git" rev-parse refs/heads/foreign)" == "$theirs" && "$out" == *"REMOTE BRANCH KEPT"* && "$out" == *"is not the landed tip"* ]]'
+check "…while the clean worktree and the local branch are removed as before"              '[[ ! -d "$(r3_wt c7 foreign)" ]] && ! git -C "$ROOT/c7" rev-parse --verify -q refs/heads/foreign >/dev/null'
+
+# 3. A branch merged by hand, whose worktree holds a file made after the enqueue, is cleaned up without that file.
+r3_branch c7 byhand byhand.txt=1
+r3_queue c7 byhand
+git -C "$ROOT/c7" merge -q --no-ff -m "merged by hand" byhand && git -C "$ROOT/c7" push -q origin main
+echo "scratch" > "$(r3_wt c7 byhand)/scratch.txt"
+out=$($LOCAL_MERGE_QUEUE land c7 2>&1)
+check "a cleanup-only entry keeps a worktree that holds an untracked file, and says so"   '[[ "$out" == *"cleanup only"* && -f "$(r3_wt c7 byhand)/scratch.txt" && "$out" == *"WORKTREE KEPT"* ]]'
+# …and a clean one is removed, local and remote branches included, as it always was (tests 10 and 12 above pin the rest).
+r3_branch c7 byhand2 byhand2.txt=1
+r3_queue c7 byhand2
+git -C "$ROOT/c7" merge -q --no-ff -m "merged by hand again" byhand2 && git -C "$ROOT/c7" push -q origin main
+out=$($LOCAL_MERGE_QUEUE land c7 2>&1)
+check "a clean cleanup-only entry is removed entirely: worktree, local and remote branch" '[[ ! -d "$(r3_wt c7 byhand2)" ]] && ! git -C "$ROOT/c7" rev-parse --verify -q refs/heads/byhand2 >/dev/null && ! git -C "$ROOT/c7-origin.git" rev-parse --verify -q refs/heads/byhand2 >/dev/null'
+
+echo
+echo "── round 3 · batched landing: the guards the re-check found unpinned ────────"
+# The re-check removed each guard in turn and found that nothing failed. Each test here fails when
+# the guard it names is taken out, because it asserts the guard's own message (or its effect).
+export HERE
+r3_init c8
+r3_hook c8
+r3_config c8 "\"batch\": {\"max\": 5}, \"gate\": [\"$(r3_gate_step c8)\"], \"finalCheck\": \"true\""
+cat > "$ROOT/c8-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c8-hold-main" ]; then
+  touch "$ROOT/c8-push-started"
+  for i in $(seq 1 150); do [ -e "$ROOT/c8-go" ] && break; sleep 0.2; done
+fi
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c8-reject-main" ]; then echo "REJECTED BY TEST HOOK" >&2; exit 1; fi
+if [ -e "$ROOT/c8-unapprove-on" ] && [ "$ref" = "refs/heads/$(cat "$ROOT/c8-unapprove-on")" ]; then node "$HERE/local-merge-queue.mjs" unapprove "$(cat "$ROOT/c8-unapprove")" --repo c8 >/dev/null 2>&1; fi
+SH
+c8_pair () {  # a prefix: two entries, approved
+  r3_branch c8 "$1-1" "$1-1.txt=1"; r3_branch c8 "$1-2" "$1-2.txt=2"; r3_queue c8 "$1-1" "$1-2"
+}
+c8_gated () {  # a land run whose batch gate is held; the caller acts, then it is released
+  r3_hold c8; : > "$ROOT/c8-gate.log"
+  $LOCAL_MERGE_QUEUE land c8 > "$ROOT/c8-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c8-gate-started"
+}
+c8_release () { touch "$ROOT/c8-release"; wait $BG; rc=$?; out=$(cat "$ROOT/c8-land.out"); r3_unhold c8; }
+
+# 1. Guard: an entry's worktree must still be clean.
+c8_pair wc
+c8_gated
+echo "left by somebody" > "$(r3_wt c8 wc-2)/scratch.txt"
+c8_release
+check "an untracked file made in an entry's worktree during the batch gate fails the batch" '[[ "$out" == *"BATCH FAILED: wc-2 changed while the batch was gated"* ]]'
+check "…and the entries still land, one at a time"                                         '[[ -f "$ROOT/c8/wc-1.txt" && -f "$ROOT/c8/wc-2.txt" ]]'
+
+# 2. Guard: the entry's remote branch is compared with what it was. Nothing is published before it fails.
+c8_pair rb
+c8_gated
+( cd "$ROOT/c8-other" && git fetch -q origin rb-2 && git checkout -q -B rb-2 origin/rb-2 && echo theirs > rb-theirs.txt && git add -A && git commit -qm "pushed to the remote branch during the gate" && git push -q origin rb-2 && git checkout -q main )
+: > "$ROOT/c8-refs.log"
+c8_release
+check "a push to an entry's remote branch during the batch gate fails the batch with that message" '[[ "$out" == *"BATCH FAILED: rb-2 changed while the batch was gated"* ]]'
+
+# 3. Guard: origin's main moved while the candidate was gated.
+c8_pair mv
+c8_gated
+r3_outside c8 other/moved.txt=1 "pushed to main during the batch gate"
+: > "$ROOT/c8-refs.log"
+c8_release
+check "main moving during the batch gate fails the batch with the stale-gate message, not at the push" '[[ "$out" == *"BATCH FAILED: main moved while the candidate was gated, so the gate result is stale"* ]]'
+check "…and before any entry's tip was published for the batch"                              '[[ "$out" != *"BATCH FAILED: origin rejected"* ]]'
+
+# 4. Guard: each entry's rebased tip is published before main is pushed, so its pull request can retire as merged.
+c8_pair pb
+: > "$ROOT/c8-refs.log"
+$LOCAL_MERGE_QUEUE land c8 > "$ROOT/c8-land.out" 2>&1; rc=$?
+out=$(cat "$ROOT/c8-land.out")
+second=$(grep "^refs/heads/pb-2 " "$ROOT/c8-refs.log" | grep -v " 0000000" | head -1 | cut -d" " -f2)
+check "(setup of the test) the pair landed as one batch"                                      '[[ $rc == 0 && "$out" == *"gated together in one batch, landed in one push: pb-1, pb-2"* ]]'
+check "the second entry's rebased tip was pushed to its own branch on origin, before main"     '[[ -n "$second" && "$(grep -n "^refs/heads/pb-2 $second" "$ROOT/c8-refs.log" | head -1 | cut -d: -f1)" -lt "$(grep -n "^refs/heads/main " "$ROOT/c8-refs.log" | head -1 | cut -d: -f1)" ]]'
+check "…and that tip is reachable from main (which is what lets its pull request close as merged)" '[[ -n "$second" ]] && git -C "$ROOT/c8-origin.git" merge-base --is-ancestor $second main'
+
+# 5. Approval is re-checked after the tips are pushed and before main is.
+c8_pair ap
+echo ap-2 > "$ROOT/c8-unapprove-on"; echo ap-1 > "$ROOT/c8-unapprove"
+: > "$ROOT/c8-refs.log"
+out=$($LOCAL_MERGE_QUEUE land c8 2>&1)
+rm -f "$ROOT/c8-unapprove-on" "$ROOT/c8-unapprove"
+check "an entry unapproved while the tips are being pushed fails the batch before main is pushed" '[[ "$out" == *"BATCH FAILED: ap-1 was unapproved"* ]]'
+check "…and the unapproved entry does not land (it stays enqueued), while the other does"      '[[ ! -f "$ROOT/c8/ap-1.txt" && -f "$ROOT/c8/ap-2.txt" && "$(r3_qinfo)" == ap-1:enqueued ]]'
+$LOCAL_MERGE_QUEUE dequeue ap-1 --repo c8 >/dev/null 2>&1
+
+# 6. No `reset --hard` discards work in an entry's worktree after the push.
+c8_pair rs
+rm -f "$ROOT/c8-push-started" "$ROOT/c8-go"; touch "$ROOT/c8-hold-main"
+$LOCAL_MERGE_QUEUE land c8 > "$ROOT/c8-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c8-push-started"
+echo "an edit made after the final check" >> "$(r3_wt c8 rs-1)/rs-1.txt"
+echo "a new file" > "$(r3_wt c8 rs-1)/notes.txt"
+touch "$ROOT/c8-go"; wait $BG; rc=$?; rm -f "$ROOT/c8-hold-main"; out=$(cat "$ROOT/c8-land.out")
+check "(setup of the test) the batch landed both entries (exit 3: the kept worktree is residue)" '[[ $rc == 3 && "$(git -C "$ROOT/c8" show main:rs-1.txt)" == 1 && -f "$ROOT/c8/rs-2.txt" ]]'
+check "an uncommitted edit and a new file made in an entry's worktree after the final check survive" '[[ "$(cat "$(r3_wt c8 rs-1)/rs-1.txt")" == *"an edit made after the final check"* && -f "$(r3_wt c8 rs-1)/notes.txt" ]]'
+check "…the entry's worktree and branch are kept, and the run says why"                        '[[ "$out" == *"WORKTREE KEPT"* ]] && git -C "$ROOT/c8" rev-parse --verify -q refs/heads/rs-1 >/dev/null'
+
+# 7. A failed batch says the remote tips were rewritten.
+c8_pair fm
+touch "$ROOT/c8-reject-main"
+out=$($LOCAL_MERGE_QUEUE land c8 2>&1)
+rm -f "$ROOT/c8-reject-main"
+check "the failed-batch message says the entries' remote tips were already rewritten"          '[[ "$out" == *"BATCH FAILED: origin rejected the push of main, so nothing has landed"* && "$out" == *"remote branch"*"fm-1, fm-2"*"already"*"rebased tips"* && "$out" == *"Falling back to landing fm-1, fm-2 one at a time"* ]]'
+
+echo
+echo "── round 3 · both guards of a lock's release are kept, and each is pinned ───"
+# lockRelease removes a lock only if it is ours, and checks that again after moving it aside (and puts
+# it back if it was not). The re-check found the first guard removable with every test still green, and
+# the second insufficient alone under contention (demonstrated), so each must be pinned by a test
+# that fails without it. The seam LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM=<prefix> writes <prefix>.checked
+# when a release gets past the first guard, and waits there for <prefix>.go.
+LG="$ROOT/c8b-state"
+printf '{ "repos": { "x": { "checkout": "%s" } } }\n' "$ROOT" > "$ROOT/c8b-repos.json"; export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/c8b-repos.json"
+c8b_queue () { rm -rf "$LG"; mkdir -p "$LG"; node -e 'require("fs").writeFileSync(process.argv[1]+"/queue.json",JSON.stringify({entries:[{repo:"x",branch:"x1",worktree:"/x",status:"enqueued",lanes:[],reached:[]}]}))' "$LG"; rm -f "$ROOT/c8b-seam".* "$ROOT/c8b-pause"; }
+# Guard 1: a release of a lock that is not ours never moves it aside.
+c8b_queue
+touch "$ROOT/c8b-seam.go"
+LOCAL_MERGE_QUEUE_STATE="$LG" LOCAL_MERGE_QUEUE_TEST_PAUSE_IN_LOCK="$ROOT/c8b-pause" LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM="$ROOT/c8b-seam" $LOCAL_MERGE_QUEUE approve x1 --repo x >/dev/null 2>&1 &
+BG=$!
+for i in $(seq 1 100); do [[ -f "$LG/queue.lock/owner.json" ]] && break; sleep 0.1; done
+echo "{\"pid\":$$,\"token\":\"someone-elses-token\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LG/queue.lock/owner.json"
+touch "$ROOT/c8b-pause"; wait $BG
+check "a release whose lock is not its own stops at the first guard: it never moves the lock aside" '[[ ! -e "$ROOT/c8b-seam.checked" ]] && grep -q someone-elses-token "$LG/queue.lock/owner.json"'
+# Guard 2: the lock changed hands between the first guard and the rename, so what was moved aside is put back.
+c8b_queue
+LOCAL_MERGE_QUEUE_STATE="$LG" LOCAL_MERGE_QUEUE_TEST_RELEASE_SEAM="$ROOT/c8b-seam" $LOCAL_MERGE_QUEUE approve x1 --repo x >/dev/null 2>&1 &
+BG=$!
+r3_wait "$ROOT/c8b-seam.checked"
+rm -rf "$LG/queue.lock"; mkdir "$LG/queue.lock"
+echo "{\"pid\":$$,\"token\":\"took-over-meanwhile\",\"since\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > "$LG/queue.lock/owner.json"
+touch "$ROOT/c8b-seam.go"; wait $BG
+check "a release that finds another process's lock where its own was puts that lock back untouched" '[[ -f "$LG/queue.lock/owner.json" ]] && grep -q took-over-meanwhile "$LG/queue.lock/owner.json" && ! ls "$LG" | grep -q "gone-"'
+rm -rf "$LG" "$ROOT/c8b-seam".* "$ROOT/c8b-pause"
+
+echo
+echo "── round 3 · main moved under a passing gate: redo the merge, and gate again only the lanes that moved ──"
+# THE LOSS (2026-11-22): a 54-minute gate passed, and the push of main was rejected as non-fast-forward
+# because a scheduled bot had pushed one commit to origin/main during the gate, changing one data file
+# outside every lane the gate covered. The run rolled the merge back and exited, and the gate had to be
+# paid again. The remedy is conservative: when the push is rejected because origin/main moved, fetch; if
+# every new commit changes only paths that belong to no lane this entry gated (by the lanes' own path
+# rules; a path that matches no lane at all counts as outside), redo the merge on the new main without a
+# new gate, at most twice. When the commits touch one or more of the entry's gated lanes the merge is
+# redone too, and only the gates of the lanes those commits touch run again (lanes are independent by
+# the queue's own definition); a rewritten history, a third move or a failing gate stalls the entry.
+r3_init c9
+r3_hook c9
+cat > "$ROOT/c9-hook.sh" <<'SH'
+# a bot: while c9-bot-left holds a positive number, each push of main makes another clone push one
+# commit to origin's main first (so the push is rejected, and origin has moved)
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c9-bot-left" ] && [ -z "${IN_BOT:-}" ]; then
+  n=$(cat "$ROOT/c9-bot-left")
+  if [ "$n" -gt 0 ]; then
+    echo $((n-1)) > "$ROOT/c9-bot-left"
+    d=$(cat "$ROOT/c9-bot-dir" 2>/dev/null || echo other)
+    ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; export IN_BOT=1
+      cd "$ROOT/c9-other" && git pull -q origin main && mkdir -p $d && echo $n > $d/bot-$n.txt && git add -A \
+        && git commit -qm "bot commit $n" && git push -q origin main ) >/dev/null 2>&1
+    echo "REJECTED: main moved" >&2; exit 1
+  fi
+fi
+SH
+cfg_lanes () { r3_config c9 "\"lanes\": { \"a\": { \"paths\": [\"a/\"], \"gate\": [\"$(r3_gate_step c9 a)\"]$1 }, \"b\": { \"paths\": [\"b/\"], \"gate\": [\"$(r3_gate_step c9 b)\"] } }"; }
+cfg_lanes ''
+c9_gated () {  # branch: a land run whose gate is held; the caller acts, then c9_release
+  r3_hold c9; : > "$ROOT/c9-gate.log"
+  $LOCAL_MERGE_QUEUE land c9 > "$ROOT/c9-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c9-gate-started"
+}
+c9_release () { touch "$ROOT/c9-release"; wait $BG; rc=$?; out=$(cat "$ROOT/c9-land.out"); r3_unhold c9; }
+
+# 1. A commit whose path belongs to no lane at all counts as outside: the merge is redone, with no new gate.
+r3_branch c9 s1 a/s1.txt=1; r3_queue c9 s1
+c9_gated
+r3_outside c9 other/data.json=1 "bot: refresh data"
+bot=$(git -C "$ROOT/c9-other" rev-parse HEAD)
+c9_release
+check "a commit on a path that belongs to no lane does not cost a second gate: the entry lands"  '[[ $rc == 0 && "$(r3_gates c9)" == 1 && -f "$ROOT/c9/a/s1.txt" && -f "$ROOT/c9/other/data.json" ]] && r3_main_eq c9'
+check "…the merge was redone on the bot's commit, and merges the gated commit"                    '[[ "$(git -C "$ROOT/c9" rev-parse main^1)" == "$bot" && "$out" == *"redoing the merge"* ]]'
+check "…and no stall was recorded"                                                                '[[ "$(r3_qinfo)" == "" ]]'
+
+# 2. A commit on another lane's path, not gated for this entry, is outside too.
+r3_branch c9 s2 a/s2.txt=1; r3_queue c9 s2
+c9_gated
+r3_outside c9 b/data.json=1 "bot: refresh b"
+c9_release
+check "a commit that touches only a lane this entry did not gate is redone without a new gate"  '[[ $rc == 0 && "$(r3_gates c9)" == 1 && -f "$ROOT/c9/a/s2.txt" && -f "$ROOT/c9/b/data.json" ]] && r3_main_eq c9'
+
+# 3. A commit that touches a gated lane's path must not merge without a gate: the merge is redone and that lane is gated again.
+r3_branch c9 s3 a/s3.txt=1; r3_queue c9 s3
+c9_gated
+r3_outside c9 a/bot.txt=1 "bot: touches the gated lane"
+bot=$(git -C "$ROOT/c9-other" rev-parse HEAD)
+c9_release
+check "a commit that touches a gated lane's path is not merged without a gate: the lane's gate runs again (two runs in all) and the entry lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 && "$(r3_lane_gates c9 a)" == 2 && -f "$ROOT/c9/a/s3.txt" && -f "$ROOT/c9/a/bot.txt" ]] && r3_main_eq c9'
+check "…the merge was redone on the bot's commit, and says which lane runs again"                  '[[ "$(git -C "$ROOT/c9" rev-parse main^1)" == "$bot" && "$out" == *"redoing the merge"* && "$out" == *"lane a"* && "$out" == *"gate runs again and no other"* ]]'
+check "…the second gate ran on the merged tree, in the entry's worktree, and the worktree is cleaned up" '[[ ! -d "$(r3_wt c9 s3)" && "$(r3_qinfo)" == "" ]]'
+# …and a second gate that fails stalls the entry, with main reset to origin's.
+r3_branch c9 s3b a/s3b.txt=1; r3_queue c9 s3b
+touch "$ROOT/c9-fail-after-first"
+c9_gated
+r3_outside c9 a/bot2.txt=1 "bot: touches the gated lane again"
+before=$(git -C "$ROOT/c9-origin.git" rev-parse main)
+c9_release
+rm -f "$ROOT/c9-fail-after-first"
+check "a gate that fails on the moved main stalls the entry, naming the lane and the moved main"    '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* && "$out" == *"failed on the new main"* && "$(r3_qinfo)" == s3b:stalled ]]'
+check "…nothing of the entry reached main or origin, local main equals origin again, and the worktree is back on its branch" '[[ "$(git -C "$ROOT/c9-origin.git" rev-parse main)" == "$before" && ! -f "$ROOT/c9/a/s3b.txt" ]] && r3_main_eq c9 && [[ "$(git -C "$(r3_wt c9 s3b)" rev-parse --abbrev-ref HEAD)" == s3b ]]'
+: > "$ROOT/c9-gate.log"
+$LOCAL_MERGE_QUEUE resume c9 >/dev/null 2>&1; rc=$?
+check "resume rebases it onto the new main, gates it, and lands it"                                '[[ $rc == 0 && -f "$ROOT/c9/a/s3b.txt" && -f "$ROOT/c9/a/bot2.txt" ]] && r3_main_eq c9'
+
+# 4. History that was rewritten (not a fast-forward of the commit the run built on) is never redone.
+r3_branch c9 s4 a/s4.txt=1; r3_queue c9 s4
+c9_gated
+( cd "$ROOT/c9-other" && git pull -q origin main 2>/dev/null; git commit -q --amend -m "rewritten tip" && git push -q --force origin main )
+c9_release
+check "a rewritten origin/main stalls the entry instead of being merged onto"                     '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* && "$out" == *"was rewritten: it no longer descends"* && "$(r3_qinfo)" == s4:stalled ]]'
+$LOCAL_MERGE_QUEUE dequeue s4 --repo c9 >/dev/null 2>&1
+
+# 5. A bot that moves main again at every push: redone at most twice, then stalled.
+r3_branch c9 s5 a/s5.txt=1; r3_queue c9 s5
+echo 5 > "$ROOT/c9-bot-left"; : > "$ROOT/c9-gate.log"
+out=$(gtimeout 180 $LOCAL_MERGE_QUEUE land c9 2>&1); rc=$?
+left=$(cat "$ROOT/c9-bot-left"); rm -f "$ROOT/c9-bot-left"
+check "main that moves at every push is redone at most twice (three pushes in all), then the entry stalls" '[[ $rc == 2 && "$left" == 2 && "$out" == *"main moved under a passing gate"* && "$out" == *"after 2 redos"* && "$(r3_gates c9)" == 1 && "$(r3_qinfo)" == s5:stalled ]]'
+check "…leaving local main equal to origin's"                                                      'r3_main_eq c9'
+$LOCAL_MERGE_QUEUE dequeue s5 --repo c9 >/dev/null 2>&1
+# …and one move followed by a quiet push lands after a single redo.
+r3_branch c9 s6 a/s6.txt=1; r3_queue c9 s6
+echo 1 > "$ROOT/c9-bot-left"; : > "$ROOT/c9-gate.log"
+out=$(gtimeout 180 $LOCAL_MERGE_QUEUE land c9 2>&1); rc=$?
+rm -f "$ROOT/c9-bot-left"
+check "one move during the push is redone once and lands, still on one gate"                       '[[ $rc == 0 && "$(r3_gates c9)" == 1 && -f "$ROOT/c9/a/s6.txt" && -f "$ROOT/c9/other/bot-1.txt" ]] && r3_main_eq c9'
+
+# 6. A push that is rejected while origin has NOT moved is the old failure: rolled back, the run dies.
+r3_branch c9 s7 a/s7.txt=1; r3_queue c9 s7
+cat > "$ROOT/c9-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c9-reject" ]; then echo "REJECTED BY TEST HOOK" >&2; exit 1; fi
+SH
+touch "$ROOT/c9-reject"
+out=$($LOCAL_MERGE_QUEUE land c9 2>&1); rc=$?
+rm -f "$ROOT/c9-reject"
+check "a rejection with no move of main is still rolled back and fatal (entry stays approved)"     '[[ $rc != 0 && "$out" == *"push to origin/main failed, so the merge was rolled back locally"* && "$(r3_qinfo)" == s7:approved ]] && r3_main_eq c9'
+$LOCAL_MERGE_QUEUE dequeue s7 --repo c9 >/dev/null 2>&1
+
+# 7. A lane that REACHES the commit's paths (the lane's own reach rule) is gated again.
+cfg_lanes ", \"reach\": { \"when\": \"grep -q ^other/\", \"gate\": [\"$(r3_gate_step c9 a-reach)\"] }"
+r3_branch c9 s8 a/s8.txt=1; r3_queue c9 s8
+c9_gated
+r3_outside c9 other/read-by-a.txt=1 "bot: a file the gated lane reads"
+c9_release
+check "a commit that reaches the gated lane by its reach rule gets that lane's reach gate run again (not the full gate), and lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 && "$(r3_lane_gates c9 a)" == 1 && "$(r3_lane_gates c9 a-reach)" == 1 && "$out" == *"lane a"* ]] && r3_main_eq c9'
+
+# 8. One lane: every path belongs to the one lane, so the one lane's gate runs again.
+r3_config c9 "\"gate\": [\"$(r3_gate_step c9)\"], \"finalCheck\": \"true\""
+r3_branch c9 s9 a/s9.txt=1; r3_queue c9 s9
+c9_gated
+r3_outside c9 other/anything.txt=1 "bot: anything"
+c9_release
+check "in a one-lane repo any commit on origin's main during the gate gets the gate run again, and lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 ]] && r3_main_eq c9'
+
+# 9. Only the lanes the commits touch are gated again: an entry that gated two lanes re-runs the cheap one alone.
+cfg_lanes ''
+r3_branch c9 t1 a/t1.txt=1 b/t1.txt=1; r3_queue c9 t1
+c9_gated
+r3_outside c9 b/moved.txt=1 "bot: touches lane b only"
+c9_release
+check "an upstream commit in lane b re-runs lane b's gate only: a once, b twice"                  '[[ $rc == 0 && "$(r3_lane_gates c9 a)" == 1 && "$(r3_lane_gates c9 b)" == 2 && -f "$ROOT/c9/b/moved.txt" && -f "$ROOT/c9/a/t1.txt" ]] && r3_main_eq c9'
+
+# 10. A lane that takes "*" is touched only by a path no other lane claims.
+r3_config c9 "\"lanes\": { \"a\": { \"paths\": [\"a/\"], \"gate\": [\"$(r3_gate_step c9 a)\"] }, \"rest\": { \"paths\": \"*\", \"gate\": [\"$(r3_gate_step c9 rest)\"] } }"
+r3_branch c9 t2 a/t2.txt=1 misc/t2.txt=1; r3_queue c9 t2
+c9_gated
+r3_outside c9 elsewhere/data.json=1 "bot: a path no named lane claims"
+c9_release
+check "an upstream path no named lane claims falls to the catch-all lane: its gate runs again, the other lane's does not" '[[ $rc == 0 && "$(r3_lane_gates c9 a)" == 1 && "$(r3_lane_gates c9 rest)" == 2 ]] && r3_main_eq c9'
+r3_branch c9 t3 a/t3.txt=1 misc/t3.txt=1; r3_queue c9 t3
+c9_gated
+r3_outside c9 a/other-bot.txt=1 "bot: a path lane a claims"
+c9_release
+check "a path a named lane claims does not touch the catch-all lane: only that lane's gate runs again" '[[ $rc == 0 && "$(r3_lane_gates c9 a)" == 2 && "$(r3_lane_gates c9 rest)" == 1 ]] && r3_main_eq c9'
+
+# 11. A third move stalls: the merge is redone (and the touched lane gated again) at most twice.
+cfg_lanes ''
+cat > "$ROOT/c9-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c9-bot-left" ] && [ -z "${IN_BOT:-}" ]; then
+  n=$(cat "$ROOT/c9-bot-left")
+  if [ "$n" -gt 0 ]; then
+    echo $((n-1)) > "$ROOT/c9-bot-left"
+    d=$(cat "$ROOT/c9-bot-dir" 2>/dev/null || echo other)
+    ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; export IN_BOT=1
+      cd "$ROOT/c9-other" && git pull -q origin main && mkdir -p $d && echo $n > $d/bot-$n.txt && git add -A \
+        && git commit -qm "bot commit $n" && git push -q origin main ) >/dev/null 2>&1
+    echo "REJECTED: main moved" >&2; exit 1
+  fi
+fi
+SH
+r3_branch c9 u1 a/u1.txt=1; r3_queue c9 u1
+echo a > "$ROOT/c9-bot-dir"; echo 5 > "$ROOT/c9-bot-left"; : > "$ROOT/c9-gate.log"
+out=$(gtimeout 300 $LOCAL_MERGE_QUEUE land c9 2>&1); rc=$?
+left=$(cat "$ROOT/c9-bot-left"); rm -f "$ROOT/c9-bot-left" "$ROOT/c9-bot-dir"
+check "a main that moves at every push, in the gated lane: redone twice with the lane gated each time (three gate runs), then the entry stalls" '[[ $rc == 2 && "$left" == 2 && "$out" == *"after 2 redos"* && "$(r3_gates c9)" == 3 && "$(r3_qinfo)" == u1:stalled ]] && r3_main_eq c9'
+
+echo
+echo "── round 3 · batch.keep without a max leaves batching off; a dry run does not say it landed ──"
+# The config can now name the batch worktree's kept dependency directories (batch.keep) without
+# turning batching on for every run: only a "max" does that. --batch turns it on for one run.
+r3_init c10
+r3_config c10 '"batch": {"keep": ["node_modules"]}, "gate": ["true"], "finalCheck": "true"'
+r3_branch c10 k1 k1.txt=1; r3_branch c10 k2 k2.txt=2; r3_queue c10 k1 k2
+out=$($LOCAL_MERGE_QUEUE land c10 --dry-run 2>&1); rc=$?
+check "a batch key with keep and no max is accepted, and batching stays off for a run without --batch" '[[ $rc == 0 && "$out" != *"gated together, one gate run"* ]]'
+out=$($LOCAL_MERGE_QUEUE land c10 --dry-run --batch 2>&1); rc=$?
+check "--batch turns it on for the run, with the default maximum"                         '[[ $rc == 0 && "$out" == *"gated together, one gate run: k1, k2"* ]]'
+check "a dry run says it would land the entries, not that it landed them"                  '[[ "$out" == *"would land"* && "$out" != *"landed"*"branch(es) into"* ]]'
+r3_config c10 '"batch": {"max": 5, "keep": ["node_modules"]}, "gate": ["true"], "finalCheck": "true"'
+out=$($LOCAL_MERGE_QUEUE land c10 --dry-run 2>&1)
+check "a max in the config still turns batching on for every run"                         '[[ "$out" == *"gated together, one gate run: k1, k2"* ]]'
+r3_config c10 '"batch": {"keep": "node_modules"}, "gate": ["true"]'
+out=$($LOCAL_MERGE_QUEUE status c10 2>&1); rc=$?
+check "a keep that is not an array of relative paths is still refused"                      '[[ $rc != 0 && "$out" == *batch.keep* ]]'
+
+echo
+echo "── round 3 · cleanup: what the gate leaves is the gate's; what appears after it is kept, and said truly ──"
+# THE DEFECT (reviewer): cleanup's baseline was taken before the gate, so a gate that leaves any
+# non-ignored file (a temp folder, build output) made every landing end in WORKTREE KEPT, with a
+# cure that failed on exactly that case and no trace in status.
+r3_init c11
+r3_hook c11
+cat > "$ROOT/c11-gate.sh" <<'SH'
+#!/bin/bash
+mkdir -p tmpout ign && echo x > tmpout/junk && echo y > ign/cache
+SH
+r3_config c11 "\"gate\": [\"bash $ROOT/c11-gate.sh\"], \"finalCheck\": \"true\""
+r3_branch c11 leaves leaves.txt=1
+r3_queue c11 leaves
+out=$($LOCAL_MERGE_QUEUE land c11 2>&1); rc=$?
+check "a gate that leaves a non-ignored folder and an ignored one does not keep the worktree: the entry lands and is cleaned up, exit 0" '[[ $rc == 0 && "$out" != *"WORKTREE KEPT"* && ! -d "$(r3_wt c11 leaves)" ]] && ! git -C "$ROOT/c11" rev-parse --verify -q refs/heads/leaves >/dev/null'
+check "…and the ignored files that went with the worktree were named before they went"    '[[ "$out" == *"ignored files go with the worktree: ign/"* ]]'
+
+cat > "$ROOT/c11-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c11-hold-main" ]; then
+  touch "$ROOT/c11-push-started"
+  for i in $(seq 1 150); do [ -e "$ROOT/c11-go" ] && break; sleep 0.2; done
+fi
+SH
+c11_window () {  # branch, then the commands to run in the worktree while the push of main is held
+  local b="$1"; shift
+  rm -f "$ROOT/c11-push-started" "$ROOT/c11-go"; touch "$ROOT/c11-hold-main"
+  $LOCAL_MERGE_QUEUE land c11 > "$ROOT/c11-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c11-push-started"
+  ( cd "$(r3_wt c11 $b)" && eval "$@" )
+  touch "$ROOT/c11-go"; wait $BG; rc=$?; rm -f "$ROOT/c11-hold-main"; out=$(cat "$ROOT/c11-land.out")
+}
+r3_branch c11 late late.txt=1; r3_queue c11 late
+c11_window late 'echo mine > notes.txt; echo mine > later.scratch'
+check "files made after the gate (an untracked one and an ignored one) keep the worktree; the entry still lands" '[[ -f "$ROOT/c11/late.txt" && -f "$(r3_wt c11 late)/notes.txt" && -f "$(r3_wt c11 late)/later.scratch" ]]'
+check "…the message says what was found and that it appeared after the gate ended, not what the gate made" '[[ "$out" == *"WORKTREE KEPT: it holds files that appeared after the gate ended"* && "$out" == *"?? notes.txt"* && "$out" == *"!! later.scratch"* && "$out" != *"tmpout"* ]]'
+check "…the run exits 3, which says a cleanup left something"                              '[[ $rc == 3 ]]'
+st=$($LOCAL_MERGE_QUEUE status c11 2>&1)
+check "status names the kept worktree, its reason and the way to finish it"                '[[ "$st" == *"left a worktree kept"* && "$st" == *"late"* && "$st" == *"Look first: git -C"* && "$st" == *"worktree remove --force"* && "$st" == *"notes.txt"* ]]'
+cure=$(grep -m1 "Then, once you have kept what you want: " <<<"$st" | perl -pe 's/\e\[[0-9;]*m//g; s/.*what you want: //')
+bash -c "$cure" >/dev/null 2>&1; crc=$?
+check "the cure that is printed works on this case: it removes the worktree and the branch"  '[[ $crc == 0 && ! -d "$(r3_wt c11 late)" ]] && ! git -C "$ROOT/c11" rev-parse --verify -q refs/heads/late >/dev/null'
+check "…and status stops naming it once it is gone"                                         '[[ "$($LOCAL_MERGE_QUEUE status c11 2>&1)" != *"left a worktree kept"* ]]'
+# An ignored file alone, made after the gate, keeps the worktree too: it is deleted by --force and no status line shows it.
+r3_branch c11 ignoredlate ignoredlate.txt=1; r3_queue c11 ignoredlate
+c11_window ignoredlate 'echo mine > only.scratch'
+check "an ignored file made after the gate keeps the worktree"                              '[[ "$out" == *"WORKTREE KEPT"* && "$out" == *"!! only.scratch"* && -f "$(r3_wt c11 ignoredlate)/only.scratch" && $rc == 3 ]]'
+
+echo
+echo "── round 3 · local main is re-checked before the merge (review item 2) ───────"
+# THE DEFECT (reviewer, finding 2): the unbatched path synced local main once, gated for minutes,
+# then merged onto whatever local main was. (a) A pull in the primary checkout during the gate moved
+# main to a commit the gate never saw, and the redo rule's lane test was bypassed, since the push was
+# not rejected. (b) A stray commit on local main in the primary checkout was pushed ungated by the merge.
+r3_init c12
+r3_hook c12
+r3_config c12 "\"gate\": [\"$(r3_gate_step c12)\"], \"finalCheck\": \"true\""
+c12_gated () {
+  r3_hold c12; : > "$ROOT/c12-gate.log"
+  $LOCAL_MERGE_QUEUE land c12 > "$ROOT/c12-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c12-gate-started"
+}
+c12_release () { touch "$ROOT/c12-release"; wait $BG; rc=$?; out=$(cat "$ROOT/c12-land.out"); r3_unhold c12; }
+# (a) a pulled commit
+r3_branch c12 pulled pulled.txt=1; r3_queue c12 pulled
+c12_gated
+r3_outside c12 a/changed-meanwhile.txt=1 "pushed to origin during the gate"
+git -C "$ROOT/c12" pull -q --ff-only origin main
+theirs=$(git -C "$ROOT/c12-origin.git" rev-parse main)
+c12_release
+check "a pull in the primary checkout during the gate stalls the entry before the merge"      '[[ $rc == 2 && "$out" == *"local main moved during the gate"* && "$(r3_qinfo)" == pulled:stalled ]]'
+check "…nothing was merged or pushed: origin's main is still the pulled commit"              '[[ "$(git -C "$ROOT/c12-origin.git" rev-parse main)" == "$theirs" && ! -e "$ROOT/c12/pulled.txt" ]]'
+: > "$ROOT/c12-gate.log"
+$LOCAL_MERGE_QUEUE resume c12 >/dev/null 2>&1; rc=$?
+check "resume rebases it onto the current main, gates it again, and lands it"                '[[ $rc == 0 && "$(r3_gates c12)" == 1 && -f "$ROOT/c12/pulled.txt" && -f "$ROOT/c12/a/changed-meanwhile.txt" ]] && r3_main_eq c12'
+# (b) a stray local commit
+r3_branch c12 stray stray-entry.txt=1; r3_queue c12 stray
+c12_gated
+( cd "$ROOT/c12" && echo oops > stray.txt && git add stray.txt && git commit -qm "a stray commit in the primary checkout" )
+origin_before=$(git -C "$ROOT/c12-origin.git" rev-parse main)
+c12_release
+check "a stray commit on local main during the gate stalls the entry, and is not pushed ungated" '[[ $rc == 2 && "$out" == *"local main moved during the gate"* && "$(git -C "$ROOT/c12-origin.git" rev-parse main)" == "$origin_before" ]]'
+out=$($LOCAL_MERGE_QUEUE resume c12 2>&1); rc=$?
+check "resume then refuses, because main is ahead of origin, naming the stray commit"       '[[ $rc != 0 && "$out" == *"a stray commit in the primary checkout"* ]]'
+git -C "$ROOT/c12" reset -q --hard origin/main
+$LOCAL_MERGE_QUEUE resume c12 >/dev/null 2>&1; rc=$?
+check "…and once the stray commit is moved away it lands"                                    '[[ $rc == 0 && -f "$ROOT/c12/stray-entry.txt" && ! -e "$ROOT/c12/stray.txt" ]]'
+
+echo
+echo "── round 3 · a gate that modifies tracked files: the stall names the paths and the key; gateModifies exempts them ──"
+# A gate (or a generator it runs) may rewrite a tracked file, a lockfile for instance. The commit
+# binding would then stall every entry for ever, so a lane can name the paths its gate may modify.
+r3_init c13
+cat > "$ROOT/c13-gate.sh" <<'SH'
+#!/bin/bash
+echo "rewritten by the gate" >> a/f.txt
+SH
+r3_config c13 "\"gate\": [\"bash $ROOT/c13-gate.sh\"], \"finalCheck\": \"true\""
+r3_branch c13 rewrites rewrites.txt=1; r3_queue c13 rewrites
+out=$($LOCAL_MERGE_QUEUE land c13 2>&1); rc=$?
+check "a gate that modifies a tracked file stalls the entry, listing the changed path"       '[[ $rc == 2 && "$out" == *"changed during the gate"* && "$out" == *"M a/f.txt"* ]]'
+check "…and the message names the key that exempts it"                                         '[[ "$out" == *gateModifies* ]] && grep -q gateModifies "$LOCAL_MERGE_QUEUE_STATE/reports/c13-rewrites.md"'
+$LOCAL_MERGE_QUEUE dequeue rewrites --repo c13 >/dev/null 2>&1
+r3_config c13 "\"gate\": [\"bash $ROOT/c13-gate.sh\"], \"gateModifies\": [\"a/f.txt\"], \"finalCheck\": \"true\""
+git -C "$(r3_wt c13 rewrites)" checkout -q -- a/f.txt
+r3_queue c13 rewrites
+out=$($LOCAL_MERGE_QUEUE land c13 2>&1); rc=$?
+check "with the path named in gateModifies the entry lands, and the worktree is cleaned up"  '[[ $rc == 0 && -f "$ROOT/c13/rewrites.txt" && ! -d "$(r3_wt c13 rewrites)" ]]'
+check "…the gate's rewrite is not in what landed (only the gated commit merges)"              '[[ "$(git -C "$ROOT/c13" show main:a/f.txt)" == a ]]'
+# A prefix exempts what is under it, and nothing else.
+cat > "$ROOT/c13-gate.sh" <<'SH'
+#!/bin/bash
+echo "rewritten by the gate" >> a/f.txt
+echo "rewritten by the gate" >> b/f.txt
+SH
+r3_config c13 "\"gate\": [\"bash $ROOT/c13-gate.sh\"], \"gateModifies\": [\"a/\"], \"finalCheck\": \"true\""
+r3_branch c13 partial partial.txt=1; r3_queue c13 partial
+out=$($LOCAL_MERGE_QUEUE land c13 2>&1); rc=$?
+check "a path outside the named prefixes still stalls the entry, and only it is listed"       '[[ $rc == 2 && "$out" == *"M b/f.txt"* && "$out" != *"M a/f.txt"* ]]'
+$LOCAL_MERGE_QUEUE dequeue partial --repo c13 >/dev/null 2>&1
+r3_config c13 '"gate": ["true"], "gateModifies": "a/f.txt"'
+out=$($LOCAL_MERGE_QUEUE status c13 2>&1); rc=$?
+check "a gateModifies that is not an array of relative paths is refused"                       '[[ $rc != 0 && "$out" == *gateModifies* ]]'
+
+echo
+echo "── round 3 · each guard of the commit binding is pinned by its own test (review item 4) ──"
+# The re-check removed each of these in turn and nothing failed, because they are redundant in
+# pairs: the merge names the recorded commit AND the check before it refuses a moved branch, and the
+# publish likewise. A test seam (LOCAL_MERGE_QUEUE_TEST_HOLD) stops the run in each window between a
+# check and the act it guards, so a commit made in the worktree there tells which guard held.
+r3_init c14
+r3_hook c14
+r3_config c14 "\"gate\": [\"$(r3_gate_step c14)\"], \"finalCheck\": \"true\""
+n14=0
+c14_hold () {  # point: start a land that stops at <point>; every other point passes at once
+  local p
+  rm -f "$ROOT"/c14-hold.*
+  for p in before-first-check before-publish before-second-check before-merge; do [[ $p == "$1" ]] || touch "$ROOT/c14-hold.$p.go"; done
+  : > "$ROOT/c14-refs.log"
+  LOCAL_MERGE_QUEUE_TEST_HOLD="$ROOT/c14-hold" $LOCAL_MERGE_QUEUE land c14 > "$ROOT/c14-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c14-hold.$1"
+}
+c14_go () { touch "$ROOT/c14-hold.$1.go"; wait $BG; rc=$?; out=$(cat "$ROOT/c14-land.out"); }
+c14_entry () {  # branch: an entry that needs a rebase (main moves after it is cut), approved
+  r3_branch c14 "$1" "$1.txt=gated"
+  n14=$((n14 + 1)); r3_outside c14 "other/moved-$n14.txt=1" "main moves under $1"
+  r3_queue c14 "$1"
+}
+c14_ungated () { ( cd "$(r3_wt c14 "$1")" && echo ungated > sneaky.txt && git add -A && git commit -qm "made in the worktree, never gated" ); }
+
+# 1. The check before the publish: nothing is published for a branch that moved.
+c14_entry g1
+c14_hold before-first-check
+c14_ungated g1
+c14_go before-first-check
+check "the check before the publish stalls an entry whose branch moved after the gate, before anything is pushed for it" '[[ $rc == 2 && "$out" == *"changed during the gate"* ]] && ! grep -q "^refs/heads/g1 " "$ROOT/c14-refs.log"'
+$LOCAL_MERGE_QUEUE dequeue g1 --repo c14 >/dev/null 2>&1
+
+# 2. The publish names the recorded commit, not the branch: the remote branch never holds the ungated commit.
+c14_entry g2
+c14_hold before-publish
+gated=$(git -C "$(r3_wt c14 g2)" rev-parse HEAD)
+c14_ungated g2
+c14_go before-publish
+check "the publish pushes the gated commit, never the commit made in the worktree meanwhile (the entry then stalls)" '[[ $rc == 2 && "$out" == *"changed during the gate"* ]] && ! grep "^refs/heads/g2 " "$ROOT/c14-refs.log" | grep -qv "^refs/heads/g2 $gated"'
+check "…and the remote branch holds the gated commit"                                     '[[ "$(git -C "$ROOT/c14-origin.git" rev-parse refs/heads/g2)" == "$gated" ]]'
+$LOCAL_MERGE_QUEUE dequeue g2 --repo c14 >/dev/null 2>&1
+
+# 3. The check before the merge: a branch that moved after the publish does not land.
+c14_entry g3
+c14_hold before-second-check
+c14_ungated g3
+c14_go before-second-check
+check "the check before the merge stalls an entry whose branch moved after the publish: nothing lands" '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c14/g3.txt" && ! -e "$ROOT/c14/sneaky.txt" ]]'
+$LOCAL_MERGE_QUEUE dequeue g3 --repo c14 >/dev/null 2>&1
+
+# 4. The merge names the recorded commit: a branch that moves between the last check and the merge still lands only the gated commit.
+c14_entry g4
+c14_hold before-merge
+gated=$(git -C "$(r3_wt c14 g4)" rev-parse HEAD)
+c14_ungated g4
+c14_go before-merge
+check "a commit made after the last check does not land: the merge's second parent is the gated commit" '[[ "$(git -C "$ROOT/c14" rev-parse main^2)" == "$gated" && -f "$ROOT/c14/g4.txt" && ! -e "$ROOT/c14/sneaky.txt" ]]'
+check "…and the worktree, whose HEAD is not the landed commit, is kept (exit 3)"           '[[ $rc == 3 && -f "$(r3_wt c14 g4)/sneaky.txt" && "$out" == *"WORKTREE KEPT"* ]]'
+git -C "$ROOT/c14" worktree remove --force "$(r3_wt c14 g4)"; git -C "$ROOT/c14" branch -q -D g4
+
+# 5. The pair (reviewer): a hook that commits in the worktree while the publish push is in flight.
+cat > "$ROOT/c14-hook.sh" <<'SH'
+if [ "$ref" = "refs/heads/g5" ] && [ -e "$ROOT/c14-commit-on-push" ]; then
+  rm -f "$ROOT/c14-commit-on-push"
+  ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    cd "$ROOT/c14-g5" && echo ungated > sneaky.txt && git add -A && git -c user.email=t@t.t -c user.name=T commit -qm "committed during the publish push" ) >/dev/null 2>&1
+fi
+SH
+c14_entry g5
+touch "$ROOT/c14-commit-on-push"
+out=$($LOCAL_MERGE_QUEUE land c14 2>&1); rc=$?
+check "a commit made in the worktree while the publish push is in flight does not land"   '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c14/sneaky.txt" && ! -e "$ROOT/c14/g5.txt" ]] && r3_main_eq c14'
+
+echo
+echo "── round 3 · review item 7: the batch's reset --keep, and the redeploy push fetches first ──"
+# 1. `git reset --keep` refuses where `--hard` would overwrite: a file made in an entry's worktree in
+# the window between the guard and the branch move, named like a file the published tip brings.
+r3_init c15
+r3_hook c15
+r3_config c15 "\"batch\": {\"max\": 5}, \"gate\": [\"$(r3_gate_step c15)\"], \"finalCheck\": \"true\""
+r3_branch c15 k-1 k-1.txt=1; r3_branch c15 k-2 k-2.txt=2; r3_queue c15 k-1 k-2
+rm -f "$ROOT"/c15-hold.*; touch "$ROOT/c15-hold.batch-move-k-1.go"
+LOCAL_MERGE_QUEUE_TEST_HOLD="$ROOT/c15-hold" $LOCAL_MERGE_QUEUE land c15 > "$ROOT/c15-land.out" 2>&1 &
+BG=$!
+r3_wait "$ROOT/c15-hold.batch-move-k-2"
+echo "mine, made after the guard" > "$(r3_wt c15 k-2)/k-1.txt"
+touch "$ROOT/c15-hold.batch-move-k-2.go"; wait $BG; rc=$?; out=$(cat "$ROOT/c15-land.out")
+check "(setup of the test) the batch landed both entries"                                  '[[ "$out" == *"landed in one push: k-1, k-2"* && -f "$ROOT/c15/k-2.txt" ]]'
+check "a file made in the window between the guard and the branch move is not overwritten: the move is refused, not forced" '[[ "$(cat "$(r3_wt c15 k-2)/k-1.txt")" == "mine, made after the guard" && "$out" == *"COULD NOT MOVE k-2"* ]]'
+check "…and the entry's worktree and branch are kept (exit 3)"                               '[[ $rc == 3 && "$out" == *"WORKTREE KEPT"* ]]'
+
+# 2. The redeploy (settle) push fetches before it resets local main.
+r3_init c15r
+r3_hook c15r
+r3_config c15r "\"deploy\": {\"skipMarker\": \"[skip-deploy]\"}, \"gate\": [\"$(r3_gate_step c15r)\"], \"finalCheck\": \"true\""
+r3_branch c15r d1 d1.txt=1; r3_branch c15r d2 d2.txt=2; r3_queue c15r d1 d2
+touch "$ROOT/c15r-fail-after-first"
+$LOCAL_MERGE_QUEUE land c15r >/dev/null 2>&1; rc=$?
+rm -f "$ROOT/c15r-fail-after-first"
+check "(setup of the test) d1 landed marked and d2 stalled, so main sits on a build the host was told to skip" '[[ $rc == 2 && -f "$ROOT/c15r/d1.txt" && "$(git -C "$ROOT/c15r" log -1 --format=%B main)" == *"[skip-deploy]"* ]]'
+$LOCAL_MERGE_QUEUE dequeue d2 --repo c15r >/dev/null 2>&1
+cat > "$ROOT/c15r-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c15r-bot" ] && [ -z "${IN_BOT:-}" ]; then
+  rm -f "$ROOT/c15r-bot"
+  ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; export IN_BOT=1
+    cd "$ROOT/c15r-other" && git pull -q origin main && echo x > bot.txt && git add -A && git commit -qm "bot" && git push -q origin main ) >/dev/null 2>&1
+  echo "REJECTED: main moved" >&2; exit 1
+fi
+SH
+touch "$ROOT/c15r-bot"
+out=$($LOCAL_MERGE_QUEUE land c15r 2>&1)
+check "a redeploy push rejected because origin moved leaves local main on origin's new tip, not on a stale one" '[[ "$out" == *"THE REDEPLOY PUSH FAILED"* ]] && r3_main_eq c15r'
+# ROUND3-END
+
 echo
 echo "════════════════════════════════════════════════════════════════"
 echo "  passed $PASS   failed $FAIL"
-echo "  sandbox left at $ROOT"
+# The sandbox is removed by its exact path when everything passed (it is a directory this script
+# created with mktemp, and nothing else); after a failure it is left for inspection.
+if [[ $FAIL == 0 && -n "$ROOT" && "$(basename "$ROOT")" == local-merge-queue-test.* && -d "$ROOT" ]]; then
+  cd /; rm -rf -- "$ROOT"; echo "  sandbox removed"
+else
+  echo "  sandbox left at $ROOT"
+fi
 [[ $FAIL == 0 ]]
