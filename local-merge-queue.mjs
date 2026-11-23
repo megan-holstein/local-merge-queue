@@ -2591,6 +2591,11 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
       console.log(dim('  fetching…'))
       const drift = syncMainWithOrigin(repo)
       if (drift) die(drift)
+      // THE TRUNK THE ENTRY IS BUILT ON IS RECORDED HERE: local `main` as the sync left it. The
+      // gate takes minutes, and a pull or a stray commit in the primary checkout during it would
+      // move `main` under the rebase the gate ran on; the merge (and each redo) stalls the entry
+      // if local `main` is no longer this commit.
+      let trunk = git(['rev-parse', repo.mainBranch], repo.checkout)
 
       // A branch already contained in main needs cleanup, not a merge. This is
       // where the roster's "merged; delete the worktree and this row" backlog
@@ -2872,6 +2877,11 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         let b = bound()
         if (b === 'end') return { landed, stalledOn: entry.branch }
         if (b === 'next') continue
+        const trunkMoved = () => {
+          const now = git(['rev-parse', repo.mainBranch], repo.checkout)
+          return now === trunk ? null
+            : `local ${repo.mainBranch} moved during the gate: it was ${trunk.slice(0, 9)} when the entry started and is ${now.slice(0, 9)} now (a pull, or a commit made in the primary checkout)`
+        }
 
         // 3b. PUBLISH THE REBASED TIP BEFORE THE MERGE. Not optional bookkeeping:
         //     the pull request is the roster now, and this is the one step that
@@ -2925,9 +2935,23 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         b = bound()
         if (b === 'end') return { landed, stalledOn: entry.branch }
         if (b === 'next') continue
+        // THE TRUNK IS RE-CHECKED BEFORE THE MERGE: the merge lands on local `main`, and a `main`
+        // that is not the commit the gate's rebase was built on means the gate did not see the
+        // trunk that would land (a pulled commit), or that a stray local commit would be pushed
+        // ungated.
+        const moved0 = trunkMoved()
+        if (moved0) {
+          const s = stallAfterGate(entry, `${moved0}, so the gate did not see the trunk this would land on`, 'local main moved during the gate',
+            `${moved0}.\n\nThe gate ran on ${binding.sha}, rebased onto ${trunk}. Nothing was published to ${repo.mainBranch} or merged; local ${repo.mainBranch} was left as it is.`,
+            ['# nothing to fix in the worktree. If the primary checkout holds a stray commit, move it elsewhere first;',
+             '# resume then rebases the branch onto the current main and gates it again'],
+            `${entry.branch} — ${moved0}`)
+          if (s === 'end') return { landed, stalledOn: entry.branch }
+          continue
+        }
         const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${markers.map(m => ` ${m}`).join('')}`
         // THE GATED COMMIT IS WHAT MERGES, not whatever the branch ref holds now.
-        let base = git(['rev-parse', repo.mainBranch], repo.checkout)    // what the gate's merge was built on
+        let base = trunk                                                  // what the gate's merge was built on
         const mg = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
 
@@ -2953,6 +2977,9 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           redos++
           console.log(dim(`  origin/${repo.mainBranch} moved during the gate: ${mv.commits.length} new commit(s), none touching what the gate covered (${mv.commits.map(c => `${c.sha} ${c.subject}`).join('; ') || 'none'}) — redoing the merge on it without a new gate (redo ${redos} of 2)`))
           base = mv.newTip
+          trunk = mv.newTip                   // local main was just reset to origin's
+          const movedAgain = trunkMoved()
+          if (movedAgain) { movedStall = { mv, blocker: movedAgain }; break }
           const again = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
           if (!again.ok) {
             gitTry(['merge', '--abort'], repo.checkout)

@@ -2695,6 +2695,47 @@ check "…and status stops naming it once it is gone"                           
 r3_branch c11 ignoredlate ignoredlate.txt=1; r3_queue c11 ignoredlate
 c11_window ignoredlate 'echo mine > only.scratch'
 check "an ignored file made after the gate keeps the worktree"                              '[[ "$out" == *"WORKTREE KEPT"* && "$out" == *"!! only.scratch"* && -f "$(r3_wt c11 ignoredlate)/only.scratch" && $rc == 3 ]]'
+
+echo
+echo "── round 3 · local main is re-checked before the merge (review item 2) ───────"
+# THE DEFECT (reviewer, finding 2): the unbatched path synced local main once, gated for minutes,
+# then merged onto whatever local main was. (a) A pull in the primary checkout during the gate moved
+# main to a commit the gate never saw, and the redo rule's lane test was bypassed, since the push was
+# not rejected. (b) A stray commit on local main in the primary checkout was pushed ungated by the merge.
+r3_init c12
+r3_hook c12
+r3_config c12 "\"gate\": [\"$(r3_gate_step c12)\"], \"finalCheck\": \"true\""
+c12_gated () {
+  r3_hold c12; : > "$ROOT/c12-gate.log"
+  $LOCAL_MERGE_QUEUE land c12 > "$ROOT/c12-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c12-gate-started"
+}
+c12_release () { touch "$ROOT/c12-release"; wait $BG; rc=$?; out=$(cat "$ROOT/c12-land.out"); r3_unhold c12; }
+# (a) a pulled commit
+r3_branch c12 pulled pulled.txt=1; r3_queue c12 pulled
+c12_gated
+r3_outside c12 a/changed-meanwhile.txt=1 "pushed to origin during the gate"
+git -C "$ROOT/c12" pull -q --ff-only origin main
+theirs=$(git -C "$ROOT/c12-origin.git" rev-parse main)
+c12_release
+check "a pull in the primary checkout during the gate stalls the entry before the merge"      '[[ $rc == 2 && "$out" == *"local main moved during the gate"* && "$(r3_qinfo)" == pulled:stalled ]]'
+check "…nothing was merged or pushed: origin's main is still the pulled commit"              '[[ "$(git -C "$ROOT/c12-origin.git" rev-parse main)" == "$theirs" && ! -e "$ROOT/c12/pulled.txt" ]]'
+: > "$ROOT/c12-gate.log"
+$LOCAL_MERGE_QUEUE resume c12 >/dev/null 2>&1; rc=$?
+check "resume rebases it onto the current main, gates it again, and lands it"                '[[ $rc == 0 && "$(r3_gates c12)" == 1 && -f "$ROOT/c12/pulled.txt" && -f "$ROOT/c12/a/changed-meanwhile.txt" ]] && r3_main_eq c12'
+# (b) a stray local commit
+r3_branch c12 stray stray-entry.txt=1; r3_queue c12 stray
+c12_gated
+( cd "$ROOT/c12" && echo oops > stray.txt && git add stray.txt && git commit -qm "a stray commit in the primary checkout" )
+origin_before=$(git -C "$ROOT/c12-origin.git" rev-parse main)
+c12_release
+check "a stray commit on local main during the gate stalls the entry, and is not pushed ungated" '[[ $rc == 2 && "$out" == *"local main moved during the gate"* && "$(git -C "$ROOT/c12-origin.git" rev-parse main)" == "$origin_before" ]]'
+out=$($LOCAL_MERGE_QUEUE resume c12 2>&1); rc=$?
+check "resume then refuses, because main is ahead of origin, naming the stray commit"       '[[ $rc != 0 && "$out" == *"a stray commit in the primary checkout"* ]]'
+git -C "$ROOT/c12" reset -q --hard origin/main
+$LOCAL_MERGE_QUEUE resume c12 >/dev/null 2>&1; rc=$?
+check "…and once the stray commit is moved away it lands"                                    '[[ $rc == 0 && -f "$ROOT/c12/stray-entry.txt" && ! -e "$ROOT/c12/stray.txt" ]]'
 # ROUND3-END
 
 echo
