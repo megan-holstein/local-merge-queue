@@ -307,7 +307,7 @@ function batchFor (repo, args) {
 // Everything after this function reads `repo.lanes` and never the repo-level
 // keys, which is what makes a repo without `lanes` behave exactly as it did
 // before lanes existed.
-const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'finalCheck', 'protectedPaths', 'deploy', 'reach']
+const LANE_KEYS = ['setupWhen', 'setup', 'gate', 'gateEnv', 'gateModifies', 'finalCheck', 'protectedPaths', 'deploy', 'reach']
 
 function loadLanes (key, repo) {
   if (repo.lanes === undefined) {
@@ -315,6 +315,7 @@ function loadLanes (key, repo) {
     for (const k of LANE_KEYS) if (repo[k] !== undefined) lane[k] = repo[k]
     for (const k of LANE_KEYS) delete repo[k]
     repo.shared = []
+    checkGateModifies(key, key, lane)
     return { [key]: finishLane(lane) }
   }
   if (!repo.lanes || typeof repo.lanes !== 'object' || Array.isArray(repo.lanes) || !Object.keys(repo.lanes).length) {
@@ -342,6 +343,7 @@ function loadLanes (key, repo) {
     }
     lanes[name] = finishLane({ ...lane })
     checkReach(key, name, lanes[name])
+    checkGateModifies(key, name, lanes[name])
   }
   return lanes
 }
@@ -360,6 +362,17 @@ function checkReach (key, name, lane) {
   }
   if (r.gate !== undefined && !(Array.isArray(r.gate) && r.gate.every(x => typeof x === 'string'))) {
     die(`repo "${key}": lane "${name}": reach.gate must be an array of commands`)
+  }
+}
+
+// `gateModifies`: path prefixes (relative to the repository root) a gate step of the lane may
+// change in the entry's worktree, such as a lockfile an install rewrites. Empty by default. The
+// commit binding does not count a tracked change under one of them as a change during the gate.
+function checkGateModifies (key, name, lane) {
+  const v = lane.gateModifies
+  if (v === undefined) return
+  if (!Array.isArray(v) || !v.every(x => typeof x === 'string' && x && !path.isAbsolute(x) && !x.split('/').includes('..'))) {
+    die(`repo "${key}": lane "${name}": gateModifies must be an array of relative path prefixes inside the repository, with no ".."`)
   }
 }
 
@@ -1069,8 +1082,9 @@ function preflight (repo) {
  */
 // `ignored` adds the ignored files and directories (`!! path`), which the binding does not
 // care about and cleanup does (`git worktree remove --force` deletes them).
+// (Not through `gitTry`, which trims its output: the first status line begins with a space.)
 const statusLines = (wt, { ignored = false } = {}) =>
-  gitTry(['status', '--porcelain', ...(ignored ? ['--ignored=traditional'] : [])], wt).out.split('\n').filter(Boolean)
+  (spawnSync('git', ['status', '--porcelain', ...(ignored ? ['--ignored=traditional'] : [])], { cwd: wt, encoding: 'utf8' }).stdout || '').split('\n').filter(Boolean)
 const trackedOnly = lines => lines.filter(l => !l.startsWith('??') && !l.startsWith('!!'))
 
 function recordBinding (repo, entry, wt) {
@@ -1080,18 +1094,26 @@ function recordBinding (repo, entry, wt) {
   return { sha: head.out, status: statusLines(wt) }
 }
 
-// Why the gate no longer vouches for what would land, or null.
-function bindingBroken (repo, entry, wt, rec) {
+// A porcelain status line's path (both sides of a rename).
+const statusPaths = l => l.slice(3).split(' -> ')
+
+// Why the gate no longer vouches for what would land, or null. A tracked change under a
+// `gateModifies` prefix of one of the lanes the entry gated is the gate's own doing.
+function bindingBroken (repo, entry, wt, rec, gatedLanes = []) {
+  const allowed = gatedLanes.flatMap(n => repo.lanes[n]?.gateModifies || [])
+  const exempt = l => allowed.length > 0 && statusPaths(l).every(p => allowed.some(a => p === a || p.startsWith(a)))
   const short = s => s.slice(0, 9)
   const ref = gitTry(['rev-parse', '--verify', '-q', `refs/heads/${entry.branch}`], repo.checkout)
   if (!ref.ok) return `the branch ${entry.branch} is gone`
   if (ref.out !== rec.sha) return `${entry.branch} moved from ${short(rec.sha)}, the commit the gate ran on, to ${short(ref.out)}`
   const head = gitTry(['rev-parse', 'HEAD'], wt)
   if (!head.ok || head.out !== rec.sha) return `the worktree's HEAD moved from ${short(rec.sha)}, the commit the gate ran on, to ${head.ok ? short(head.out) : '(unreadable)'}`
-  const was = trackedOnly(rec.status)
-  const now = trackedOnly(statusLines(wt))
+  const was = trackedOnly(rec.status).filter(l => !exempt(l))
+  const now = trackedOnly(statusLines(wt)).filter(l => !exempt(l))
   const differ = [...now.filter(l => !was.includes(l)), ...was.filter(l => !now.includes(l))]
-  if (differ.length) return `tracked files in the worktree changed (${differ.map(l => l.trim()).join('; ')})`
+  if (differ.length) {
+    return `tracked files in the worktree changed (${differ.map(l => l.trim()).join('; ')}); if a gate step is meant to change such a file, name its path in the lane's "gateModifies"`
+  }
   return null
 }
 
@@ -2866,7 +2888,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         // 3a'. THE BRANCH AND THE WORKTREE ARE WHAT THE GATE RAN ON, or the gate's
         //      verdict is about something that will not land.
         const bound = () => {
-          const broke = bindingBroken(repo, entry, wt, binding)
+          const broke = bindingBroken(repo, entry, wt, binding, runLanes)
           if (!broke) return 'ok'
           return stallAfterGate(entry, `changed during the gate: ${broke}`, 'the branch or its worktree changed during the gate',
             `${broke}.\n\nThe gate ran on ${binding.sha}, so the gate did not see what would land. Nothing was published or merged.`,
@@ -2971,7 +2993,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)      // the merge is rolled back either way
           let blocker = mv.blocker
           if (!blocker && redos >= 2) blocker = `origin/${repo.mainBranch} moved again after 2 redos of the merge`
-          if (!blocker) { const broke = bindingBroken(repo, entry, wt, binding); if (broke) blocker = `the gate no longer vouches for the entry: ${broke}` }
+          if (!blocker) { const broke = bindingBroken(repo, entry, wt, binding, runLanes); if (broke) blocker = `the gate no longer vouches for the entry: ${broke}` }
           if (!blocker && withdrawn(entry)) { gone = true; break }
           if (blocker) { movedStall = { mv, blocker }; break }
           redos++

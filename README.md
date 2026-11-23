@@ -418,6 +418,8 @@ and minutes added to a gate are paid on every single landing.
 
 **The merge is bound to the commit the gate ran on.** After the setup, the run records the branch's commit and the worktree's status. After the gate, and again right before the merge, it checks both: an entry whose branch moved, whose worktree's HEAD moved, or whose tracked files differ from the record (an edit, a staged change, a deletion) stalls with `changed during the gate: …` and a report, and nothing is published or merged. The publish and the merge name the recorded commit and never the branch ref, so a commit made in the worktree while the gate ran cannot land ungated. An untracked file is not a change to what lands, since only commits land; cleanup is what keeps such a file safe (see [Cleanup](#cleanup-and-what-happens-when-it-fails)). `resume` gates the entry again.
 
+**A gate that modifies tracked files** (an install that rewrites a lockfile, a generator that rewrites a checked-in file) would stall every entry for ever, since its change looks like a change during the gate. A lane names the paths its gate may modify with `gateModifies`, an array of path prefixes relative to the repository root, empty by default: a tracked change under one of them, in a lane the entry gated, is the gate's own and is not counted. The `changed during the gate` stall lists the changed paths and names the key. The gate's rewrite is never part of what lands, since only the gated commit merges.
+
 The **final check** runs once, in the primary checkout, after the whole batch has landed, and under the landing lock, so a second `land` cannot fast-forward that checkout beneath it.
 It reports rather than gates, because each entry already passed the gate on its own
 content. A repo whose full test sweep takes minutes puts the sweep in the gate, where a red
@@ -530,7 +532,7 @@ A repo declares lanes in its config entry. `repos.example.json` has a worked mon
 ```
 
 - `paths` is an array of path prefixes, or the string `"*"` for the lane that takes every path no other lane claims. At most one lane may be `"*"`; a repo without one is valid, and then `enqueue` and `land` refuse an entry that changes an unclaimed path, naming the path.
-- A lane may carry `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` and `deploy`, with the meanings those keys have at repo level. The deploy marker is per lane; see [Lanes and the deploy marker](#lanes-and-the-deploy-marker).
+- A lane may carry `setupWhen`, `setup`, `gate`, `gateEnv`, `gateModifies`, `finalCheck`, `protectedPaths` and `deploy`, with the meanings those keys have at repo level. The deploy marker is per lane; see [Lanes and the deploy marker](#lanes-and-the-deploy-marker).
 - `shared` is a repo-level array of path prefixes that count as belonging to every lane.
 - `checkout`, `mainBranch` and `githubRepo` stay at repo level.
 - When a repo declares `lanes`, a repo-level `setupWhen`, `setup`, `gate`, `gateEnv`, `finalCheck`, `protectedPaths` or `deploy` is a config error. `loadConfig` names the key and exits, so there is one answer to which gate ran.

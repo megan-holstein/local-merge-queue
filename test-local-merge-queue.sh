@@ -2736,6 +2736,42 @@ check "resume then refuses, because main is ahead of origin, naming the stray co
 git -C "$ROOT/c12" reset -q --hard origin/main
 $LOCAL_MERGE_QUEUE resume c12 >/dev/null 2>&1; rc=$?
 check "…and once the stray commit is moved away it lands"                                    '[[ $rc == 0 && -f "$ROOT/c12/stray-entry.txt" && ! -e "$ROOT/c12/stray.txt" ]]'
+
+echo
+echo "── round 3 · a gate that modifies tracked files: the stall names the paths and the key; gateModifies exempts them ──"
+# A gate (or a generator it runs) may rewrite a tracked file, a lockfile for instance. The commit
+# binding would then stall every entry for ever, so a lane can name the paths its gate may modify.
+r3_init c13
+cat > "$ROOT/c13-gate.sh" <<'SH'
+#!/bin/bash
+echo "rewritten by the gate" >> a/f.txt
+SH
+r3_config c13 "\"gate\": [\"bash $ROOT/c13-gate.sh\"], \"finalCheck\": \"true\""
+r3_branch c13 rewrites rewrites.txt=1; r3_queue c13 rewrites
+out=$($LOCAL_MERGE_QUEUE land c13 2>&1); rc=$?
+check "a gate that modifies a tracked file stalls the entry, listing the changed path"       '[[ $rc == 2 && "$out" == *"changed during the gate"* && "$out" == *"M a/f.txt"* ]]'
+check "…and the message names the key that exempts it"                                         '[[ "$out" == *gateModifies* ]] && grep -q gateModifies "$LOCAL_MERGE_QUEUE_STATE/reports/c13-rewrites.md"'
+$LOCAL_MERGE_QUEUE dequeue rewrites --repo c13 >/dev/null 2>&1
+r3_config c13 "\"gate\": [\"bash $ROOT/c13-gate.sh\"], \"gateModifies\": [\"a/f.txt\"], \"finalCheck\": \"true\""
+git -C "$(r3_wt c13 rewrites)" checkout -q -- a/f.txt
+r3_queue c13 rewrites
+out=$($LOCAL_MERGE_QUEUE land c13 2>&1); rc=$?
+check "with the path named in gateModifies the entry lands, and the worktree is cleaned up"  '[[ $rc == 0 && -f "$ROOT/c13/rewrites.txt" && ! -d "$(r3_wt c13 rewrites)" ]]'
+check "…the gate's rewrite is not in what landed (only the gated commit merges)"              '[[ "$(git -C "$ROOT/c13" show main:a/f.txt)" == a ]]'
+# A prefix exempts what is under it, and nothing else.
+cat > "$ROOT/c13-gate.sh" <<'SH'
+#!/bin/bash
+echo "rewritten by the gate" >> a/f.txt
+echo "rewritten by the gate" >> b/f.txt
+SH
+r3_config c13 "\"gate\": [\"bash $ROOT/c13-gate.sh\"], \"gateModifies\": [\"a/\"], \"finalCheck\": \"true\""
+r3_branch c13 partial partial.txt=1; r3_queue c13 partial
+out=$($LOCAL_MERGE_QUEUE land c13 2>&1); rc=$?
+check "a path outside the named prefixes still stalls the entry, and only it is listed"       '[[ $rc == 2 && "$out" == *"M b/f.txt"* && "$out" != *"M a/f.txt"* ]]'
+$LOCAL_MERGE_QUEUE dequeue partial --repo c13 >/dev/null 2>&1
+r3_config c13 '"gate": ["true"], "gateModifies": "a/f.txt"'
+out=$($LOCAL_MERGE_QUEUE status c13 2>&1); rc=$?
+check "a gateModifies that is not an array of relative paths is refused"                       '[[ $rc != 0 && "$out" == *gateModifies* ]]'
 # ROUND3-END
 
 echo
