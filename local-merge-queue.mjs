@@ -221,6 +221,16 @@ function rebaseInProgress (wt) {
          fs.existsSync(path.join(g.out, 'rebase-apply'))
 }
 
+// A TEST SEAM, like LOCAL_MERGE_QUEUE_TEST_PAUSE_IN_LOCK: with LOCAL_MERGE_QUEUE_TEST_HOLD=<prefix>
+// the run stops at a named point, writes <prefix>.<point>, and waits (up to 15 s) for
+// <prefix>.<point>.go, so a test can act in the window between two checks. Never set outside tests.
+function testHold (point) {
+  const seam = process.env.LOCAL_MERGE_QUEUE_TEST_HOLD
+  if (!seam) return
+  fs.writeFileSync(`${seam}.${point}`, '')
+  for (let i = 0; i < 300 && !fs.existsSync(`${seam}.${point}.go`); i++) sleepMs(50)
+}
+
 function pidAlive (pid) {
   try { process.kill(pid, 0); return true } catch { return false }
 }
@@ -2896,6 +2906,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
              '# take out or commit what changed (the gate runs again on resume), then resume'],
             `${entry.branch} changed during the gate — ${broke}`)
         }
+        testHold('before-first-check')
         let b = bound()
         if (b === 'end') return { landed, stalledOn: entry.branch }
         if (b === 'next') continue
@@ -2920,6 +2931,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         //     --force-with-lease and not --force: the fetch at step 1 made the
         //     remote-tracking ref current, so the lease refuses exactly when it
         //     should — somebody pushed to the branch after the landing run began.
+        testHold('before-publish')
         const pub = gitTry(['push', '--force-with-lease', 'origin', `${binding.sha}:refs/heads/${entry.branch}`], wt)
         if (pub.ok) {
           console.log(dim(current
@@ -2954,6 +2966,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           if (more && !markers.includes(marker)) markers.push(marker)
         }
         if (withdrawn(entry)) continue
+        testHold('before-second-check')
         b = bound()
         if (b === 'end') return { landed, stalledOn: entry.branch }
         if (b === 'next') continue
@@ -2974,6 +2987,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         const msg = `Merge ${entry.branch}${entry.note ? ` — ${entry.note}` : ''}${markers.map(m => ` ${m}`).join('')}`
         // THE GATED COMMIT IS WHAT MERGES, not whatever the branch ref holds now.
         let base = trunk                                                  // what the gate's merge was built on
+        testHold('before-merge')
         const mg = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
 

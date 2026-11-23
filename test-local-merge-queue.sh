@@ -2772,6 +2772,82 @@ $LOCAL_MERGE_QUEUE dequeue partial --repo c13 >/dev/null 2>&1
 r3_config c13 '"gate": ["true"], "gateModifies": "a/f.txt"'
 out=$($LOCAL_MERGE_QUEUE status c13 2>&1); rc=$?
 check "a gateModifies that is not an array of relative paths is refused"                       '[[ $rc != 0 && "$out" == *gateModifies* ]]'
+
+echo
+echo "── round 3 · each guard of the commit binding is pinned by its own test (review item 4) ──"
+# The re-check removed each of these in turn and nothing failed, because they are redundant in
+# pairs: the merge names the recorded commit AND the check before it refuses a moved branch, and the
+# publish likewise. A test seam (LOCAL_MERGE_QUEUE_TEST_HOLD) stops the run in each window between a
+# check and the act it guards, so a commit made in the worktree there tells which guard held.
+r3_init c14
+r3_hook c14
+r3_config c14 "\"gate\": [\"$(r3_gate_step c14)\"], \"finalCheck\": \"true\""
+n14=0
+c14_hold () {  # point: start a land that stops at <point>; every other point passes at once
+  local p
+  rm -f "$ROOT"/c14-hold.*
+  for p in before-first-check before-publish before-second-check before-merge; do [[ $p == "$1" ]] || touch "$ROOT/c14-hold.$p.go"; done
+  : > "$ROOT/c14-refs.log"
+  LOCAL_MERGE_QUEUE_TEST_HOLD="$ROOT/c14-hold" $LOCAL_MERGE_QUEUE land c14 > "$ROOT/c14-land.out" 2>&1 &
+  BG=$!
+  r3_wait "$ROOT/c14-hold.$1"
+}
+c14_go () { touch "$ROOT/c14-hold.$1.go"; wait $BG; rc=$?; out=$(cat "$ROOT/c14-land.out"); }
+c14_entry () {  # branch: an entry that needs a rebase (main moves after it is cut), approved
+  r3_branch c14 "$1" "$1.txt=gated"
+  n14=$((n14 + 1)); r3_outside c14 "other/moved-$n14.txt=1" "main moves under $1"
+  r3_queue c14 "$1"
+}
+c14_ungated () { ( cd "$(r3_wt c14 "$1")" && echo ungated > sneaky.txt && git add -A && git commit -qm "made in the worktree, never gated" ); }
+
+# 1. The check before the publish: nothing is published for a branch that moved.
+c14_entry g1
+c14_hold before-first-check
+c14_ungated g1
+c14_go before-first-check
+check "the check before the publish stalls an entry whose branch moved after the gate, before anything is pushed for it" '[[ $rc == 2 && "$out" == *"changed during the gate"* ]] && ! grep -q "^refs/heads/g1 " "$ROOT/c14-refs.log"'
+$LOCAL_MERGE_QUEUE dequeue g1 --repo c14 >/dev/null 2>&1
+
+# 2. The publish names the recorded commit, not the branch: the remote branch never holds the ungated commit.
+c14_entry g2
+c14_hold before-publish
+gated=$(git -C "$(r3_wt c14 g2)" rev-parse HEAD)
+c14_ungated g2
+c14_go before-publish
+check "the publish pushes the gated commit, never the commit made in the worktree meanwhile (the entry then stalls)" '[[ $rc == 2 && "$out" == *"changed during the gate"* ]] && ! grep "^refs/heads/g2 " "$ROOT/c14-refs.log" | grep -qv "^refs/heads/g2 $gated"'
+check "…and the remote branch holds the gated commit"                                     '[[ "$(git -C "$ROOT/c14-origin.git" rev-parse refs/heads/g2)" == "$gated" ]]'
+$LOCAL_MERGE_QUEUE dequeue g2 --repo c14 >/dev/null 2>&1
+
+# 3. The check before the merge: a branch that moved after the publish does not land.
+c14_entry g3
+c14_hold before-second-check
+c14_ungated g3
+c14_go before-second-check
+check "the check before the merge stalls an entry whose branch moved after the publish: nothing lands" '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c14/g3.txt" && ! -e "$ROOT/c14/sneaky.txt" ]]'
+$LOCAL_MERGE_QUEUE dequeue g3 --repo c14 >/dev/null 2>&1
+
+# 4. The merge names the recorded commit: a branch that moves between the last check and the merge still lands only the gated commit.
+c14_entry g4
+c14_hold before-merge
+gated=$(git -C "$(r3_wt c14 g4)" rev-parse HEAD)
+c14_ungated g4
+c14_go before-merge
+check "a commit made after the last check does not land: the merge's second parent is the gated commit" '[[ "$(git -C "$ROOT/c14" rev-parse main^2)" == "$gated" && -f "$ROOT/c14/g4.txt" && ! -e "$ROOT/c14/sneaky.txt" ]]'
+check "…and the worktree, whose HEAD is not the landed commit, is kept (exit 3)"           '[[ $rc == 3 && -f "$(r3_wt c14 g4)/sneaky.txt" && "$out" == *"WORKTREE KEPT"* ]]'
+git -C "$ROOT/c14" worktree remove --force "$(r3_wt c14 g4)"; git -C "$ROOT/c14" branch -q -D g4
+
+# 5. The pair (reviewer): a hook that commits in the worktree while the publish push is in flight.
+cat > "$ROOT/c14-hook.sh" <<'SH'
+if [ "$ref" = "refs/heads/g5" ] && [ -e "$ROOT/c14-commit-on-push" ]; then
+  rm -f "$ROOT/c14-commit-on-push"
+  ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    cd "$ROOT/c14-g5" && echo ungated > sneaky.txt && git add -A && git -c user.email=t@t.t -c user.name=T commit -qm "committed during the publish push" ) >/dev/null 2>&1
+fi
+SH
+c14_entry g5
+touch "$ROOT/c14-commit-on-push"
+out=$($LOCAL_MERGE_QUEUE land c14 2>&1); rc=$?
+check "a commit made in the worktree while the publish push is in flight does not land"   '[[ $rc == 2 && "$out" == *"changed during the gate"* && ! -e "$ROOT/c14/sneaky.txt" && ! -e "$ROOT/c14/g5.txt" ]] && r3_main_eq c14'
 # ROUND3-END
 
 echo
