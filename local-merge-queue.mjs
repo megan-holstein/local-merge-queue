@@ -1138,10 +1138,13 @@ function bindingBroken (repo, entry, wt, rec, gatedLanes = []) {
  * On 2026-11-22 a 54-minute gate passed and the push was rejected as a non-fast-forward
  * because a scheduled bot had pushed one commit to origin's `main` during the gate, changing
  * one data file under a folder outside every lane the entry's gate covered. The run rolled the
- * merge back and exited, and the gate had to be paid again. The remedy is conservative: fetch;
- * if every new commit changes only paths that belong to no lane this entry gated, the merge is
- * redone on the new `main` without a new gate (what merges is still the gated commit), at most
- * twice; in every other case the entry stalls and says `main` moved under a passing gate.
+ * merge back and exited, and the gate had to be paid again. The remedy: fetch; redo the merge on
+ * the new `main` (what merges is still the gated commit), at most twice, and run again only the
+ * gates of the lanes the new commits touch, none if they touch none; a rewritten history, a third
+ * move, a merge that does not redo, or a re-run gate that fails stalls the entry, saying `main`
+ * moved under a passing gate. Lanes are independent by the queue's own definition (their own paths,
+ * setup and gate, with `shared` and `reach` declaring the exceptions, both of which are asked), so
+ * the gates of the lanes nothing touched have nothing new to say.
  *
  * A path belongs to a lane by the lanes' own rules (`lanesForPath`; a path no lane claims
  * belongs to none, so it is outside). A lane the entry gated that has a `reach` rule is asked
@@ -1150,8 +1153,9 @@ function bindingBroken (repo, entry, wt, rec, gatedLanes = []) {
  * the net diff of the range, so a change that a later commit reverts still counts.
  *
  * Returns { moved: false } when origin's `main` is where the run left it (the push failed for
- * another reason), else { moved: true, newTip, commits: [{sha, subject, paths, inside}], blocker }
- * where `blocker` says why the merge may not be redone, or null.
+ * another reason), else { moved: true, newTip, commits: [{sha, subject, paths, inside}], touched,
+ * blocker } where `touched` names the gated lanes the commits touch or reach, and `blocker` (set
+ * with `fatal`) says why the merge may not be redone at all (rewritten history), or is null.
  */
 function inspectMovedMain (repo, gatedLanes, wt, base) {
   const main = repo.mainBranch
@@ -1161,7 +1165,7 @@ function inspectMovedMain (repo, gatedLanes, wt, base) {
   if (!fetched.ok || !tip.ok || tip.out === base) return { moved: false }
   const newTip = tip.out
   if (!gitTry(['merge-base', '--is-ancestor', base, newTip], repo.checkout).ok) {
-    return { moved: true, newTip, commits: [], blocker: `origin/${main} was rewritten: it no longer descends from ${short(base)}, the commit the gate ran against` }
+    return { moved: true, newTip, commits: [], touched: [], fatal: true, blocker: `origin/${main} was rewritten: it no longer descends from ${short(base)}, the commit the gate ran against` }
   }
   const shas = gitTry(['rev-list', '--reverse', `${base}..${newTip}`], repo.checkout).out.split('\n').filter(Boolean)
   const commits = shas.map(sha => {
@@ -1184,12 +1188,9 @@ function inspectMovedMain (repo, gatedLanes, wt, base) {
     }
     return { sha: gitTry(['log', '-1', '--format=%h', sha], repo.checkout).out, subject, paths, inside }
   })
-  const bad = commits.filter(c => c.inside.length)
-  const where = i => multiLane(repo) ? `lane ${i.lane}` : 'what the gate covers'
-  const blocker = bad.length
-    ? `${bad.length === 1 ? 'a commit changes' : `${bad.length} commits change`} what the gate covered: ${bad.map(c => `${c.sha} "${c.subject}" ${c.inside.map(i => `${i.how} ${where(i)} (${i.path})`).join(', ')}`).join('; ')}`
-    : null
-  return { moved: true, newTip, commits, blocker }
+  // The lanes the new commits touch (or reach) among those this entry gated, in the entry's order.
+  const touched = gatedLanes.filter(n => commits.some(c => c.inside.some(i => i.lane === n)))
+  return { moved: true, newTip, commits, blocker: null, touched }
 }
 
 // ─── local main must equal origin's before an entry starts ───────────────────
@@ -2999,13 +3000,39 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
         const mg = gitTry(['merge', '--no-ff', '-m', msg, binding.sha], repo.checkout)
         if (!mg.ok) die(`merge failed unexpectedly after a clean rebase: ${mg.err}`)
 
-        // 4a. THE PUSH. If origin rejects it because its `main` moved during the gate, the
-        //     merge is redone on the new `main` without a new gate only when nothing the gate
-        //     covered changed (see `inspectMovedMain`), at most twice; otherwise the entry stalls.
+        // 4a. THE PUSH. If origin rejects it because its `main` moved during the gate, the merge
+        //     is redone on the new `main`, at most twice (see `inspectMovedMain`), and only the
+        //     gates of the lanes the new commits touch are run again, on the merged tree: none
+        //     when they touch no lane the entry gated. Lanes are independent by the queue's own
+        //     definition (their own paths, setup and gate, and `shared` and `reach` declare every
+        //     exception, both of which are asked), so the gate of a lane nothing touched has
+        //     nothing new to say, and a lane a commit touched is gated again, not waved through.
         let push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
         let redos = 0
         let movedStall = null
         let gone = false
+        // Run again the gates of `lanes` on the redone merge `m2`, in the entry's worktree
+        // (detached at `m2` for the run, then back on the branch). Returns a reason it failed, or null.
+        const regate = async (lanes, m2) => {
+          const detach = gitTry(['checkout', '--detach', m2], wt)
+          if (!detach.ok) return `the redone merge could not be checked out in the entry's worktree to be gated: ${detach.err}`
+          let why = null
+          const setup = await ensureWorktreeSetup(repo, wt, lanes)
+          if (!setup.ok) why = `worktree setup ${setup.timedOut ? 'timed out' : 'failed'}${multiLane(repo) ? ` in lane ${setup.lane}` : ''} on the new ${repo.mainBranch}: ${setup.failed}`
+          gate: for (const name of lanes) {
+            if (why) break
+            for (const step of gateStepsFor(repo, entry, name)) {
+              console.log(dim(`  gate${multiLane(repo) ? ` [${name}]` : ''} (${repo.mainBranch} moved): ${step}`))
+              if (!await runGate(step, wt, repo.lanes[name].gateEnv || {}, { timeoutMs: gateTimeoutMs(repo, name) })) {
+                why = `the gate${multiLane(repo) ? ` of lane ${name}` : ''} ${gateTimedOut ? 'timed out' : 'failed'} on the new ${repo.mainBranch}: ${step}`
+                break gate
+              }
+            }
+          }
+          const back = gitTry(['checkout', entry.branch], wt)
+          if (!back.ok) why ||= `the entry's worktree could not be put back on ${entry.branch}: ${back.err}`
+          return why
+        }
         while (!push.ok) {
           const mv = inspectMovedMain(repo, runLanes, wt, base)
           if (!mv.moved) {
@@ -3013,13 +3040,15 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
             die(`push to origin/${repo.mainBranch} failed, so the merge was rolled back locally:\n${push.err}`)
           }
           gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)      // the merge is rolled back either way
-          let blocker = mv.blocker
+          let blocker = mv.fatal ? mv.blocker : null
           if (!blocker && redos >= 2) blocker = `origin/${repo.mainBranch} moved again after 2 redos of the merge`
           if (!blocker) { const broke = bindingBroken(repo, entry, wt, binding, runLanes); if (broke) blocker = `the gate no longer vouches for the entry: ${broke}` }
           if (!blocker && withdrawn(entry)) { gone = true; break }
           if (blocker) { movedStall = { mv, blocker }; break }
           redos++
-          console.log(dim(`  origin/${repo.mainBranch} moved during the gate: ${mv.commits.length} new commit(s), none touching what the gate covered (${mv.commits.map(c => `${c.sha} ${c.subject}`).join('; ') || 'none'}) — redoing the merge on it without a new gate (redo ${redos} of 2)`))
+          console.log(dim(`  origin/${repo.mainBranch} moved during the gate: ${mv.commits.length} new commit(s) (${mv.commits.map(c => `${c.sha} ${c.subject}`).join('; ') || 'none'}) — redoing the merge on it (redo ${redos} of 2); ` +
+            (mv.touched.length ? `they touch ${multiLane(repo) ? lanePhrase(mv.touched) : 'what the gate covers'}, so ${mv.touched.length === 1 && multiLane(repo) ? 'that lane\'s gate runs' : 'those gates run'} again and no other`
+              : 'none touches a lane this entry gated, so no gate runs again')))
           base = mv.newTip
           trunk = mv.newTip                   // local main was just reset to origin's
           const movedAgain = trunkMoved()
@@ -3030,6 +3059,19 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
             gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
             movedStall = { mv, blocker: `the merge could not be redone on the new ${repo.mainBranch}: ${again.err}` }
             break
+          }
+          if (mv.touched.length) {
+            const m2 = git(['rev-parse', repo.mainBranch], repo.checkout)
+            const failed = await regate(mv.touched, m2)
+            const afterwards = failed ? null : bindingBroken(repo, entry, wt, binding, runLanes)
+            const drift = failed || afterwards ? null : (git(['rev-parse', repo.mainBranch], repo.checkout) === m2 ? null : `local ${repo.mainBranch} moved while the lanes were gated again`)
+            if (failed || afterwards || drift) {
+              if (!drift) gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout)
+              movedStall = { mv, blocker: failed || (afterwards ? `the gate no longer vouches for the entry: ${afterwards}` : drift) }
+              break
+            }
+            binding.after = statusLines(wt, { ignored: true })     // what the second gate left is the gate's too
+            if (withdrawn(entry)) { gitTry(['reset', '--hard', `origin/${repo.mainBranch}`], repo.checkout); gone = true; break }
           }
           push = gitTry(['push', 'origin', repo.mainBranch], repo.checkout)
         }
@@ -3042,7 +3084,7 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
           const s = stallAfterGate(entry, reason, 'main moved under a passing gate',
             `origin/${repo.mainBranch} moved while the gate ran, and the push was rejected. The gate passed on ${binding.sha}, built on ${base.slice(0, 9)}.\n\n` +
             `New commits on origin/${repo.mainBranch}:\n${mv.commits.map(c => `  ${c.sha} ${c.subject}\n    ${c.paths.join(', ') || '(no files)'}${c.inside.length ? `\n    ${c.inside.map(i => `${i.how} ${multiLane(repo) ? `lane ${i.lane}` : 'what the gate covers'} (${i.path})`).join('; ')}` : ''}`).join('\n') || '  (history was rewritten)'}\n\n` +
-            `Why the merge was not redone without a new gate: ${blocker}.\n\nLocal ${repo.mainBranch} was reset to origin/${repo.mainBranch}; nothing of this entry reached ${repo.mainBranch}.` +
+            `Why the merge was not redone: ${blocker}.\n\nLocal ${repo.mainBranch} was reset to origin/${repo.mainBranch} (unless it had moved); nothing of this entry reached ${repo.mainBranch}.` +
             (redos ? ` (The merge was redone ${redos} time(s) first.)` : ''),
             ['# nothing to fix in the worktree: resume rebases the branch onto the new main and gates it again'],
             `${entry.branch} — ${reason}`)

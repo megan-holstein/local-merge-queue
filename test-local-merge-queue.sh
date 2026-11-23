@@ -2081,17 +2081,20 @@ r3_main_eq () { [[ "$(git -C "$ROOT/$1" rev-parse main)" == "$(git -C "$ROOT/$1-
 # <repo>-gate-pid) and waits for <repo>-release; it fails while <repo>-fail exists.
 cat > "$ROOT/r3-gate.sh" <<'SH'
 #!/bin/bash
-n="$1"
-echo "gate-run $(basename "$PWD")" >> "$ROOT/$n-gate.log"
+n="$1"; lane="${2:-}"
+echo "gate-run $(basename "$PWD") $lane" >> "$ROOT/$n-gate.log"
 if [ -e "$ROOT/$n-hold" ]; then
   echo $$ > "$ROOT/$n-gate-pid"; touch "$ROOT/$n-gate-started"
   for i in $(seq 1 600); do [ -e "$ROOT/$n-release" ] && break; sleep 0.2; done
 fi
+# <repo>-fail-after-first: every run after the first one fails
+if [ -e "$ROOT/$n-fail-after-first" ] && [ "$(grep -c '^gate-run' "$ROOT/$n-gate.log")" -gt 1 ]; then exit 1; fi
 [ ! -e "$ROOT/$n-fail" ]
 SH
 r3_hold () { rm -f "$ROOT/$1-release" "$ROOT/$1-gate-started" "$ROOT/$1-gate-pid" "$ROOT/$1-fail"; touch "$ROOT/$1-hold"; }
 r3_unhold () { rm -f "$ROOT/$1-hold" "$ROOT/$1-release" "$ROOT/$1-gate-started" "$ROOT/$1-fail"; }
-r3_gate_step () { echo "bash $ROOT/r3-gate.sh $1"; }
+r3_gate_step () { echo "bash $ROOT/r3-gate.sh $1 ${2:-}"; }
+r3_lane_gates () { local n; n=$(grep -c "^gate-run .* $2\$" "$ROOT/$1-gate.log" 2>/dev/null); echo "${n:-0}"; }
 # The origin's pre-receive hook: it logs every ref pushed (<repo>-refs.log) and, when
 # <repo>-hook.sh exists, runs it with the ref and the new value, so a test can act at a chosen push.
 r3_hook () {  # repo
@@ -2525,14 +2528,16 @@ check "a release that finds another process's lock where its own was puts that l
 rm -rf "$LG" "$ROOT/c8b-seam".* "$ROOT/c8b-pause"
 
 echo
-echo "── round 3 · main moved under a passing gate: redo the merge only if nothing gated was touched ──"
+echo "── round 3 · main moved under a passing gate: redo the merge, and gate again only the lanes that moved ──"
 # THE LOSS (2026-11-22): a 54-minute gate passed, and the push of main was rejected as non-fast-forward
 # because a scheduled bot had pushed one commit to origin/main during the gate, changing one data file
 # outside every lane the gate covered. The run rolled the merge back and exited, and the gate had to be
 # paid again. The remedy is conservative: when the push is rejected because origin/main moved, fetch; if
 # every new commit changes only paths that belong to no lane this entry gated (by the lanes' own path
 # rules; a path that matches no lane at all counts as outside), redo the merge on the new main without a
-# new gate, at most twice; in every other case stall the entry, saying main moved and naming the commits.
+# new gate, at most twice. When the commits touch one or more of the entry's gated lanes the merge is
+# redone too, and only the gates of the lanes those commits touch run again (lanes are independent by
+# the queue's own definition); a rewritten history, a third move or a failing gate stalls the entry.
 r3_init c9
 r3_hook c9
 cat > "$ROOT/c9-hook.sh" <<'SH'
@@ -2542,14 +2547,15 @@ if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c9-bot-left" ] && [ -z "${IN_BOT:
   n=$(cat "$ROOT/c9-bot-left")
   if [ "$n" -gt 0 ]; then
     echo $((n-1)) > "$ROOT/c9-bot-left"
+    d=$(cat "$ROOT/c9-bot-dir" 2>/dev/null || echo other)
     ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; export IN_BOT=1
-      cd "$ROOT/c9-other" && git pull -q origin main && mkdir -p other && echo $n > other/bot-$n.txt && git add -A \
+      cd "$ROOT/c9-other" && git pull -q origin main && mkdir -p $d && echo $n > $d/bot-$n.txt && git add -A \
         && git commit -qm "bot commit $n" && git push -q origin main ) >/dev/null 2>&1
     echo "REJECTED: main moved" >&2; exit 1
   fi
 fi
 SH
-cfg_lanes () { r3_config c9 "\"lanes\": { \"a\": { \"paths\": [\"a/\"], \"gate\": [\"$(r3_gate_step c9)\"]$1 }, \"b\": { \"paths\": [\"b/\"], \"gate\": [\"true\"] } }"; }
+cfg_lanes () { r3_config c9 "\"lanes\": { \"a\": { \"paths\": [\"a/\"], \"gate\": [\"$(r3_gate_step c9 a)\"]$1 }, \"b\": { \"paths\": [\"b/\"], \"gate\": [\"$(r3_gate_step c9 b)\"] } }"; }
 cfg_lanes ''
 c9_gated () {  # branch: a land run whose gate is held; the caller acts, then c9_release
   r3_hold c9; : > "$ROOT/c9-gate.log"
@@ -2576,19 +2582,28 @@ r3_outside c9 b/data.json=1 "bot: refresh b"
 c9_release
 check "a commit that touches only a lane this entry did not gate is redone without a new gate"  '[[ $rc == 0 && "$(r3_gates c9)" == 1 && -f "$ROOT/c9/a/s2.txt" && -f "$ROOT/c9/b/data.json" ]] && r3_main_eq c9'
 
-# 3. A commit that touches a gated lane's path must not merge without a gate.
+# 3. A commit that touches a gated lane's path must not merge without a gate: the merge is redone and that lane is gated again.
 r3_branch c9 s3 a/s3.txt=1; r3_queue c9 s3
 c9_gated
 r3_outside c9 a/bot.txt=1 "bot: touches the gated lane"
-botsha=$(git -C "$ROOT/c9-other" log -1 --format=%h)
+bot=$(git -C "$ROOT/c9-other" rev-parse HEAD)
+c9_release
+check "a commit that touches a gated lane's path is not merged without a gate: the lane's gate runs again (two runs in all) and the entry lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 && "$(r3_lane_gates c9 a)" == 2 && -f "$ROOT/c9/a/s3.txt" && -f "$ROOT/c9/a/bot.txt" ]] && r3_main_eq c9'
+check "…the merge was redone on the bot's commit, and says which lane runs again"                  '[[ "$(git -C "$ROOT/c9" rev-parse main^1)" == "$bot" && "$out" == *"redoing the merge"* && "$out" == *"lane a"* && "$out" == *"gate runs again and no other"* ]]'
+check "…the second gate ran on the merged tree, in the entry's worktree, and the worktree is cleaned up" '[[ ! -d "$(r3_wt c9 s3)" && "$(r3_qinfo)" == "" ]]'
+# …and a second gate that fails stalls the entry, with main reset to origin's.
+r3_branch c9 s3b a/s3b.txt=1; r3_queue c9 s3b
+touch "$ROOT/c9-fail-after-first"
+c9_gated
+r3_outside c9 a/bot2.txt=1 "bot: touches the gated lane again"
 before=$(git -C "$ROOT/c9-origin.git" rev-parse main)
 c9_release
-check "a commit that touches a gated lane's path stalls the entry: main moved under a passing gate, naming the commit" '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* && "$out" == *"$botsha"* && "$(r3_qinfo)" == s3:stalled ]]'
-check "…nothing of the entry reached main or origin, and local main equals origin again"           '[[ "$(git -C "$ROOT/c9-origin.git" rev-parse main)" == "$before" && ! -f "$ROOT/c9/a/s3.txt" ]] && r3_main_eq c9'
-check "…and the report says why a redo was not allowed"                                           'grep -q "touches lane a" "$LOCAL_MERGE_QUEUE_STATE/reports/c9-s3.md" && grep -q "bot: touches the gated lane" "$LOCAL_MERGE_QUEUE_STATE/reports/c9-s3.md"'
+rm -f "$ROOT/c9-fail-after-first"
+check "a gate that fails on the moved main stalls the entry, naming the lane and the moved main"    '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* && "$out" == *"failed on the new main"* && "$(r3_qinfo)" == s3b:stalled ]]'
+check "…nothing of the entry reached main or origin, local main equals origin again, and the worktree is back on its branch" '[[ "$(git -C "$ROOT/c9-origin.git" rev-parse main)" == "$before" && ! -f "$ROOT/c9/a/s3b.txt" ]] && r3_main_eq c9 && [[ "$(git -C "$(r3_wt c9 s3b)" rev-parse --abbrev-ref HEAD)" == s3b ]]'
 : > "$ROOT/c9-gate.log"
 $LOCAL_MERGE_QUEUE resume c9 >/dev/null 2>&1; rc=$?
-check "resume rebases it onto the new main, gates it again (the second gate), and lands it"        '[[ $rc == 0 && "$(r3_gates c9)" == 1 && -f "$ROOT/c9/a/s3.txt" && -f "$ROOT/c9/a/bot.txt" ]] && r3_main_eq c9'
+check "resume rebases it onto the new main, gates it, and lands it"                                '[[ $rc == 0 && -f "$ROOT/c9/a/s3b.txt" && -f "$ROOT/c9/a/bot2.txt" ]] && r3_main_eq c9'
 
 # 4. History that was rewritten (not a fast-forward of the commit the run built on) is never redone.
 r3_branch c9 s4 a/s4.txt=1; r3_queue c9 s4
@@ -2624,22 +2639,63 @@ rm -f "$ROOT/c9-reject"
 check "a rejection with no move of main is still rolled back and fatal (entry stays approved)"     '[[ $rc != 0 && "$out" == *"push to origin/main failed, so the merge was rolled back locally"* && "$(r3_qinfo)" == s7:approved ]] && r3_main_eq c9'
 $LOCAL_MERGE_QUEUE dequeue s7 --repo c9 >/dev/null 2>&1
 
-# 7. A lane that REACHES the commit's paths (the lane's own reach rule) counts the commit as inside.
+# 7. A lane that REACHES the commit's paths (the lane's own reach rule) is gated again.
 cfg_lanes ', "reach": { "when": "grep -q ^other/" }'
 r3_branch c9 s8 a/s8.txt=1; r3_queue c9 s8
 c9_gated
 r3_outside c9 other/read-by-a.txt=1 "bot: a file the gated lane reads"
 c9_release
-check "a commit that reaches the gated lane by its reach rule is not redone: the entry stalls"    '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* && "$out" == *"reaches lane a"* ]]'
-$LOCAL_MERGE_QUEUE dequeue s8 --repo c9 >/dev/null 2>&1
+check "a commit that reaches the gated lane by its reach rule gets that lane's gate run again, and lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 && "$out" == *"lane a"* ]] && r3_main_eq c9'
 
-# 8. One lane: every path belongs to the one lane, so any commit stalls.
+# 8. One lane: every path belongs to the one lane, so the one lane's gate runs again.
 r3_config c9 "\"gate\": [\"$(r3_gate_step c9)\"], \"finalCheck\": \"true\""
 r3_branch c9 s9 a/s9.txt=1; r3_queue c9 s9
 c9_gated
 r3_outside c9 other/anything.txt=1 "bot: anything"
 c9_release
-check "in a one-lane repo any commit on origin's main during the gate stalls the entry"           '[[ $rc == 2 && "$out" == *"main moved under a passing gate"* ]]'
+check "in a one-lane repo any commit on origin's main during the gate gets the gate run again, and lands" '[[ $rc == 0 && "$(r3_gates c9)" == 2 ]] && r3_main_eq c9'
+
+# 9. Only the lanes the commits touch are gated again: an entry that gated two lanes re-runs the cheap one alone.
+cfg_lanes ''
+r3_branch c9 t1 a/t1.txt=1 b/t1.txt=1; r3_queue c9 t1
+c9_gated
+r3_outside c9 b/moved.txt=1 "bot: touches lane b only"
+c9_release
+check "an upstream commit in lane b re-runs lane b's gate only: a once, b twice"                  '[[ $rc == 0 && "$(r3_lane_gates c9 a)" == 1 && "$(r3_lane_gates c9 b)" == 2 && -f "$ROOT/c9/b/moved.txt" && -f "$ROOT/c9/a/t1.txt" ]] && r3_main_eq c9'
+
+# 10. A lane that takes "*" is touched only by a path no other lane claims.
+r3_config c9 "\"lanes\": { \"a\": { \"paths\": [\"a/\"], \"gate\": [\"$(r3_gate_step c9 a)\"] }, \"rest\": { \"paths\": \"*\", \"gate\": [\"$(r3_gate_step c9 rest)\"] } }"
+r3_branch c9 t2 a/t2.txt=1 misc/t2.txt=1; r3_queue c9 t2
+c9_gated
+r3_outside c9 elsewhere/data.json=1 "bot: a path no named lane claims"
+c9_release
+check "an upstream path no named lane claims falls to the catch-all lane: its gate runs again, the other lane's does not" '[[ $rc == 0 && "$(r3_lane_gates c9 a)" == 1 && "$(r3_lane_gates c9 rest)" == 2 ]] && r3_main_eq c9'
+r3_branch c9 t3 a/t3.txt=1 misc/t3.txt=1; r3_queue c9 t3
+c9_gated
+r3_outside c9 a/other-bot.txt=1 "bot: a path lane a claims"
+c9_release
+check "a path a named lane claims does not touch the catch-all lane: only that lane's gate runs again" '[[ $rc == 0 && "$(r3_lane_gates c9 a)" == 2 && "$(r3_lane_gates c9 rest)" == 1 ]] && r3_main_eq c9'
+
+# 11. A third move stalls: the merge is redone (and the touched lane gated again) at most twice.
+cfg_lanes ''
+cat > "$ROOT/c9-hook.sh" <<'SH'
+if [ "$ref" = refs/heads/main ] && [ -e "$ROOT/c9-bot-left" ] && [ -z "${IN_BOT:-}" ]; then
+  n=$(cat "$ROOT/c9-bot-left")
+  if [ "$n" -gt 0 ]; then
+    echo $((n-1)) > "$ROOT/c9-bot-left"
+    d=$(cat "$ROOT/c9-bot-dir" 2>/dev/null || echo other)
+    ( unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; export IN_BOT=1
+      cd "$ROOT/c9-other" && git pull -q origin main && mkdir -p $d && echo $n > $d/bot-$n.txt && git add -A \
+        && git commit -qm "bot commit $n" && git push -q origin main ) >/dev/null 2>&1
+    echo "REJECTED: main moved" >&2; exit 1
+  fi
+fi
+SH
+r3_branch c9 u1 a/u1.txt=1; r3_queue c9 u1
+echo a > "$ROOT/c9-bot-dir"; echo 5 > "$ROOT/c9-bot-left"; : > "$ROOT/c9-gate.log"
+out=$(gtimeout 300 $LOCAL_MERGE_QUEUE land c9 2>&1); rc=$?
+left=$(cat "$ROOT/c9-bot-left"); rm -f "$ROOT/c9-bot-left" "$ROOT/c9-bot-dir"
+check "a main that moves at every push, in the gated lane: redone twice with the lane gated each time (three gate runs), then the entry stalls" '[[ $rc == 2 && "$left" == 2 && "$out" == *"after 2 redos"* && "$(r3_gates c9)" == 3 && "$(r3_qinfo)" == u1:stalled ]] && r3_main_eq c9'
 
 echo
 echo "── round 3 · batch.keep without a max leaves batching off; a dry run does not say it landed ──"
