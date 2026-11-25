@@ -3041,6 +3041,41 @@ check "resume on AC at 35% passes the power check" '[[ $rc == 0 && -f "$ROOT/p1/
 r4_batt ac 100 charged
 # ROUND4-END
 
+# ROUND5-BEGIN
+echo
+echo "════ round 5: the batch record never sits beside the batch worktree ═══"
+# A module loader that resolves the worktree's folder as a module tries `<folder>.json` before the
+# folder, so a record named like the worktree shadows it. The gate below resolves its own folder
+# and fails unless the loader lands on the folder's own entry file.
+r3_init c20
+( cd "$ROOT/c20" && echo '{"main": "index.js"}' > package.json && echo 'module.exports = 1' > index.js \
+  && git add -A && git commit -qm "a package that resolves as a module" && git push -q origin main )
+cat > "$ROOT/c20-gate.js" <<'JS'
+const fs = require('fs'), path = require('path')
+const want = fs.realpathSync(path.join(process.cwd(), 'index.js'))
+process.exit(fs.realpathSync(require.resolve(process.cwd())) === want ? 0 : 1)
+JS
+r3_config c20 "\"batch\": {\"max\": 5}, \"gate\": [\"node $ROOT/c20-gate.js\"], \"finalCheck\": \"true\""
+r3_branch c20 m-1 m-1.txt=1; r3_branch c20 m-2 m-2.txt=2; r3_queue c20 m-1 m-2
+out=$($LOCAL_MERGE_QUEUE land c20 2>&1); rc=$?
+check "a gate that resolves its own folder as a module passes in a batch" '[[ $rc == 0 && "$out" == *"landed in one push: m-1, m-2"* && -f "$ROOT/c20/m-2.txt" ]]'
+check "…the record is in batch-records, and nothing beside the worktree has its name plus an extension" '[[ -s "$LOCAL_MERGE_QUEUE_STATE/batch-records/c20.json" && -d "$LOCAL_MERGE_QUEUE_STATE/batch/c20" && -z "$(ls "$LOCAL_MERGE_QUEUE_STATE/batch" | grep -v "^c20$")" ]]'
+# A record left at the old path by an earlier version is read once and removed: with the new record
+# gone and the old one holding the current hash, the next batch must neither set up again nor leave the old file.
+cp "$LOCAL_MERGE_QUEUE_STATE/batch-records/c20.json" "$ROOT/c20-record.json"
+rm -f "$LOCAL_MERGE_QUEUE_STATE/batch-records/c20.json"
+cp "$ROOT/c20-record.json" "$LOCAL_MERGE_QUEUE_STATE/batch/c20.json"
+r3_branch c20 m-3 m-3.txt=3; r3_branch c20 m-4 m-4.txt=4; r3_queue c20 m-3 m-4
+out=$($LOCAL_MERGE_QUEUE land c20 2>&1); rc=$?
+check "a record at the old path is read (the worktree is not set up again) and the batch lands" '[[ $rc == 0 && "$out" == *"landed in one push: m-3, m-4"* && "$out" != *"has not been set up yet"* && "$out" != *"lockfiles differ"* ]]'
+check "…the old file is removed and the record is at the new path"     '[[ ! -e "$LOCAL_MERGE_QUEUE_STATE/batch/c20.json" && -s "$LOCAL_MERGE_QUEUE_STATE/batch-records/c20.json" ]]'
+# An old record beside a new one is removed too, and the new one wins.
+echo '{"lockfiles": "from-the-old-version"}' > "$LOCAL_MERGE_QUEUE_STATE/batch/c20.json"
+r3_branch c20 m-5 m-5.txt=5; r3_branch c20 m-6 m-6.txt=6; r3_queue c20 m-5 m-6
+out=$($LOCAL_MERGE_QUEUE land c20 2>&1); rc=$?
+check "an old record beside a current one is removed, and the current one decides" '[[ $rc == 0 && ! -e "$LOCAL_MERGE_QUEUE_STATE/batch/c20.json" && "$out" != *"lockfiles differ"* ]]'
+# ROUND5-END
+
 echo
 echo "════════════════════════════════════════════════════════════════"
 echo "  passed $PASS   failed $FAIL"
