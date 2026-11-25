@@ -36,6 +36,11 @@ const REPORT_DIR = path.join(STATE_DIR, 'reports')
 const reportFile = (key, branch) => path.join(REPORT_DIR, `${key}-${branch.replaceAll('/', '%2F')}.md`)
 const QUEUE_LOCK = path.join(STATE_DIR, 'queue.lock')
 const BATCH_DIR = path.join(STATE_DIR, 'batch')
+// The batch records live in a folder of their own, never beside the batch worktrees: a record
+// named `<repo>.json` next to the worktree `<repo>` shadows it for any module loader that
+// resolves the worktree's folder as a module (it tries `.json` before the folder), so every
+// gate that does so fails at launch.
+const BATCH_RECORD_DIR = path.join(STATE_DIR, 'batch-records')
 
 // ─── small helpers ──────────────────────────────────────────────────────────
 
@@ -1704,7 +1709,7 @@ function requireBatchGit () {
 //     directories in `batch.keep`;
 //   - the repository's lockfiles are hashed (`batch.lockfiles`, or the usual
 //     lockfile names at the root and beside each `keep` directory) and the hash
-//     is kept in `<state>/batch/<repo>.json`; when it differs from the last
+//     is kept in `<state>/batch-records/<repo>.json`; when it differs from the last
 //     successful setup, the `keep` directories are removed and the setup steps run
 //     again, whatever the setup probe says;
 //   - it is `git worktree lock`ed, so that `git worktree prune` never reaps it;
@@ -1726,7 +1731,19 @@ function lockfileHash (repo, bw) {
   }
   return h.digest('hex')
 }
-const batchMetaPath = repo => path.join(BATCH_DIR, `${repo.key}.json`)
+const batchMetaPath = repo => path.join(BATCH_RECORD_DIR, `${repo.key}.json`)
+// Where the record used to be kept, beside the worktree. A record found there is read once and
+// removed, so that the old name stops shadowing the worktree on the first batch after the update.
+const legacyBatchMetaPath = repo => path.join(BATCH_DIR, `${repo.key}.json`)
+function readBatchRecord (repo) {
+  const legacy = legacyBatchMetaPath(repo)
+  const old = fs.existsSync(legacy) ? readJSON(legacy, null) : null
+  fs.rmSync(legacy, { force: true })
+  const current = readJSON(batchMetaPath(repo), null)
+  if (current) return current
+  if (old) { writeJSON(batchMetaPath(repo), old); return old }
+  return {}
+}
 
 function ensureBatchWorktree (repo, base) {
   const bw = path.join(BATCH_DIR, repo.key)
@@ -1748,6 +1765,7 @@ function ensureBatchWorktree (repo, base) {
   if (path.dirname(bw) === BATCH_DIR && path.basename(bw) === repo.key) fs.rmSync(bw, { recursive: true, force: true })
   gitTry(['worktree', 'prune'], repo.checkout)
   fs.rmSync(batchMetaPath(repo), { force: true })
+  fs.rmSync(legacyBatchMetaPath(repo), { force: true })
   const add = gitTry(['worktree', 'add', '--detach', bw, base], repo.checkout)
   if (!add.ok) throw new BatchFailure(`could not create the batch worktree ${bw}: ${add.err}`)
   gitTry(['worktree', 'lock', '--reason', 'local-merge-queue batch worktree', bw], repo.checkout)
@@ -1837,7 +1855,7 @@ async function runBatch (cfg, repo, key, members, { held, onBuilt }) {
 
   // The lockfiles decide whether the kept dependency directories can be trusted.
   const hash = lockfileHash(repo, bw)
-  const recorded = readJSON(batchMetaPath(repo), {}).lockfiles
+  const recorded = readBatchRecord(repo).lockfiles
   const changed = recorded !== hash
   if (changed) {
     for (const d of batchKeep(repo)) fs.rmSync(path.join(bw, d), { recursive: true, force: true })
