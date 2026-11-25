@@ -50,6 +50,52 @@ function die (msg, code = 1) {
   process.exit(code)                    // `process.exit` skips every `finally`; the exit handler below releases what this process holds
 }
 
+// THE POWER CHECK. A gate is heavy work, and a laptop whose power supply cannot keep up (an
+// external battery that has run down, or an undersized adapter) drains its internal battery
+// while the system still reports AC power; when the battery empties the machine sleeps and
+// freezes the gate, and a gate that spans a sleep fails every test that holds a clock. So
+// `land` and `resume` start no gate on battery power, nor on AC under a charge floor
+// (LOCAL_MERGE_QUEUE_POWER_FLOOR, default 30 percent), whether or not the battery is charging:
+// under load a "charging" battery turns into a drain within minutes. `--ignore-power` skips
+// the check for a person who has weighed it, and `--dry-run` never runs it, since it runs no
+// gate. A machine with no battery passes. A reading that cannot be taken passes too, with one
+// line, so a broken `pmset` never stops all landing. The reading comes from `pmset -g batt`;
+// LOCAL_MERGE_QUEUE_TEST_BATTERY, a test seam, names a file that holds the text it would print.
+function readPower () {
+  let text
+  const seam = process.env.LOCAL_MERGE_QUEUE_TEST_BATTERY
+  if (seam) {
+    try { text = fs.readFileSync(seam, 'utf8') } catch { return { kind: 'unknown' } }
+  } else {
+    const r = spawnSync('pmset', ['-g', 'batt'], { encoding: 'utf8', timeout: 10000 })
+    if (r.error?.code === 'ENOENT') return { kind: 'none' }            // no pmset: not a Mac, so nothing to read
+    if (r.error || r.status !== 0) return { kind: 'unknown' }
+    text = r.stdout
+  }
+  const source = text.includes("'AC Power'") ? 'ac' : text.includes("'Battery Power'") ? 'battery' : null
+  if (!source) return { kind: 'unknown' }
+  const line = text.split('\n').find(l => l.includes('InternalBattery'))
+  if (!line) return source === 'ac' ? { kind: 'none' } : { kind: 'unknown' }
+  const m = line.match(/(\d+)%/)
+  return m ? { kind: source, charge: Number(m[1]) } : { kind: 'unknown' }
+}
+
+function powerRefusal (verb) {
+  const floor = Number(process.env.LOCAL_MERGE_QUEUE_POWER_FLOOR) || 30
+  const power = readPower()
+  if (power.kind === 'unknown') {
+    console.error(dim('local-merge-queue: warning: cannot read the battery from pmset; the power check passes'))
+    return null
+  }
+  if (power.kind === 'battery') {
+    return `${verb} refuses to start a gate: the machine is on battery power (charge ${power.charge}%); it starts on AC power at ${floor}% or more, or run it with --ignore-power`
+  }
+  if (power.kind === 'ac' && power.charge < floor) {
+    return `${verb} refuses to start a gate: battery charge ${power.charge}% on AC power is under the ${floor}% floor; it starts at ${floor}% or more, or run it with --ignore-power`
+  }
+  return null
+}
+
 // A RELATIVE CHECKOUT PATH RESOLVES AGAINST THE CONFIG'S `root`, which defaults
 // to the directory the config file itself sits in. A path beginning with `~/`
 // never consults it, so a registry whose paths are all absolute behaves the same
@@ -2435,6 +2481,10 @@ async function cmdLand (cfg, args, { resuming = false } = {}) {
   if (!key) die('name the repo to land (or run from inside one of its worktrees)')
   const repo = repoOf(cfg, key)
   const dryRun = !!args['--dry-run']
+  if (!dryRun && !args['--ignore-power']) {
+    const refusal = powerRefusal(resuming ? 'resume' : 'land')
+    if (refusal) die(refusal)
+  }
   const batchOpt = batchFor(repo, args)
   if (batchOpt) requireBatchGit()
 
@@ -3213,16 +3263,19 @@ ${bold('local-merge-queue')} — a local merge queue for git repositories
       nothing about the branch or its worktree moves. Refuses a stalled entry.
   ${bold('local-merge-queue order')} <branch> --first | --last | <position>
       Reorder. Land refactors early — everything behind one rebases over it anyway.
-  ${bold('local-merge-queue land')} [repo] [--dry-run] [--batch | --no-batch]
+  ${bold('local-merge-queue land')} [repo] [--dry-run] [--batch | --no-batch] [--ignore-power]
       Land every approved entry, one at a time: rebase → gate → merge --no-ff →
       push → remove worktree → delete branch → delete roster row. Stalls on the
       first conflict; nothing that shares a lane with it lands out of order.
       ${bold('--batch')}: gate several approved entries that share lanes once, on a
       candidate main, then land them one by one (the repo's "batch": {"max": N}
       turns it on by default; ${bold('--no-batch')} turns it off for a run).
-  ${bold('local-merge-queue resume')} [repo] [--owner-approved]
+      ${bold('--ignore-power')}: skip the power check. Without it, ${bold('land')} and ${bold('resume')}
+      start no gate on battery power, nor on AC power with the charge under 30%
+      (LOCAL_MERGE_QUEUE_POWER_FLOOR sets the floor); ${bold('--dry-run')} is never refused.
+  ${bold('local-merge-queue resume')} [repo] [--owner-approved] [--ignore-power]
       Continue after a stall has been resolved in the worktree. Retries every
-      stalled entry in queue order.
+      stalled entry in queue order. The power check of ${bold('land')} applies.
   ${bold('local-merge-queue dequeue')} <branch>       Remove an entry; the branch is left untouched.
 
 Full contract: ${path.join(HERE, 'README.md')}
