@@ -59,9 +59,11 @@ function die (msg, code = 1) {
 // external battery that has run down, or an undersized adapter) drains its internal battery
 // while the system still reports AC power; when the battery empties the machine sleeps and
 // freezes the gate, and a gate that spans a sleep fails every test that holds a clock. So
-// `land` and `resume` start no gate on battery power, nor on AC under a charge floor
-// (LOCAL_MERGE_QUEUE_POWER_FLOOR, default 30 percent), whether or not the battery is charging:
-// under load a "charging" battery turns into a drain within minutes. `--ignore-power` skips
+// `land` and `resume` start no gate while the charge is under a floor
+// (LOCAL_MERGE_QUEUE_POWER_FLOOR, default 30 percent), on battery power or on AC, whether or not
+// the battery is charging: under load a "charging" battery turns into a drain within minutes.
+// Battery power alone refuses nothing: a person who works on battery for hours is a normal
+// case, and the charge, not the power source, predicts a sleep. `--ignore-power` skips
 // the check for a person who has weighed it, and `--dry-run` never runs it, since it runs no
 // gate. A machine with no battery passes. A reading that cannot be taken passes too, with one
 // line, so a broken `pmset` never stops all landing. The reading comes from `pmset -g batt`;
@@ -92,11 +94,9 @@ function powerRefusal (verb) {
     console.error(dim('local-merge-queue: warning: cannot read the battery from pmset; the power check passes'))
     return null
   }
-  if (power.kind === 'battery') {
-    return `${verb} refuses to start a gate: the machine is on battery power (charge ${power.charge}%); it starts on AC power at ${floor}% or more, or run it with --ignore-power`
-  }
-  if (power.kind === 'ac' && power.charge < floor) {
-    return `${verb} refuses to start a gate: battery charge ${power.charge}% on AC power is under the ${floor}% floor; it starts at ${floor}% or more, or run it with --ignore-power`
+  if ((power.kind === 'battery' || power.kind === 'ac') && power.charge < floor) {
+    const source = power.kind === 'ac' ? 'AC power' : 'battery power'
+    return `${verb} refuses to start a gate: battery charge ${power.charge}% on ${source} is under the ${floor}% floor; it starts at ${floor}% or more, or run it with --ignore-power`
   }
   return null
 }
@@ -3289,7 +3289,7 @@ ${bold('local-merge-queue')} — a local merge queue for git repositories
       candidate main, then land them one by one (the repo's "batch": {"max": N}
       turns it on by default; ${bold('--no-batch')} turns it off for a run).
       ${bold('--ignore-power')}: skip the power check. Without it, ${bold('land')} and ${bold('resume')}
-      start no gate on battery power, nor on AC power with the charge under 30%
+      start no gate while the charge is under 30%, on battery or on AC power
       (LOCAL_MERGE_QUEUE_POWER_FLOOR sets the floor); ${bold('--dry-run')} is never refused.
   ${bold('local-merge-queue resume')} [repo] [--owner-approved] [--ignore-power]
       Continue after a stall has been resolved in the worktree. Retries every
