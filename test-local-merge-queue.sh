@@ -11,6 +11,10 @@ export LOCAL_MERGE_QUEUE_STATE="$ROOT/state"
 export LOCAL_MERGE_QUEUE_CONFIG="$ROOT/repos.json"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_MERGE_QUEUE="node $HERE/local-merge-queue.mjs"
+# `land` and `resume` read the battery. Holding it at AC power, charge 100%, keeps every case below
+# independent of the machine that runs the suite; the power cases (round 4) move the reading.
+export LOCAL_MERGE_QUEUE_TEST_BATTERY="$ROOT/battery"
+printf "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t100%%; charged; 0:00 remaining present: true\n" > "$ROOT/battery"
 PASS=0; FAIL=0
 ok ()   { PASS=$((PASS+1)); echo "  ok   — $1"; }
 bad ()  { FAIL=$((FAIL+1)); echo "  FAIL — $1"; }
@@ -2963,6 +2967,79 @@ touch "$ROOT/c15r-bot"
 out=$($LOCAL_MERGE_QUEUE land c15r 2>&1)
 check "a redeploy push rejected because origin moved leaves local main on origin's new tip, not on a stale one" '[[ "$out" == *"THE REDEPLOY PUSH FAILED"* ]] && r3_main_eq c15r'
 # ROUND3-END
+
+# ROUND4-BEGIN
+echo
+echo "════ round 4: no gate starts on battery power or a low charge ═════════"
+# The reading is `pmset -g batt` text in a file the test seam names. Each case writes one.
+r4_batt () {  # source (ac|battery), percent, state
+  local src="AC Power"; [[ "$1" == battery ]] && src="Battery Power"
+  printf "Now drawing from '%s'\n -InternalBattery-0 (id=1)\t%s%%; %s; 3:00 remaining present: true\n" "$src" "$2" "$3" > "$ROOT/battery"
+}
+r3_init p1
+r3_config p1 "\"gate\": [\"true\"], \"finalCheck\": \"true\""
+r3_branch p1 pw1 pw1.txt=1
+r3_queue p1 pw1
+p1_before=$(git -C "$ROOT/p1-origin.git" rev-parse main)
+r4_batt battery 80 discharging
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "land on battery power refuses with one line naming the reading (exit 1)" '[[ $rc == 1 && "$out" == *"land refuses to start a gate: the machine is on battery power (charge 80%)"* && "$(grep -c . <<<"$out")" == 1 ]]'
+check "…and nothing moved: main and origin unchanged, the entry still approved, no lock left" '[[ "$(git -C "$ROOT/p1-origin.git" rev-parse main)" == "$p1_before" && "$(r3_qinfo)" == pw1:approved && ! -e "$LOCAL_MERGE_QUEUE_STATE/locks/p1" ]]'
+r4_batt battery 100 discharging
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "land on battery power at 100% refuses too (the power source decides, not the charge)" '[[ $rc == 1 && "$out" == *"on battery power (charge 100%)"* ]]'
+r4_batt ac 9 charging
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "land on AC at 9% (charging) refuses and names the reading and the 30% floor" '[[ $rc == 1 && "$out" == *"battery charge 9% on AC power is under the 30% floor"* ]]'
+r4_batt ac 29 "not charging"
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "land on AC at 29% (not charging) refuses" '[[ $rc == 1 && "$out" == *"battery charge 29% on AC power is under the 30% floor"* ]]'
+r4_batt battery 80 discharging
+out=$($LOCAL_MERGE_QUEUE resume p1 2>&1); rc=$?
+check "resume on battery power refuses, saying resume" '[[ $rc == 1 && "$out" == *"resume refuses to start a gate: the machine is on battery power (charge 80%)"* ]]'
+r4_batt ac 20 charging
+out=$($LOCAL_MERGE_QUEUE resume p1 2>&1); rc=$?
+check "resume on AC at 20% refuses" '[[ $rc == 1 && "$out" == *"resume refuses to start a gate: battery charge 20% on AC power is under the 30% floor"* ]]'
+check "…and the entry is still approved, nothing landed" '[[ "$(r3_qinfo)" == pw1:approved && "$(git -C "$ROOT/p1-origin.git" rev-parse main)" == "$p1_before" ]]'
+r4_batt battery 5 discharging
+q_before=$(cat "$LOCAL_MERGE_QUEUE_STATE/queue.json")
+out=$($LOCAL_MERGE_QUEUE land p1 --dry-run 2>&1); rc=$?
+check "land --dry-run is never refused, even on battery at 5%" '[[ $rc == 0 && "$out" != *refuses* && "$out" == *"would land"* ]]'
+check "…and the dry run moved nothing" '[[ "$(cat "$LOCAL_MERGE_QUEUE_STATE/queue.json")" == "$q_before" ]]'
+out=$($LOCAL_MERGE_QUEUE resume p1 --dry-run 2>&1); rc=$?
+check "resume --dry-run is never refused either" '[[ $rc == 0 && "$out" != *refuses* ]]'
+r4_batt ac 40 charging
+out=$(LOCAL_MERGE_QUEUE_POWER_FLOOR=50 $LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "LOCAL_MERGE_QUEUE_POWER_FLOOR=50 refuses AC at 40% and names the 50% floor" '[[ $rc == 1 && "$out" == *"battery charge 40% on AC power is under the 50% floor"* ]]'
+r4_batt ac 30 charging
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "land on AC at exactly the 30% floor starts the gate and lands the entry" '[[ $rc == 0 && "$out" == *"landed"* && -f "$ROOT/p1/pw1.txt" && "$out" != *refuses* ]]'
+r3_branch p1 pw2 pw2.txt=2; r3_queue p1 pw2
+r4_batt ac 100 charged
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "land on AC at 100% lands" '[[ $rc == 0 && -f "$ROOT/p1/pw2.txt" ]]'
+r3_branch p1 pw3 pw3.txt=3; r3_queue p1 pw3
+printf "Now drawing from 'AC Power'\n" > "$ROOT/battery"
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "a machine with no battery lands, with no power line at all" '[[ $rc == 0 && -f "$ROOT/p1/pw3.txt" && "$out" != *battery* ]]'
+r3_branch p1 pw4 pw4.txt=4; r3_queue p1 pw4
+echo "not a pmset reading" > "$ROOT/battery"
+out=$($LOCAL_MERGE_QUEUE land p1 2>&1); rc=$?
+check "an unreadable reading lands, with one line saying so" '[[ $rc == 0 && -f "$ROOT/p1/pw4.txt" && "$out" == *"cannot read the battery from pmset; the power check passes"* && "$(grep -c "cannot read the battery" <<<"$out")" == 1 ]]'
+r3_branch p1 pw5 pw5.txt=5; r3_queue p1 pw5
+r4_batt battery 40 discharging
+out=$($LOCAL_MERGE_QUEUE land p1 --ignore-power 2>&1); rc=$?
+check "--ignore-power lands on battery power" '[[ $rc == 0 && -f "$ROOT/p1/pw5.txt" && "$out" != *refuses* ]]'
+r3_branch p1 pw6 pw6.txt=6; r3_queue p1 pw6
+r4_batt ac 10 charging
+out=$($LOCAL_MERGE_QUEUE resume p1 --ignore-power 2>&1); rc=$?
+check "resume --ignore-power runs on AC at 10% (and lands the approved entry)" '[[ $rc == 0 && -f "$ROOT/p1/pw6.txt" && "$out" != *refuses* ]]'
+r3_branch p1 pw7 pw7.txt=7; r3_queue p1 pw7
+r4_batt ac 35 charging
+out=$($LOCAL_MERGE_QUEUE resume p1 2>&1); rc=$?
+check "resume on AC at 35% passes the power check" '[[ $rc == 0 && -f "$ROOT/p1/pw7.txt" && "$out" != *refuses* ]]'
+r4_batt ac 100 charged
+# ROUND4-END
 
 echo
 echo "════════════════════════════════════════════════════════════════"
